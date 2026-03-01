@@ -7,3 +7,6 @@ build
 /vendor-bin/*/vendor
 /lib/Vendor
 /lib/autoload
+__pycache__/
+python/venv/
+*.pyc

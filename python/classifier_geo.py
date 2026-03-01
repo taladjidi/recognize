@@ -12,7 +12,13 @@ import os
 import sys
 
 import exifread
+
+# reverse_geocoder prints to stdout on first load — redirect to stderr
+import io
+_orig_stdout = sys.stdout
+sys.stdout = sys.stderr
 import reverse_geocoder as rg
+sys.stdout = _orig_stdout
 
 import base_classifier
 

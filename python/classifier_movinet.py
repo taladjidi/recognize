@@ -121,7 +121,9 @@ def main():
         sys.exit(1)
 
     print('Loading MoViNet model...', file=sys.stderr)
-    model = tf.saved_model.load(model_path)
+    loaded = tf.saved_model.load(model_path)
+    # Use the serving_default signature which expects image= keyword arg
+    model = loaded.signatures['serving_default']
     print('Model loaded', file=sys.stderr)
 
     ffmpeg_binary = get_ffmpeg_binary()
@@ -141,12 +143,11 @@ def main():
             # Add batch dim: [1, N, 176, 176, 3]
             frame_batch = np.expand_dims(frame_tensor, axis=0).astype(np.float32)
 
-            # Run inference
+            # Run inference via serving_default signature
             input_tensor = tf.constant(frame_batch)
-            logits = model(input_tensor)
-            if isinstance(logits, dict):
-                # Some SavedModel formats return dicts
-                logits = list(logits.values())[0]
+            output = model(image=input_tensor)
+            # serving_default returns dict with 'classifier_head' key
+            logits = output['classifier_head']
             probs = tf.nn.softmax(logits).numpy().flatten()
 
             # Get top-K
