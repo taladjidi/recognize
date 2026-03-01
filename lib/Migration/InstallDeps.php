@@ -51,6 +51,8 @@ final class InstallDeps implements IRepairStep {
 	private string $tfjsGPUPath;
 	private IBinaryFinder $binaryFinder;
 	private string $nodeModulesDir;
+	private string $pythonDir;
+	private string $pythonRequirements;
 
 	public function __construct(IAppConfig $config, IClientService $clientService, LoggerInterface $logger, IBinaryFinder $binaryFinder) {
 		$this->config = $config;
@@ -63,6 +65,8 @@ final class InstallDeps implements IRepairStep {
 		$this->tfjsGpuInstallScript = dirname(__DIR__, 2) . '/node_modules/@tensorflow/tfjs-node-gpu/scripts/install.js';
 		$this->tfjsPath = dirname(__DIR__, 2) . '/node_modules/@tensorflow/tfjs-node/';
 		$this->tfjsGPUPath = dirname(__DIR__, 2) . '/node_modules/@tensorflow/tfjs-node-gpu/';
+		$this->pythonDir = dirname(__DIR__, 2) . '/python/';
+		$this->pythonRequirements = dirname(__DIR__, 2) . '/python/requirements.txt';
 		$this->clientService = $clientService;
 		$this->logger = $logger;
 		$this->binaryFinder = $binaryFinder;
@@ -97,6 +101,13 @@ final class InstallDeps implements IRepairStep {
 		} catch (\Throwable $e) {
 			$output->warning('Failed to automatically install dependencies for recognize. Check the recognize admin panel for potential problems.');
 			$this->logger->error('Failed to automatically install dependencies for recognize. Check the recognize admin panel for potential problems.', ['exception' => $e]);
+		}
+
+		try {
+			$this->installPythonDeps($output);
+		} catch (\Throwable $e) {
+			$output->warning('Failed to install Python dependencies for recognize. Python-based classifiers will not be available.');
+			$this->logger->error('Failed to install Python dependencies for recognize.', ['exception' => $e]);
 		}
 	}
 
@@ -304,6 +315,60 @@ final class InstallDeps implements IRepairStep {
 				throw new \Exception('Error when setting '.$this->nodeModulesDir.'* permissions: ' . $realpath);
 			}
 		}
+	}
+
+	protected function installPythonDeps(IOutput $output): void {
+		// Check if python_binary is already configured and working
+		$existingBinary = $this->config->getAppValueString('python_binary', '');
+		if ($existingBinary !== '' && $this->testBinary($existingBinary) !== null) {
+			$output->info('Python binary already configured: ' . $existingBinary);
+			return;
+		}
+
+		// Try to find python3 on the system
+		$python3Path = $this->binaryFinder->findBinaryPath('python3');
+		if ($python3Path === false) {
+			$output->warning('python3 not found on the system. Python classifiers will not be available.');
+			return;
+		}
+
+		$version = $this->testBinary($python3Path);
+		if ($version === null) {
+			$output->warning('python3 binary found but not functional.');
+			return;
+		}
+
+		$output->info('Found python3: ' . $version);
+
+		// Create venv in python/venv/
+		$venvPath = $this->pythonDir . 'venv';
+		if (!is_dir($venvPath)) {
+			$cmd = escapeshellcmd($python3Path) . ' -m venv ' . escapeshellarg($venvPath);
+			exec($cmd . ' 2>&1', $venvOutput, $returnCode);
+			if ($returnCode !== 0) {
+				throw new \Exception('Failed to create Python venv: ' . trim(implode("\n", $venvOutput)));
+			}
+			$output->info('Created Python venv at ' . $venvPath);
+		}
+
+		// The venv python binary
+		$venvPython = $venvPath . '/bin/python';
+		if (!file_exists($venvPython)) {
+			throw new \Exception('Python venv binary not found at ' . $venvPython);
+		}
+
+		// Install requirements
+		$cmd = escapeshellcmd($venvPython) . ' -m pip install -r ' . escapeshellarg($this->pythonRequirements);
+		exec($cmd . ' 2>&1', $pipOutput, $returnCode);
+		if ($returnCode !== 0) {
+			$this->logger->error('pip install output: ' . trim(implode("\n", $pipOutput)));
+			throw new \Exception('Failed to install Python requirements');
+		}
+		$output->info('Installed Python requirements');
+
+		// Store venv python path in config
+		$this->config->setAppValueString('python_binary', $venvPython);
+		$output->info('Python binary set to: ' . $venvPython);
 	}
 
 	protected function isAVXSupported(): bool {

@@ -237,6 +237,43 @@ final class AdminController extends Controller {
 		return new JSONResponse(['ffmpeg' => $version]);
 	}
 
+	public function python(): JSONResponse {
+		$pythonBinary = $this->settingsService->getSetting('python_binary');
+		if ($pythonBinary === '') {
+			return new JSONResponse(['python' => null]);
+		}
+		try {
+			exec($pythonBinary . ' --version' . ' 2>&1', $output, $returnCode);
+		} catch (\Throwable $e) {
+			return new JSONResponse(['python' => null]);
+		}
+
+		if ($returnCode !== 0) {
+			return new JSONResponse(['python' => false]);
+		}
+
+		$version = trim(implode("\n", $output));
+		return new JSONResponse(['python' => $version]);
+	}
+
+	public function pythontensorflow(): JSONResponse {
+		$pythonBinary = $this->settingsService->getSetting('python_binary');
+		if ($pythonBinary === '') {
+			return new JSONResponse(['pythontensorflow' => false]);
+		}
+		try {
+			exec($pythonBinary . ' ' . __DIR__ . '/../../python/test_tensorflow.py' . ' 2>&1', $output, $returnCode);
+		} catch (\Throwable $e) {
+			return new JSONResponse(['pythontensorflow' => false]);
+		}
+
+		if ($returnCode !== 0) {
+			return new JSONResponse(['pythontensorflow' => false]);
+		}
+
+		return new JSONResponse(['pythontensorflow' => true]);
+	}
+
 	public function libtensorflow(): JSONResponse {
 		try {
 			exec($this->settingsService->getSetting('node_binary') . ' ' . __DIR__ . '/../../src/test_libtensorflow.js' . ' 2>&1', $output, $returnCode);

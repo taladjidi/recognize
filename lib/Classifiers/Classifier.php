@@ -158,11 +158,20 @@ abstract class Classifier {
 
 		$this->logger->debug('Classifying '.var_export($paths, true));
 
-		$command = [
-			$this->config->getAppValueString('node_binary'),
-			dirname(__DIR__, 2) . '/src/classifier_'.$model.'.js',
-			'-'
-		];
+		$pythonBinary = $this->config->getAppValueString('python_binary', '');
+		if ($pythonBinary !== '') {
+			$command = [
+				$pythonBinary,
+				dirname(__DIR__, 2) . '/python/classifier_'.$model.'.py',
+				'-'
+			];
+		} else {
+			$command = [
+				$this->config->getAppValueString('node_binary'),
+				dirname(__DIR__, 2) . '/src/classifier_'.$model.'.js',
+				'-'
+			];
+		}
 
 		if (trim($this->config->getAppValueString('nice_binary', '')) !== '') {
 			$command = [
@@ -186,6 +195,11 @@ abstract class Classifier {
 		$cores = $this->config->getAppValueString('tensorflow.cores', '0');
 		if ($cores !== '0') {
 			$env['RECOGNIZE_CORES'] = $cores;
+		}
+		// Pass ffmpeg binary path for Python classifiers (movinet, musicnn)
+		$ffmpegBinary = $this->config->getAppValueString('ffmpeg_binary', '');
+		if ($ffmpegBinary !== '') {
+			$env['FFMPEG_BINARY'] = $ffmpegBinary;
 		}
 		$proc->setEnv($env);
 		$proc->setTimeout(count($paths) * $timeout);

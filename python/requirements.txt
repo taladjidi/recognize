@@ -1,0 +1,11 @@
+tensorflow>=2.16
+insightface>=0.7
+onnxruntime-gpu>=1.17
+numpy
+Pillow
+PyYAML
+soundfile
+exifread
+reverse_geocoder
+pycountry
+tensorflowjs

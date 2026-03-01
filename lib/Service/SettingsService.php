@@ -32,6 +32,7 @@ final class SettingsService {
 		'musicnn.enabled' => 'false',
 		'movinet.enabled' => 'false',
 		'node_binary' => '',
+		'python_binary' => '',
 		'clusterFaces.status' => 'null',
 		'faces.status' => 'null',
 		'imagenet.status' => 'null',
