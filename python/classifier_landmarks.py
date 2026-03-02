@@ -94,15 +94,21 @@ def main():
     # Load all labels
     all_labels = load_labels()
 
-    # Load all 6 regional models
+    # Load all 6 regional models via serving_default signature
     models = {}
+    input_keys = {}
+    output_keys = {}
     for region in REGIONS:
         model_path = os.path.join(MODELS_DIR, f'{region}_saved')
         if not os.path.isdir(model_path):
             print(f'ERROR: Model not found at {model_path}. Run convert_models.py first.', file=sys.stderr)
             sys.exit(1)
         print(f'Loading {region} model...', file=sys.stderr)
-        models[region] = tf.saved_model.load(model_path)
+        loaded = tf.saved_model.load(model_path)
+        sig = loaded.signatures['serving_default']
+        models[region] = sig
+        input_keys[region] = list(sig.structured_input_signature[1].keys())[0]
+        output_keys[region] = list(sig.structured_outputs.keys())[0]
 
     print('All landmark models loaded', file=sys.stderr)
 
@@ -117,10 +123,8 @@ def main():
             all_results = []
             for region in REGIONS:
                 model = models[region]
-                logits = model(input_tf)
-                if isinstance(logits, dict):
-                    logits = list(logits.values())[0]
-                values = logits.numpy().flatten()
+                output = model(**{input_keys[region]: input_tf})
+                values = output[output_keys[region]].numpy().flatten()
 
                 # No softmax — raw logits, topK=7
                 results = get_top_k(values, TOP_K, all_labels[region])

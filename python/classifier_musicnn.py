@@ -113,7 +113,10 @@ def main():
         sys.exit(1)
 
     print('Loading MusicNN model...', file=sys.stderr)
-    model = tf.saved_model.load(model_path)
+    loaded = tf.saved_model.load(model_path)
+    model = loaded.signatures['serving_default']
+    input_key = list(model.structured_input_signature[1].keys())[0]
+    output_key = list(model.structured_outputs.keys())[0]
     print('Model loaded', file=sys.stderr)
 
     ffmpeg_binary = get_ffmpeg_binary()
@@ -141,10 +144,9 @@ def main():
             # Split into batches and stack: [num_batches, 188, 96, 1]
             batches = tf.stack([mel_spec[i * BATCH_FRAMES:(i + 1) * BATCH_FRAMES] for i in range(num_batches)])
 
-            # Run inference
-            logits = model(batches)
-            if isinstance(logits, dict):
-                logits = list(logits.values())[0]
+            # Run inference via serving_default signature
+            output = model(**{input_key: batches})
+            logits = output[output_key]
 
             # Softmax per batch, then average
             logit_batches = tf.split(logits, num_batches, axis=0)
