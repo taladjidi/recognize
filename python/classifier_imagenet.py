@@ -94,15 +94,37 @@ def get_top_k(values, k):
     return results
 
 
+def _load_model_v1(model_path):
+    """Load a SavedModel using v1 Session API.
+
+    More memory-efficient for frozen graphs (weights as constants in the
+    graph) since it avoids parsing the entire protobuf into Python objects.
+    Returns (session, input_tensor_name, output_tensor_name).
+    """
+    sess = tf.compat.v1.Session(
+        graph=tf.compat.v1.Graph(),
+        config=tf.compat.v1.ConfigProto(allow_soft_placement=True),
+    )
+    meta_graph_def = tf.compat.v1.saved_model.loader.load(
+        sess,
+        [tf.compat.v1.saved_model.tag_constants.SERVING],
+        model_path,
+    )
+    sig = meta_graph_def.signature_def['serving_default']
+    input_name = list(sig.inputs.values())[0].name
+    output_name = list(sig.outputs.values())[0].name
+    return sess, input_name, output_name
+
+
 def main():
     model_path, img_size, input_min, model_name = select_model()
 
     print(f'Loading {model_name} model...', file=sys.stderr)
-    loaded = tf.saved_model.load(model_path)
-    model = loaded.signatures['serving_default']
-    # Discover the sanitized input/output key names
-    input_key = list(model.structured_input_signature[1].keys())[0]
-    output_key = list(model.structured_outputs.keys())[0]
+    sess, input_name, output_name = _load_model_v1(model_path)
+    # Build a softmax op in the session graph
+    with sess.graph.as_default():
+        output_tensor = sess.graph.get_tensor_by_name(output_name)
+        softmax_tensor = tf.nn.softmax(output_tensor)
     print('Model loaded', file=sys.stderr)
 
     paths = base_classifier.get_paths()
@@ -110,14 +132,10 @@ def main():
     for path in paths:
         try:
             input_tensor = preprocess_image(path, img_size, input_min)
-            input_tf = tf.constant(input_tensor)
 
-            # Run inference via serving_default signature
-            output = model(**{input_key: input_tf})
-            logits = output[output_key]
-
-            # Apply softmax
-            probs = tf.nn.softmax(logits).numpy().flatten()
+            # Run inference via v1 Session
+            probs = sess.run(softmax_tensor, feed_dict={input_name: input_tensor})
+            probs = probs.flatten()
 
             # Get top-K
             results = get_top_k(probs, TOP_K)

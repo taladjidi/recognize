@@ -10,9 +10,9 @@ Expected results match ClassifierTest.php's classifierFilesProvider:
     jumpingjack.gif  → movinet   → 'jumping jacks'
 
 Usage:
-    conda run -n 313 python -m pytest python/tests/test_harness.py -v
-    conda run -n 313 python -m pytest python/tests/test_harness.py -v -k imagenet
-    conda run -n 313 python -m pytest python/tests/test_harness.py -v -k Geo
+    python -m pytest python/tests/test_harness.py -v
+    python -m pytest python/tests/test_harness.py -v -k imagenet
+    python -m pytest python/tests/test_harness.py -v -k Geo
 """
 import json
 import os

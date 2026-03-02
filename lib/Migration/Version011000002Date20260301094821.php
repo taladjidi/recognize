@@ -7,13 +7,14 @@
 declare(strict_types=1);
 namespace OCA\Recognize\Migration;
 
+use Closure;
 use OCA\Recognize\BackgroundJobs\SchedulerJob;
 use OCA\Recognize\Classifiers\Images\ClusteringFaceClassifier;
 use OCP\BackgroundJob\IJobList;
 use OCP\DB\Exception;
 use OCP\IDBConnection;
 use OCP\Migration\IOutput;
-use OCP\Migration\IRepairStep;
+use OCP\Migration\SimpleMigrationStep;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -23,7 +24,7 @@ use Psr\Log\LoggerInterface;
  * incompatible with the old 128-dim vectors from vladmandic/face-api.
  * All face data must be cleared and re-scanned.
  */
-final class Version011000002Date20260301094821 implements IRepairStep {
+final class Version011000002Date20260301094821 extends SimpleMigrationStep {
 
 	public function __construct(
 		private IDBConnection $db,
@@ -32,12 +33,7 @@ final class Version011000002Date20260301094821 implements IRepairStep {
 	) {
 	}
 
-	public function getName(): string {
-		return 'Clear face detections for 512-dim vector migration';
-	}
-
-	public function run(IOutput $output): void {
-		// Only run if python_binary is configured (i.e., Python port is active)
+	public function postSchemaChange(IOutput $output, Closure $schemaClosure, array $options): void {
 		try {
 			$qb = $this->db->getQueryBuilder();
 

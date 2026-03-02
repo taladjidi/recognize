@@ -10,3 +10,7 @@ build
 __pycache__/
 python/venv/
 *.pyc
+models/*_saved/
+models/insightface/
+tests/res/
+sync_and_classify.sh

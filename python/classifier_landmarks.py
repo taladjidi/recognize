@@ -77,14 +77,18 @@ def preprocess_image(img_path):
     return np.expand_dims(arr, axis=0)
 
 
-def get_top_k(values, k, label_list):
-    """Get top-k classes and probabilities (no softmax — raw logits)."""
+def get_top_k(values, k, label_dict):
+    """Get top-k classes and probabilities (no softmax — raw logits).
+
+    label_dict has string keys ("0", "1", ...) from the JSON label files.
+    """
     indices = np.argsort(values)[::-1][:k]
     results = []
     for idx in indices:
-        if idx < len(label_list):
+        key = str(int(idx))
+        if key in label_dict:
             results.append({
-                'className': label_list[idx],
+                'className': label_dict[key],
                 'probability': float(values[idx]),
             })
     return results

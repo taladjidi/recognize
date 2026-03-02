@@ -8,7 +8,13 @@ Protocol (matches the Node.js classifiers):
 - Diagnostics go to stderr
 """
 import json
+import os
 import sys
+
+# Set a stable writable matplotlib config dir before any transitive import
+# (TensorFlow and InsightFace pull in matplotlib). Avoids permission errors
+# when running as the apache user whose home dir is not writable.
+os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib-recognize')
 
 
 def get_paths():
