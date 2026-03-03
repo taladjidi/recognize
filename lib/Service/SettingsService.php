@@ -54,6 +54,7 @@ final class SettingsService {
 		'nice_value' => '0',
 		'concurrency.enabled' => 'false',
 		'ffmpeg_binary' => '',
+		'imagenet.model' => 'auto',
 	];
 
 	/** @var array<string,string>  */

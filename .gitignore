@@ -9,8 +9,14 @@ build
 /lib/autoload
 __pycache__/
 python/venv/
+python/.tf_cache/
 *.pyc
 models/*_saved/
 models/insightface/
+models/efficientnetv2-xl-21k-ft1k/
+models/efficientnetv2-xl-21k-ft1k.tgz
+automl_effnetv2/
+bench_*.json
+bench_*.txt
 tests/res/
 sync_and_classify.sh

@@ -2,8 +2,8 @@
 
 Replaces src/classifier_landmarks.js.
 
-Preprocessing: PIL resize 321x321 → normalize [0,1] → [1, 321, 321, 3]
-Runs all 6 regional models per image, takes highest confidence above 0.9.
+Preprocessing: PIL resize 321x321 → normalize [0,1] → [N, 321, 321, 3] (batched)
+Runs all 6 regional models per batch, takes highest confidence above 0.9.
 Output: ["landmark", "Name"] or []
 
 Reference: src/classifier_landmarks.js
@@ -11,6 +11,7 @@ Reference: src/classifier_landmarks.js
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import gpu_setup
 tf = gpu_setup.configure()
@@ -27,6 +28,7 @@ IMG_SIZE = 321
 INPUT_MIN = 0
 TOP_K = 7
 THRESHOLD = 0.9
+BATCH_SIZE = 16
 
 REGIONS = [
     'landmarks_africa',
@@ -62,6 +64,7 @@ def preprocess_image(img_path):
     """Load, resize, and normalize an image.
 
     Normalize from [0, 255] to [0, 1]: pixel * (1/255)
+    Returns [H, W, 3] array (no batch dim) for stacking into batches.
     """
     img = Image.open(img_path).convert('RGB')
 
@@ -74,7 +77,7 @@ def preprocess_image(img_path):
     normalization_constant = (1.0 - INPUT_MIN) / 255.0
     arr = arr * normalization_constant + INPUT_MIN
 
-    return np.expand_dims(arr, axis=0)
+    return arr
 
 
 def get_top_k(values, k, label_dict):
@@ -94,61 +97,101 @@ def get_top_k(values, k, label_dict):
     return results
 
 
-def main():
-    # Load all labels
-    all_labels = load_labels()
+def _load_models_v1():
+    """Load all 6 regional models using v1 Session API for faster inference.
 
-    # Load all 6 regional models via serving_default signature
-    models = {}
-    input_keys = {}
-    output_keys = {}
+    Returns (sessions, input_names, output_names) dicts keyed by region.
+    """
+    sessions = {}
+    input_names = {}
+    output_names = {}
+
     for region in REGIONS:
         model_path = os.path.join(MODELS_DIR, f'{region}_saved')
         if not os.path.isdir(model_path):
             print(f'ERROR: Model not found at {model_path}. Run convert_models.py first.', file=sys.stderr)
             sys.exit(1)
-        print(f'Loading {region} model...', file=sys.stderr)
-        loaded = tf.saved_model.load(model_path)
-        sig = loaded.signatures['serving_default']
-        models[region] = sig
-        input_keys[region] = list(sig.structured_input_signature[1].keys())[0]
-        output_keys[region] = list(sig.structured_outputs.keys())[0]
 
+        print(f'Loading {region} model...', file=sys.stderr)
+        sess = tf.compat.v1.Session(
+            graph=tf.compat.v1.Graph(),
+            config=tf.compat.v1.ConfigProto(allow_soft_placement=True),
+        )
+        meta = tf.compat.v1.saved_model.loader.load(
+            sess, [tf.compat.v1.saved_model.tag_constants.SERVING], model_path)
+        sig = meta.signature_def['serving_default']
+        input_names[region] = list(sig.inputs.values())[0].name
+        output_names[region] = list(sig.outputs.values())[0].name
+        sessions[region] = sess
+
+    return sessions, input_names, output_names
+
+
+def _preprocess_one(args):
+    """Preprocess a single image; returns (index, array) or (index, None) on error."""
+    idx, path = args
+    try:
+        return idx, preprocess_image(path)
+    except Exception:
+        return idx, None
+
+
+def main():
+    all_labels = load_labels()
+
+    print('Loading landmark models (v1 Session)...', file=sys.stderr)
+    sessions, input_names, output_names = _load_models_v1()
     print('All landmark models loaded', file=sys.stderr)
 
     paths = base_classifier.get_paths()
 
-    for path in paths:
-        try:
-            input_tensor = preprocess_image(path)
-            input_tf = tf.constant(input_tensor)
+    # Process in batches
+    for batch_start in range(0, len(paths), BATCH_SIZE):
+        batch_paths = paths[batch_start:batch_start + BATCH_SIZE]
 
-            # Collect results from all 6 models
-            all_results = []
+        # Parallel preprocessing
+        preprocessed = [None] * len(batch_paths)
+        args = [(i, p) for i, p in enumerate(batch_paths)]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for idx, arr in pool.map(_preprocess_one, args):
+                preprocessed[idx] = arr
+
+        valid_indices = [i for i, arr in enumerate(preprocessed) if arr is not None]
+        failed_indices = set(i for i, arr in enumerate(preprocessed) if arr is None)
+
+        # Per-image results: list of lists of {className, probability} dicts
+        image_results = [[] for _ in range(len(batch_paths))]
+
+        if valid_indices:
+            # Stack valid images: [N, 321, 321, 3]
+            batch_tensor = np.stack([preprocessed[i] for i in valid_indices], axis=0)
+
+            # Run each of the 6 regional models on the full batch (6 calls, not 6*N)
             for region in REGIONS:
-                model = models[region]
-                output = model(**{input_keys[region]: input_tf})
-                values = output[output_keys[region]].numpy().flatten()
+                all_values = sessions[region].run(
+                    output_names[region],
+                    feed_dict={input_names[region]: batch_tensor},
+                )
+                # all_values shape: [N, num_classes]
+                for vi, valid_i in enumerate(valid_indices):
+                    values = all_values[vi].flatten()
+                    results = get_top_k(values, TOP_K, all_labels[region])
+                    for r in results:
+                        if r['probability'] >= THRESHOLD:
+                            image_results[valid_i].append(r)
 
-                # No softmax — raw logits, topK=7
-                results = get_top_k(values, TOP_K, all_labels[region])
-                for r in results:
-                    if r['probability'] >= THRESHOLD:
-                        all_results.append(r)
-
-            print(path, file=sys.stderr)
-            # Sort by probability descending, take best
-            all_results.sort(key=lambda x: x['probability'], reverse=True)
-            print(repr(all_results), file=sys.stderr)
-
-            if all_results:
-                base_classifier.output_result(['landmark', all_results[0]['className']])
+        # Emit results in input order
+        for i in range(len(batch_paths)):
+            if i in failed_indices:
+                print(f'Error processing {batch_paths[i]}', file=sys.stderr)
+                base_classifier.output_error()
             else:
-                base_classifier.output_result([])
-
-        except Exception as e:
-            print(f'Error processing {path}: {e}', file=sys.stderr)
-            base_classifier.output_error()
+                all_results = image_results[i]
+                all_results.sort(key=lambda x: x['probability'], reverse=True)
+                if all_results:
+                    base_classifier.output_result(['landmark', all_results[0]['className']])
+                else:
+                    base_classifier.output_result([])
 
 
 if __name__ == '__main__':

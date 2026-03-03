@@ -201,6 +201,11 @@ abstract class Classifier {
 		if ($ffmpegBinary !== '') {
 			$env['FFMPEG_BINARY'] = $ffmpegBinary;
 		}
+		// Pass imagenet model preference (auto, efficientnetv2, efficientnet_lite4)
+		$imagenetModel = $this->config->getAppValueString('imagenet.model', 'auto');
+		if ($imagenetModel !== 'auto') {
+			$env['RECOGNIZE_IMAGENET_MODEL'] = $imagenetModel;
+		}
 		$proc->setEnv($env);
 		$proc->setTimeout(count($paths) * $timeout);
 		$proc->setInput(implode("\n", $paths));

@@ -6,7 +6,7 @@ Model selection (matches JS behavior):
 - GPU mode: EfficientNetV2-XL (512x512, normalize to [-1,1])
 - CPU mode: EfficientNet-Lite4 (380x380, normalize to [0,1])
 
-Preprocessing: PIL resize → normalize → [1, H, W, 3]
+Preprocessing: PIL resize → normalize → [N, H, W, 3] (batched)
 Postprocessing: softmax → top-7 → rules.yml filtering → category aggregation → uppercase
 
 Reference: src/efficientnet/EfficientnetModel.js lines 47-78, src/classifier_imagenet.js
@@ -14,6 +14,7 @@ Reference: src/efficientnet/EfficientnetModel.js lines 47-78, src/classifier_ima
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import gpu_setup
 tf = gpu_setup.configure()
@@ -38,24 +39,79 @@ with open(os.path.join(DATA_DIR, 'imagenet_classes.json')) as f:
 rules = rules_engine.load_rules(os.path.join(SRC_DIR, 'rules.yml'))
 
 
-def select_model():
-    """Select model based on GPU availability, matching JS behavior.
+V2_VRAM_THRESHOLD_MB = 4 * 1024  # Need >4 GB VRAM for V2-XL (native model uses ~2.5 GB)
 
-    JS: efficientnetv2 (512, min=-1) for GPU, efficientnet_lite4 (380, min=0) for PUREJS.
+
+def _get_gpu_memory_mb():
+    """Get total GPU memory in MB, or 0 if unavailable."""
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
+            text=True, timeout=5, stderr=subprocess.DEVNULL,
+        )
+        return float(out.strip().split('\n')[0])
+    except Exception:
+        return 0
+
+
+def select_model():
+    """Select EfficientNet model variant.
+
+    Selection priority:
+    1. RECOGNIZE_IMAGENET_MODEL env var (set via Recognize admin settings):
+       'efficientnetv2' → always V2-XL (prefer native over TFJS-converted)
+       'efficientnet_lite4' → always Lite4
+    2. GPU memory heuristic: V2-XL native model needs ~2.5 GB VRAM,
+       threshold set to 4 GB to leave headroom for batch inference
+    3. Fallback: whatever model is available
     """
-    has_gpu = bool(tf.config.list_physical_devices('GPU'))
-    v2_path = os.path.join(MODELS_DIR, 'efficientnetv2_saved')
+    # Prefer native model (properly fused ops, 60% less VRAM) over TFJS-converted
+    v2_native_path = os.path.join(MODELS_DIR, 'efficientnetv2_native_saved')
+    v2_tfjs_path = os.path.join(MODELS_DIR, 'efficientnetv2_saved')
     lite_path = os.path.join(MODELS_DIR, 'efficientnet_lite4_saved')
 
-    if has_gpu and os.path.isdir(v2_path):
-        return v2_path, 512, -1, 'EfficientNetV2-XL'
-    elif os.path.isdir(lite_path):
-        return lite_path, 380, 0, 'EfficientNet-Lite4'
-    elif os.path.isdir(v2_path):
-        return v2_path, 512, -1, 'EfficientNetV2-XL'
-    else:
+    has_v2_native = os.path.isdir(v2_native_path)
+    has_v2_tfjs = os.path.isdir(v2_tfjs_path)
+    has_v2 = has_v2_native or has_v2_tfjs
+    v2_path = v2_native_path if has_v2_native else v2_tfjs_path
+    v2_label = 'EfficientNetV2-XL' + (' (native)' if has_v2_native else ' (TFJS)')
+    has_lite = os.path.isdir(lite_path)
+
+    if not has_v2 and not has_lite:
         print('ERROR: No imagenet model found. Run convert_models.py first.', file=sys.stderr)
         sys.exit(1)
+
+    # Check for explicit user override via env var (set by PHP from app config)
+    override = os.environ.get('RECOGNIZE_IMAGENET_MODEL', 'auto').lower()
+    if override == 'efficientnetv2' and has_v2:
+        print(f'Model override: {v2_label} (from settings)', file=sys.stderr)
+        return v2_path, 512, -1, v2_label
+    elif override == 'efficientnet_lite4' and has_lite:
+        print('Model override: EfficientNet-Lite4 (from settings)', file=sys.stderr)
+        return lite_path, 380, 0, 'EfficientNet-Lite4'
+
+    # Auto-select based on GPU memory
+    has_gpu = bool(tf.config.list_physical_devices('GPU'))
+    if has_gpu and has_v2 and has_lite:
+        vram = _get_gpu_memory_mb()
+        if vram >= V2_VRAM_THRESHOLD_MB:
+            print(f'Auto-selected {v2_label} ({vram:.0f} MB VRAM >= {V2_VRAM_THRESHOLD_MB} MB threshold)', file=sys.stderr)
+            return v2_path, 512, -1, v2_label
+        else:
+            print(f'Auto-selected EfficientNet-Lite4 ({vram:.0f} MB VRAM < {V2_VRAM_THRESHOLD_MB} MB threshold)', file=sys.stderr)
+            return lite_path, 380, 0, 'EfficientNet-Lite4'
+
+    # Fallback: GPU without both models, or CPU
+    if has_gpu and has_v2:
+        return v2_path, 512, -1, v2_label
+    elif has_lite:
+        return lite_path, 380, 0, 'EfficientNet-Lite4'
+    else:
+        return v2_path, 512, -1, v2_label
+
+
+BATCH_SIZE = 16  # Images per inference call; tune based on GPU memory
 
 
 def preprocess_image(img_path, img_size, input_min):
@@ -65,6 +121,8 @@ def preprocess_image(img_path, img_size, input_min):
     - Normalize from [0, 255] to [inputMin, 1] using:
       normalized = image * ((1 - inputMin) / 255.0) + inputMin
     - Resize to img_size x img_size bilinear
+
+    Returns [H, W, 3] array (no batch dim) for stacking into batches.
     """
     img = Image.open(img_path).convert('RGB')
 
@@ -78,8 +136,7 @@ def preprocess_image(img_path, img_size, input_min):
     normalization_constant = (1.0 - input_min) / 255.0
     arr = arr * normalization_constant + input_min
 
-    # Add batch dimension: [1, H, W, 3]
-    return np.expand_dims(arr, axis=0)
+    return arr
 
 
 def get_top_k(values, k):
@@ -116,6 +173,15 @@ def _load_model_v1(model_path):
     return sess, input_name, output_name
 
 
+def _preprocess_one(args):
+    """Preprocess a single image; returns (index, array) or (index, None) on error."""
+    idx, path, img_size, input_min = args
+    try:
+        return idx, preprocess_image(path, img_size, input_min)
+    except Exception:
+        return idx, None
+
+
 def main():
     model_path, img_size, input_min, model_name = select_model()
 
@@ -129,25 +195,38 @@ def main():
 
     paths = base_classifier.get_paths()
 
-    for path in paths:
-        try:
-            input_tensor = preprocess_image(path, img_size, input_min)
+    # Process in batches with parallel preprocessing
+    for batch_start in range(0, len(paths), BATCH_SIZE):
+        batch_paths = paths[batch_start:batch_start + BATCH_SIZE]
 
-            # Run inference via v1 Session
-            probs = sess.run(softmax_tensor, feed_dict={input_name: input_tensor})
-            probs = probs.flatten()
+        # Parallel preprocessing (PIL releases GIL during I/O and resize)
+        preprocessed = [None] * len(batch_paths)
+        args = [(i, p, img_size, input_min) for i, p in enumerate(batch_paths)]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for idx, arr in pool.map(_preprocess_one, args):
+                preprocessed[idx] = arr
 
-            # Get top-K
-            results = get_top_k(probs, TOP_K)
+        # Split into valid (for batched inference) and failed
+        valid_indices = [i for i, arr in enumerate(preprocessed) if arr is not None]
+        failed_indices = [i for i, arr in enumerate(preprocessed) if arr is None]
 
-            # Apply rules (with uppercase)
-            labels = rules_engine.apply_rules(results, rules, uppercase=True)
+        if valid_indices:
+            # Stack valid images into [N, H, W, 3] and run single inference
+            batch_tensor = np.stack([preprocessed[i] for i in valid_indices], axis=0)
+            all_probs = sess.run(softmax_tensor, feed_dict={input_name: batch_tensor})
 
-            base_classifier.output_result(labels)
-
-        except Exception as e:
-            print(f'Error processing {path}: {e}', file=sys.stderr)
-            base_classifier.output_error()
+        # Emit results in input order (PHP counts JSON lines to match files)
+        prob_idx = 0
+        for i in range(len(batch_paths)):
+            if i in failed_indices:
+                print(f'Error processing {batch_paths[i]}', file=sys.stderr)
+                base_classifier.output_error()
+            else:
+                probs = all_probs[prob_idx].flatten()
+                prob_idx += 1
+                results = get_top_k(probs, TOP_K)
+                labels = rules_engine.apply_rules(results, rules, uppercase=True)
+                base_classifier.output_result(labels)
 
 
 if __name__ == '__main__':
