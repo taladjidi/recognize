@@ -211,6 +211,9 @@ class TestFacesParity:
 
 @pytest.mark.skipif(not TEST_AUDIO, reason="No test audio found in tests/res/")
 class TestMusicnnParity:
+    @pytest.mark.skip(
+        reason="Python uses YAMNet (521 AudioSet classes) while JS uses MusicNN (15 MSD genres)"
+    )
     def test_musicnn(self):
         node_result = run_js_classifier(
             os.path.join(SRC_DIR, "classifier_musicnn.js"), TEST_AUDIO

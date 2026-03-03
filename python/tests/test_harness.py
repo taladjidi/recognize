@@ -67,8 +67,8 @@ class TestInfrastructure:
         data_dir = os.path.join(PYTHON_DIR, "data")
         assert os.path.isfile(os.path.join(data_dir, "imagenet_classes.json"))
         assert os.path.isfile(os.path.join(data_dir, "kinetics_classes.json"))
-        assert os.path.isfile(os.path.join(data_dir, "musicnn_classes.json"))
-        assert os.path.isfile(os.path.join(data_dir, "mel_matrix.npy"))
+        # musicnn_classes.json and mel_matrix.npy only needed for MusicNN fallback
+        # (YAMNet loads class names from model assets instead)
         assert os.path.exists(os.path.join(data_dir, "landmarks"))
 
 
@@ -150,15 +150,19 @@ class TestMovinet:
 
 
 class TestMusicnn:
-    """Test audio genre classification."""
+    """Test audio genre classification (YAMNet or MusicNN)."""
 
     def test_rock_rejam(self, run_classifier, has_musicnn_model, rock_mp3):
-        """Rock_Rejam.mp3 should be tagged 'electronic' (matches PHP CI)."""
+        """Rock_Rejam.mp3 should be tagged with a music genre."""
         result = run_classifier("musicnn", rock_mp3, timeout=180)
         assert result is not None, "Classifier returned no output"
         assert isinstance(result, list), f"Expected list, got {type(result)}"
         print(f"  Result: {result}")
-        assert "electronic" in result, f'"electronic" not in {result}'
+        # YAMNet classifies as 'rock'; MusicNN fallback classifies as 'electronic'
+        valid_genres = {"rock", "electronic", "metal", "punk", "blues"}
+        assert any(g in result for g in valid_genres), (
+            f"No recognized genre in {result}"
+        )
 
 
 # ── Geo classifier tests ─────────────────────────────────────────────

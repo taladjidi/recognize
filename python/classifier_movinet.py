@@ -1,10 +1,14 @@
-"""Video action classifier using MoViNet-A3.
+"""Video action classifier using MoViNet-A3 (Stream variant).
 
 Replaces src/classifier_movinet.js.
 Model is already in SavedModel format — no conversion needed.
 
-Preprocessing: FFmpeg → 176x176 @2fps raw RGB → normalize [0,1] → [1, N, 176, 176, 3]
+Preprocessing: FFmpeg → 256x256 @2fps raw RGB → normalize [0,1] → frame-by-frame [1, 1, 256, 256, 3]
 Postprocessing: softmax → top-6 → threshold 0.85
+
+The stream variant uses (2+1)D convolutions (conv2d) instead of Conv3D,
+avoiding the GPU segfault with TF 2.20. Falls back to base model on CPU
+if stream model is not found.
 
 Reference: src/movinet/MovinetModel.js lines 49-96
 """
@@ -25,7 +29,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(SCRIPT_DIR, "..", "models")
 DATA_DIR = os.path.join(SCRIPT_DIR, "data")
 
-FRAME_SIZE = 176
+FRAME_SIZE = 256
 TOP_K = 6
 THRESHOLD = 0.85
 
@@ -35,7 +39,7 @@ with open(os.path.join(DATA_DIR, "kinetics_classes.json")) as f:
 
 
 def extract_frames(video_path, ffmpeg_binary):
-    """Extract frames from video using FFmpeg at 2fps, 176x176 raw RGB.
+    """Extract frames from video using FFmpeg at 2fps, 256x256 raw RGB.
 
     Outputs raw RGB24 pixels directly instead of MJPEG, avoiding the
     JPEG encode (FFmpeg) + JPEG decode (PIL) overhead.
@@ -80,16 +84,69 @@ def extract_frames(video_path, ffmpeg_binary):
     return frames
 
 
-def main():
-    model_path = os.path.join(MODELS_DIR, "movinet-a3")
-    if not os.path.isdir(model_path):
-        print(f"ERROR: Model not found at {model_path}", file=sys.stderr)
-        sys.exit(1)
-
-    print("Loading MoViNet model...", file=sys.stderr)
+def _load_stream_model(model_path):
+    """Load MoViNet-A3 Stream model. Returns (init_states_fn, call_fn)."""
     loaded = tf.saved_model.load(model_path)
-    model = loaded.signatures["serving_default"]
-    print("Model loaded", file=sys.stderr)
+    init_fn = loaded.signatures["init_states"]
+    call_fn = loaded.signatures["call"]
+    return init_fn, call_fn
+
+
+def _load_base_model(model_path):
+    """Load MoViNet-A3 Base model (CPU fallback). Returns signature fn."""
+    with tf.device("/CPU:0"):
+        loaded = tf.saved_model.load(model_path)
+        return loaded.signatures["serving_default"]
+
+
+def _infer_stream(init_fn, call_fn, frames):
+    """Run streaming inference: init states, feed frames one-by-one, return final logits."""
+    # Initialize states for input shape [1, 1, H, W, 3]
+    states = init_fn(input_shape=tf.constant([1, 1, FRAME_SIZE, FRAME_SIZE, 3]))
+
+    # Feed frames one at a time
+    logits = None
+    for i in range(len(frames)):
+        frame = tf.constant(frames[i : i + 1][np.newaxis])  # [1, 1, H, W, 3]
+        inputs = {**states, "image": frame}
+        output = call_fn(**inputs)
+        # Separate logits from updated states
+        logits = output["logits"]
+        states = {k: v for k, v in output.items() if k != "logits"}
+
+    return logits
+
+
+def _infer_base(model, frames):
+    """Run base model inference: all frames at once (CPU only)."""
+    frame_batch = np.expand_dims(frames, axis=0)  # [1, N, H, W, 3]
+    with tf.device("/CPU:0"):
+        output = model(image=tf.constant(frame_batch))
+        return output["classifier_head"]
+
+
+def main():
+    stream_path = os.path.join(MODELS_DIR, "movinet-a3-stream")
+    base_path = os.path.join(MODELS_DIR, "movinet-a3")
+    use_stream = os.path.isdir(stream_path)
+
+    if use_stream:
+        print("Loading MoViNet-A3 Stream model...", file=sys.stderr)
+        init_fn, call_fn = _load_stream_model(stream_path)
+        print("Model loaded (stream)", file=sys.stderr)
+    elif os.path.isdir(base_path):
+        print(
+            "Stream model not found, falling back to base model (CPU)...",
+            file=sys.stderr,
+        )
+        base_model = _load_base_model(base_path)
+        print("Model loaded (base, CPU)", file=sys.stderr)
+    else:
+        print(
+            f"ERROR: No MoViNet model found at {stream_path} or {base_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     ffmpeg_binary = base_classifier.get_ffmpeg_binary()
     paths = base_classifier.get_paths()
@@ -101,11 +158,11 @@ def main():
                 base_classifier.output_error()
                 continue
 
-            # Add batch dim: [1, N, 176, 176, 3]
-            frame_batch = np.expand_dims(frames, axis=0)
+            if use_stream:
+                logits = _infer_stream(init_fn, call_fn, frames)
+            else:
+                logits = _infer_base(base_model, frames)
 
-            output = model(image=tf.constant(frame_batch))
-            logits = output["classifier_head"]
             probs = tf.nn.softmax(logits).numpy().flatten()
 
             # Get top-K above threshold

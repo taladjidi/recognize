@@ -1,0 +1,155 @@
+# YAMNet AudioSet → Recognize genre labels
+# Maps AudioSet class names (lowercased) to the same 15 MSD output genres.
+# Uses 'see:' aliases so multiple AudioSet classes map to one output label.
+# Thresholds are much lower than musicnn_rules.yml because YAMNet uses
+# sigmoid outputs across 521 classes — genre-specific scores are typically 1-5%.
+
+rap:
+  label: rap
+  threshold: 0.01
+
+rapping:
+  see: rap
+
+hip hop music:
+  see: rap
+
+jazz:
+  label: jazz
+  threshold: 0.01
+
+pop:
+  label: pop
+  threshold: 0.01
+
+pop music:
+  see: pop
+
+rock:
+  label: rock
+  threshold: 0.01
+
+rock music:
+  see: rock
+
+rock and roll:
+  see: rock
+
+progressive rock:
+  see: rock
+
+psychedelic rock:
+  see: rock
+
+country:
+  label: country
+  threshold: 0.01
+
+folk:
+  label: folk
+  threshold: 0.01
+
+folk music:
+  see: folk
+
+new age:
+  label: new age
+  threshold: 0.01
+
+new-age music:
+  see: new age
+
+ambient music:
+  see: new age
+
+rnb:
+  label: rnb
+  threshold: 0.01
+
+rhythm and blues:
+  see: rnb
+
+soul music:
+  see: rnb
+
+latin:
+  label: latin
+  threshold: 0.01
+
+music of latin america:
+  see: latin
+
+salsa music:
+  see: latin
+
+electronic:
+  label: electronic
+  threshold: 0.01
+
+electronic music:
+  see: electronic
+
+house music:
+  see: electronic
+
+techno:
+  see: electronic
+
+electronica:
+  see: electronic
+
+electronic dance music:
+  see: electronic
+
+trance music:
+  see: electronic
+
+disco:
+  see: electronic
+
+dance music:
+  see: electronic
+
+metal:
+  label: metal
+  threshold: 0.01
+
+heavy metal:
+  see: metal
+
+reggae:
+  label: reggae
+  threshold: 0.01
+
+blues:
+  label: blues
+  threshold: 0.01
+
+punk:
+  label: punk
+  threshold: 0.01
+
+punk rock:
+  see: punk
+
+world:
+  label: world
+  threshold: 0.01
+
+music of africa:
+  see: world
+
+music of asia:
+  see: world
+
+middle eastern music:
+  see: world
+
+traditional music:
+  see: world
+
+carnatic music:
+  see: world
+
+music of bollywood:
+  see: world

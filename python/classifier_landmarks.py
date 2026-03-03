@@ -27,7 +27,6 @@ MODELS_DIR = os.path.join(SCRIPT_DIR, "..", "models")
 DATA_DIR = os.path.join(SCRIPT_DIR, "data")
 
 IMG_SIZE = 321
-INPUT_MIN = 0
 TOP_K = 7
 THRESHOLD = 0.9
 BATCH_SIZE = 16
@@ -41,20 +40,13 @@ REGIONS = [
     "landmarks_oceania",
 ]
 
-REGION_LABEL_FILES = {
-    "landmarks_africa": "africa.json",
-    "landmarks_asia": "asia.json",
-    "landmarks_europe": "europe.json",
-    "landmarks_north_america": "north_america.json",
-    "landmarks_south_america": "south_america.json",
-    "landmarks_oceania": "oceania.json",
-}
-
 
 def load_labels():
     """Load landmark labels for all regions."""
     labels = {}
-    for region, filename in REGION_LABEL_FILES.items():
+    for region in REGIONS:
+        # landmarks_africa → africa.json, landmarks_north_america → north_america.json
+        filename = region.removeprefix("landmarks_") + ".json"
         filepath = os.path.join(DATA_DIR, "landmarks", filename)
         with open(filepath) as f:
             data = json.load(f)
@@ -63,9 +55,8 @@ def load_labels():
 
 
 def preprocess_image(img_path):
-    """Load, resize, and normalize an image.
+    """Load, resize, and normalize an image to [0, 1].
 
-    Normalize from [0, 255] to [0, 1]: pixel * (1/255)
     Returns [H, W, 3] array (no batch dim) for stacking into batches.
     """
     img = Image.open(img_path).convert("RGB")
@@ -73,13 +64,7 @@ def preprocess_image(img_path):
     if img.size != (IMG_SIZE, IMG_SIZE):
         img = img.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
 
-    arr = np.array(img, dtype=np.float32)
-
-    # Normalize to [0, 1]
-    normalization_constant = (1.0 - INPUT_MIN) / 255.0
-    arr = arr * normalization_constant + INPUT_MIN
-
-    return arr
+    return np.array(img, dtype=np.float32) / 255.0
 
 
 def get_top_k(values, k, label_dict):

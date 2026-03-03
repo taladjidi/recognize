@@ -113,11 +113,17 @@ def face_images():
 
 @pytest.fixture(scope="session")
 def has_imagenet_model():
-    """Check if an EfficientNet SavedModel is available (native or TFJS-converted)."""
+    """Check if an EfficientNet SavedModel is available (V2-S, native V2-XL, TFJS V2-XL, or Lite4)."""
+    v2s = os.path.join(MODELS_DIR, "efficientnetv2s_saved", "saved_model.pb")
     native = os.path.join(MODELS_DIR, "efficientnetv2_native_saved", "saved_model.pb")
     tfjs = os.path.join(MODELS_DIR, "efficientnetv2_saved", "saved_model.pb")
     lite = os.path.join(MODELS_DIR, "efficientnet_lite4_saved", "saved_model.pb")
-    if not (os.path.isfile(native) or os.path.isfile(tfjs) or os.path.isfile(lite)):
+    if not (
+        os.path.isfile(v2s)
+        or os.path.isfile(native)
+        or os.path.isfile(tfjs)
+        or os.path.isfile(lite)
+    ):
         pytest.skip(
             "No imagenet model found (run convert_models.py or download_native_v2xl.py)"
         )
@@ -139,19 +145,21 @@ def has_landmark_models():
 
 @pytest.fixture(scope="session")
 def has_movinet_model():
-    """Check if MoViNet SavedModel is available (already in native format)."""
-    path = os.path.join(MODELS_DIR, "movinet-a3", "saved_model.pb")
-    if not os.path.isfile(path):
-        pytest.skip("Model missing: movinet-a3")
+    """Check if MoViNet SavedModel is available (stream or base)."""
+    stream = os.path.join(MODELS_DIR, "movinet-a3-stream", "saved_model.pb")
+    base = os.path.join(MODELS_DIR, "movinet-a3", "saved_model.pb")
+    if not (os.path.isfile(stream) or os.path.isfile(base)):
+        pytest.skip("Model missing: movinet-a3-stream or movinet-a3")
     return True
 
 
 @pytest.fixture(scope="session")
 def has_musicnn_model():
-    """Check if MusicNN SavedModel is available."""
-    path = os.path.join(MODELS_DIR, "musicnn_saved", "saved_model.pb")
-    if not os.path.isfile(path):
-        pytest.skip("Model not converted: musicnn_saved (run convert_models.py)")
+    """Check if YAMNet or MusicNN SavedModel is available."""
+    yamnet = os.path.join(MODELS_DIR, "yamnet_saved", "saved_model.pb")
+    musicnn = os.path.join(MODELS_DIR, "musicnn_saved", "saved_model.pb")
+    if not (os.path.isfile(yamnet) or os.path.isfile(musicnn)):
+        pytest.skip("Model missing: yamnet_saved or musicnn_saved")
     return True
 
 

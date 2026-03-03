@@ -36,6 +36,10 @@ from classifier_movinet import (
     THRESHOLD,
     KINETICS_CLASSES,
     extract_frames,
+    _load_stream_model,
+    _load_base_model,
+    _infer_stream,
+    _infer_base,
 )
 
 RES_DIR = os.path.join(PROJECT_ROOT, "tests", "res")
@@ -57,16 +61,22 @@ def find_test_videos(repeat=5):
 def run_benchmark():
     report = BenchmarkReport("MoViNet (video action classification)")
 
-    model_path = os.path.join(MODELS_DIR, "movinet-a3")
-    if not os.path.isdir(model_path):
-        print_err(f"Model not found at {model_path}")
-        sys.exit(1)
+    stream_path = os.path.join(MODELS_DIR, "movinet-a3-stream")
+    base_path = os.path.join(MODELS_DIR, "movinet-a3")
+    use_stream = os.path.isdir(stream_path)
 
     # Model load
     gpu_before = gpu_snapshot()
     with TimingContext("model_load") as t_load:
-        loaded = tf.saved_model.load(model_path)
-        model = loaded.signatures["serving_default"]
+        if use_stream:
+            init_fn, call_fn = _load_stream_model(stream_path)
+            print_err("Loaded MoViNet-A3 Stream")
+        elif os.path.isdir(base_path):
+            base_model = _load_base_model(base_path)
+            print_err("Loaded MoViNet-A3 Base (CPU)")
+        else:
+            print_err("No MoViNet model found")
+            sys.exit(1)
     gpu_after = gpu_snapshot()
 
     print_err(f"Model load: {t_load.elapsed:.3f}s")
@@ -81,7 +91,7 @@ def run_benchmark():
     for i, path in enumerate(paths):
         is_warmup = i == 0
 
-        # FFmpeg transcode + raw frame extraction (combined in new API)
+        # FFmpeg transcode + raw frame extraction
         with TimingContext("extract") as t_extract:
             frames = extract_frames(path, ffmpeg_binary)
 
@@ -91,14 +101,16 @@ def run_benchmark():
 
         n_frames = len(frames)
 
-        # Numpy stacking (frames already normalized)
+        # Preprocess (minimal for stream — frames already normalized)
         with TimingContext("preprocess") as t_pre:
-            frame_batch = np.expand_dims(frames, axis=0)
+            pass  # Frames are already [N, H, W, 3] float32
 
         # Inference
         with TimingContext("inference") as t_inf:
-            output = model(image=tf.constant(frame_batch))
-            logits = output["classifier_head"]
+            if use_stream:
+                logits = _infer_stream(init_fn, call_fn, frames)
+            else:
+                logits = _infer_base(base_model, frames)
             probs = tf.nn.softmax(logits).numpy().flatten()
 
         # Postprocess
@@ -127,6 +139,7 @@ def run_benchmark():
             extra={
                 "extract_s": t_extract.elapsed,
                 "n_frames": n_frames,
+                "model_variant": "stream" if use_stream else "base",
             },
         )
         report.add(result)

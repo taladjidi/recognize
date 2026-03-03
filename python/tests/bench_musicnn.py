@@ -1,7 +1,6 @@
-"""Benchmark for classifier_musicnn.py — MusicNN audio genre classification.
+"""Benchmark for classifier_musicnn.py — audio genre classification (YAMNet or MusicNN).
 
-Measures: model load, FFmpeg transcode, STFT/mel spectrogram computation,
-batched inference, softmax averaging + rules postprocessing.
+Measures: model load, FFmpeg transcode, inference, postprocessing.
 
 Usage:
     RECOGNIZE_GPU=true python python/tests/bench_musicnn.py
@@ -31,16 +30,14 @@ tf = gpu_setup.configure()
 import numpy as np
 
 import base_classifier
+import rules_engine
 from classifier_musicnn import (
     MODELS_DIR,
-    TOP_K,
-    BATCH_FRAMES,
-    MSD_CLASSES,
-    rules,
-    transcode_audio,
-    compute_mel_spectrogram,
+    YAMNET_TOP_K,
+    SRC_DIR,
+    transcode_audio_16khz,
+    _load_yamnet_class_names,
 )
-import rules_engine
 
 RES_DIR = os.path.join(PROJECT_ROOT, "tests", "res")
 
@@ -59,20 +56,19 @@ def find_test_audio(repeat=5):
 
 
 def run_benchmark():
-    report = BenchmarkReport("MusicNN (audio genre classification)")
+    report = BenchmarkReport("YAMNet (audio genre classification)")
 
-    model_path = os.path.join(MODELS_DIR, "musicnn_saved")
-    if not os.path.isdir(model_path):
-        print_err(f"Model not found at {model_path}")
+    yamnet_path = os.path.join(MODELS_DIR, "yamnet_saved")
+    if not os.path.isdir(yamnet_path):
+        print_err(f"YAMNet model not found at {yamnet_path}")
         sys.exit(1)
 
     # Model load
     gpu_before = gpu_snapshot()
     with TimingContext("model_load") as t_load:
-        loaded = tf.saved_model.load(model_path)
-        model = loaded.signatures["serving_default"]
-        input_key = list(model.structured_input_signature[1].keys())[0]
-        output_key = list(model.structured_outputs.keys())[0]
+        model = tf.saved_model.load(yamnet_path)
+        class_names = _load_yamnet_class_names(model)
+        rules_data = rules_engine.load_rules(os.path.join(SRC_DIR, "yamnet_rules.yml"))
     gpu_after = gpu_snapshot()
 
     print_err(f"Model load: {t_load.elapsed:.3f}s")
@@ -89,67 +85,34 @@ def run_benchmark():
 
         # FFmpeg transcode
         with TimingContext("ffmpeg") as t_ffmpeg:
-            audio_data = transcode_audio(path, ffmpeg_binary)
+            audio_data = transcode_audio_16khz(path, ffmpeg_binary)
 
-        # Mel spectrogram
-        with TimingContext("mel_spectrogram") as t_mel:
-            mel_spec = compute_mel_spectrogram(audio_data)
-
-        total_frames = mel_spec.shape[0]
-        num_batches = total_frames // BATCH_FRAMES
-        if num_batches == 0:
-            print_err(f"  Audio too short: {path}")
-            continue
-
-        # Batch construction
-        with TimingContext("preprocess") as t_pre:
-            offset = min(BATCH_FRAMES * 30, total_frames - num_batches * BATCH_FRAMES)
-            mel_spec = mel_spec[offset:]
-            num_batches = mel_spec.shape[0] // BATCH_FRAMES
-            batches = tf.stack(
-                [
-                    mel_spec[j * BATCH_FRAMES : (j + 1) * BATCH_FRAMES]
-                    for j in range(num_batches)
-                ]
-            )
-
-        # Inference (already batched)
+        # Inference (YAMNet handles preprocessing internally)
         with TimingContext("inference") as t_inf:
-            output = model(**{input_key: batches})
-            logits = output[output_key]
+            waveform = tf.constant(audio_data, dtype=tf.float32)
+            scores, embeddings, spectrogram = model(waveform)
 
         # Postprocess
         with TimingContext("postprocess") as t_post:
-            logit_batches = tf.split(logits, num_batches, axis=0)
-            prob_batches = [tf.nn.softmax(lb) for lb in logit_batches]
-            probabilities = (
-                tf.reduce_mean(tf.stack(prob_batches), axis=0).numpy().flatten()
-            )
-
-            indices = np.argsort(probabilities)[::-1][:TOP_K]
+            avg_scores = tf.reduce_mean(scores, axis=0).numpy()
+            indices = np.argsort(avg_scores)[::-1][:YAMNET_TOP_K]
             results = [
                 {
-                    "className": MSD_CLASSES[idx],
-                    "probability": float(probabilities[idx]),
+                    "className": class_names[idx],
+                    "probability": float(avg_scores[idx]),
                 }
                 for idx in indices
             ]
-            labels = rules_engine.apply_rules(results, rules, uppercase=False)
+            labels = rules_engine.apply_rules(results, rules_data, uppercase=False)
 
         gpu = gpu_snapshot()
 
-        total = (
-            t_ffmpeg.elapsed
-            + t_mel.elapsed
-            + t_pre.elapsed
-            + t_inf.elapsed
-            + t_post.elapsed
-        )
+        total = t_ffmpeg.elapsed + t_inf.elapsed + t_post.elapsed
         result = BenchmarkResult(
-            classifier="musicnn",
+            classifier="yamnet",
             file_path=os.path.basename(path),
             model_load_s=t_load.elapsed if i == 0 else 0.0,
-            preprocess_s=t_pre.elapsed,
+            preprocess_s=0.0,  # YAMNet does preprocessing internally
             inference_s=t_inf.elapsed,
             postprocess_s=t_post.elapsed,
             total_s=total,
@@ -158,21 +121,19 @@ def run_benchmark():
             is_warmup=is_warmup,
             extra={
                 "ffmpeg_s": t_ffmpeg.elapsed,
-                "mel_spectrogram_s": t_mel.elapsed,
-                "n_batches": num_batches,
-                "total_frames": int(total_frames),
+                "n_frames": int(scores.shape[0]),
             },
         )
         report.add(result)
 
         if is_warmup:
             print_err(
-                f"  Warm-up: ffmpeg={t_ffmpeg.elapsed * 1000:.0f}ms mel={t_mel.elapsed * 1000:.0f}ms "
-                f"inf={t_inf.elapsed * 1000:.0f}ms ({num_batches} batches) → {labels}"
+                f"  Warm-up: ffmpeg={t_ffmpeg.elapsed * 1000:.0f}ms "
+                f"inf={t_inf.elapsed * 1000:.0f}ms ({scores.shape[0]} frames) → {labels}"
             )
         elif i == 1:
             print_err(
-                f"  Steady:  ffmpeg={t_ffmpeg.elapsed * 1000:.0f}ms mel={t_mel.elapsed * 1000:.0f}ms "
+                f"  Steady:  ffmpeg={t_ffmpeg.elapsed * 1000:.0f}ms "
                 f"inf={t_inf.elapsed * 1000:.0f}ms"
             )
 
