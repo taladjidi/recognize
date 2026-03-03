@@ -7,6 +7,7 @@ Protocol (matches the Node.js classifiers):
 - On error for a file, output '[]' to stdout
 - Diagnostics go to stderr
 """
+
 import json
 import os
 import sys
@@ -14,17 +15,20 @@ import sys
 # Set a stable writable matplotlib config dir before any transitive import
 # (TensorFlow and InsightFace pull in matplotlib). Avoids permission errors
 # when running as the apache user whose home dir is not writable.
-os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib-recognize')
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-recognize")
 
 
 def get_paths():
     """Read file paths from stdin (if arg is '-') or from argv."""
     if len(sys.argv) < 2:
-        print('Usage: python classifier_<model>.py <file1> [file2 ...] | python classifier_<model>.py -', file=sys.stderr)
+        print(
+            "Usage: python classifier_<model>.py <file1> [file2 ...] | python classifier_<model>.py -",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    if sys.argv[1] == '-':
-        paths = sys.stdin.read().split('\n')
+    if sys.argv[1] == "-":
+        paths = sys.stdin.read().split("\n")
     else:
         paths = sys.argv[1:]
 
@@ -39,3 +43,16 @@ def output_result(result):
 def output_error():
     """Write empty result for a failed file."""
     output_result([])
+
+
+def get_ffmpeg_binary():
+    """Get ffmpeg binary path from FFMPEG_BINARY env var or system PATH."""
+    import shutil
+
+    ffmpeg = os.environ.get("FFMPEG_BINARY", "")
+    if ffmpeg and os.path.isfile(ffmpeg):
+        return ffmpeg
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        return ffmpeg
+    raise RuntimeError("ffmpeg not found. Set FFMPEG_BINARY env var.")

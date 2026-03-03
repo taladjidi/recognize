@@ -7,13 +7,14 @@ Postprocessing: softmax per batch → average → top-6 → musicnn_rules.yml fi
 
 Reference: src/musicnn/MusicnnModel.js lines 46-85
 """
+
 import json
-import math
 import os
 import subprocess
 import sys
 
 import gpu_setup
+
 tf = gpu_setup.configure()
 import numpy as np
 import soundfile as sf
@@ -23,62 +24,56 @@ import base_classifier
 import rules_engine
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(SCRIPT_DIR, '..', 'models')
-DATA_DIR = os.path.join(SCRIPT_DIR, 'data')
-SRC_DIR = os.path.join(SCRIPT_DIR, '..', 'src')
+MODELS_DIR = os.path.join(SCRIPT_DIR, "..", "models")
+DATA_DIR = os.path.join(SCRIPT_DIR, "data")
+SRC_DIR = os.path.join(SCRIPT_DIR, "..", "src")
 
 TOP_K = 6
 BATCH_FRAMES = 188
 MAX_DURATION = 120  # seconds
 
 # Load class names
-with open(os.path.join(DATA_DIR, 'musicnn_classes.json')) as f:
+with open(os.path.join(DATA_DIR, "musicnn_classes.json")) as f:
     MSD_CLASSES = json.load(f)
 
 # Load mel matrix (exact copy from JS)
-MEL_MATRIX = np.load(os.path.join(DATA_DIR, 'mel_matrix.npy'))
+MEL_MATRIX = np.load(os.path.join(DATA_DIR, "mel_matrix.npy"))
 
 # Load rules
-rules = rules_engine.load_rules(os.path.join(SRC_DIR, 'musicnn_rules.yml'))
-
-
-def get_ffmpeg_binary():
-    """Get ffmpeg binary path from env or system."""
-    ffmpeg = os.environ.get('FFMPEG_BINARY', '')
-    if ffmpeg and os.path.isfile(ffmpeg):
-        return ffmpeg
-    import shutil
-    ffmpeg = shutil.which('ffmpeg')
-    if ffmpeg:
-        return ffmpeg
-    raise RuntimeError('ffmpeg not found. Set FFMPEG_BINARY env var.')
+rules = rules_engine.load_rules(os.path.join(SRC_DIR, "musicnn_rules.yml"))
 
 
 def transcode_audio(song_path, ffmpeg_binary):
     """Transcode audio to 8kHz mono 16-bit PCM WAV using FFmpeg."""
     cores_arg = []
-    cores = os.environ.get('RECOGNIZE_CORES', '0')
-    if cores and cores != '0':
-        cores_arg = ['-threads', cores]
+    cores = os.environ.get("RECOGNIZE_CORES", "0")
+    if cores and cores != "0":
+        cores_arg = ["-threads", cores]
 
     cmd = [
         ffmpeg_binary,
-        '-i', song_path,
-        '-f', 'wav',
-        '-ac', '1',
-        '-ar', '8000',
-        '-acodec', 'pcm_s16le',
-        '-t', str(MAX_DURATION),
+        "-i",
+        song_path,
+        "-f",
+        "wav",
+        "-ac",
+        "1",
+        "-ar",
+        "8000",
+        "-acodec",
+        "pcm_s16le",
+        "-t",
+        str(MAX_DURATION),
         *cores_arg,
-        '-',
+        "-",
     ]
 
     proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0:
-        raise RuntimeError(f'FFmpeg error: {proc.stderr.decode()[:200]}')
+        raise RuntimeError(f"FFmpeg error: {proc.stderr.decode()[:200]}")
 
     # Decode WAV from stdout
-    audio_data, sample_rate = sf.read(io.BytesIO(proc.stdout), dtype='float32')
+    audio_data, sample_rate = sf.read(io.BytesIO(proc.stdout), dtype="float32")
     return audio_data
 
 
@@ -107,19 +102,22 @@ def compute_mel_spectrogram(audio_data):
 
 
 def main():
-    model_path = os.path.join(MODELS_DIR, 'musicnn_saved')
+    model_path = os.path.join(MODELS_DIR, "musicnn_saved")
     if not os.path.isdir(model_path):
-        print(f'ERROR: Model not found at {model_path}. Run convert_models.py first.', file=sys.stderr)
+        print(
+            f"ERROR: Model not found at {model_path}. Run convert_models.py first.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    print('Loading MusicNN model...', file=sys.stderr)
+    print("Loading MusicNN model...", file=sys.stderr)
     loaded = tf.saved_model.load(model_path)
-    model = loaded.signatures['serving_default']
+    model = loaded.signatures["serving_default"]
     input_key = list(model.structured_input_signature[1].keys())[0]
     output_key = list(model.structured_outputs.keys())[0]
-    print('Model loaded', file=sys.stderr)
+    print("Model loaded", file=sys.stderr)
 
-    ffmpeg_binary = get_ffmpeg_binary()
+    ffmpeg_binary = base_classifier.get_ffmpeg_binary()
     paths = base_classifier.get_paths()
 
     for path in paths:
@@ -133,7 +131,7 @@ def main():
             # JS: slice from min(188*30, total - floor(total/188)*188)
             num_batches = total_frames // BATCH_FRAMES
             if num_batches == 0:
-                print(f'Audio too short for classification: {path}', file=sys.stderr)
+                print(f"Audio too short for classification: {path}", file=sys.stderr)
                 base_classifier.output_error()
                 continue
 
@@ -142,7 +140,12 @@ def main():
             num_batches = mel_spec.shape[0] // BATCH_FRAMES
 
             # Split into batches and stack: [num_batches, 188, 96, 1]
-            batches = tf.stack([mel_spec[i * BATCH_FRAMES:(i + 1) * BATCH_FRAMES] for i in range(num_batches)])
+            batches = tf.stack(
+                [
+                    mel_spec[i * BATCH_FRAMES : (i + 1) * BATCH_FRAMES]
+                    for i in range(num_batches)
+                ]
+            )
 
             # Run inference via serving_default signature
             output = model(**{input_key: batches})
@@ -151,16 +154,20 @@ def main():
             # Softmax per batch, then average
             logit_batches = tf.split(logits, num_batches, axis=0)
             prob_batches = [tf.nn.softmax(lb) for lb in logit_batches]
-            probabilities = tf.reduce_mean(tf.stack(prob_batches), axis=0).numpy().flatten()
+            probabilities = (
+                tf.reduce_mean(tf.stack(prob_batches), axis=0).numpy().flatten()
+            )
 
             # Get top-K
             indices = np.argsort(probabilities)[::-1][:TOP_K]
             results = []
             for idx in indices:
-                results.append({
-                    'className': MSD_CLASSES[idx],
-                    'probability': float(probabilities[idx]),
-                })
+                results.append(
+                    {
+                        "className": MSD_CLASSES[idx],
+                        "probability": float(probabilities[idx]),
+                    }
+                )
 
             # Apply rules (no uppercase for musicnn)
             labels = rules_engine.apply_rules(results, rules, uppercase=False)
@@ -168,9 +175,9 @@ def main():
             base_classifier.output_result(labels)
 
         except Exception as e:
-            print(f'Error processing {path}: {e}', file=sys.stderr)
+            print(f"Error processing {path}: {e}", file=sys.stderr)
             base_classifier.output_error()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

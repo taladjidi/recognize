@@ -10,14 +10,14 @@ Handles:
 - Category probability aggregation (squared probability sums)
 - Deduplication
 """
+
 import math
-import os
 import yaml
 
 
 def load_rules(rules_path):
     """Load rules from a YAML file."""
-    with open(rules_path, 'r') as f:
+    with open(rules_path, "r") as f:
         return yaml.safe_load(f)
 
 
@@ -26,8 +26,8 @@ def find_rule(rules, class_name):
     rule = rules.get(class_name)
     if rule is None:
         return None
-    if 'see' in rule:
-        return find_rule(rules, rule['see'])
+    if "see" in rule:
+        return find_rule(rules, rule["see"])
     return rule
 
 
@@ -47,28 +47,28 @@ def apply_rules(results, rules, uppercase=False):
     # Enrich results with rules
     enriched = []
     for result in results:
-        class_name = result['className'].split(',')[0].lower()
+        class_name = result["className"].split(",")[0].lower()
         rule = find_rule(rules, class_name)
-        enriched.append({
-            'className': class_name,
-            'probability': result['probability'],
-            'rule': rule,
-        })
-        import sys
-        print(repr({'className': class_name, 'probability': result['probability'], 'rule': rule}), file=sys.stderr)
+        enriched.append(
+            {
+                "className": class_name,
+                "probability": result["probability"],
+                "rule": rule,
+            }
+        )
 
     labels = []
 
     # Direct threshold filtering
     for item in enriched:
-        if item['probability'] < 0.0 or item['rule'] is None:
+        if item["rule"] is None:
             continue
-        threshold = item['rule'].get('threshold', 0.0)
-        if item['probability'] >= threshold:
-            if item['rule'].get('label'):
-                labels.append(item['rule']['label'])
-            if item['rule'].get('categories'):
-                labels.extend(item['rule']['categories'])
+        threshold = item["rule"].get("threshold", 0.0)
+        if item["probability"] >= threshold:
+            if item["rule"].get("label"):
+                labels.append(item["rule"]["label"])
+            if item["rule"].get("categories"):
+                labels.extend(item["rule"]["categories"])
 
     # Category probability aggregation
     cat_probabilities = {}
@@ -76,21 +76,23 @@ def apply_rules(results, rules, uppercase=False):
     cat_count = {}
 
     for item in enriched:
-        if item['rule'] is None:
+        if item["rule"] is None:
             continue
         categories = []
-        if item['rule'].get('label'):
-            categories.append(item['rule']['label'])
-        if item['rule'].get('categories'):
-            categories.extend(item['rule']['categories'])
+        if item["rule"].get("label"):
+            categories.append(item["rule"]["label"])
+        if item["rule"].get("categories"):
+            categories.extend(item["rule"]["categories"])
 
         for category in set(categories):
             if category not in cat_probabilities:
                 cat_probabilities[category] = 0.0
                 cat_thresholds[category] = 0.0
                 cat_count[category] = 0
-            cat_probabilities[category] += item['probability'] ** 2
-            cat_thresholds[category] = max(cat_thresholds[category], item['rule'].get('threshold', 0.0))
+            cat_probabilities[category] += item["probability"] ** 2
+            cat_thresholds[category] = max(
+                cat_thresholds[category], item["rule"].get("threshold", 0.0)
+            )
             cat_count[category] += 1
 
     for category, probability in cat_probabilities.items():

@@ -6,12 +6,12 @@ Provides:
 - BenchmarkReport: aggregates results and prints summary tables
 - gpu_snapshot(): captures GPU memory/utilization via nvidia-smi
 """
+
 import dataclasses
 import json
 import subprocess
 import sys
 import time
-from typing import Optional
 
 
 class TimingContext:
@@ -89,12 +89,20 @@ class BenchmarkReport:
             avg_total = sum(r.total_s for r in results) / n
 
             # Model load is typically measured once
-            model_load = next((r.model_load_s for r in self.results
-                               if r.classifier == classifier and r.model_load_s > 0), 0.0)
+            model_load = next(
+                (
+                    r.model_load_s
+                    for r in self.results
+                    if r.classifier == classifier and r.model_load_s > 0
+                ),
+                0.0,
+            )
 
             # Warmup inference
-            warmup = next((r for r in self.results
-                           if r.classifier == classifier and r.is_warmup), None)
+            warmup = next(
+                (r for r in self.results if r.classifier == classifier and r.is_warmup),
+                None,
+            )
 
             lines.append(f"\n  {classifier} ({n} files, steady-state)")
             lines.append(f"  {'-' * 60}")
@@ -106,7 +114,9 @@ class BenchmarkReport:
             lines.append(f"  Avg inference:    {avg_inf * 1000:8.1f} ms")
             lines.append(f"  Avg postprocess:  {avg_post * 1000:8.1f} ms")
             lines.append(f"  Avg total/file:   {avg_total * 1000:8.1f} ms")
-            lines.append(f"  Throughput:       {1.0 / avg_total if avg_total > 0 else 0:8.1f} files/s")
+            lines.append(
+                f"  Throughput:       {1.0 / avg_total if avg_total > 0 else 0:8.1f} files/s"
+            )
 
             # GPU stats
             gpu_mems = [r.gpu_mem_mb for r in results if r.gpu_mem_mb > 0]
@@ -118,14 +128,17 @@ class BenchmarkReport:
             for r in results:
                 extra_keys.update(r.extra.keys())
             for key in sorted(extra_keys):
-                vals = [r.extra[key] for r in results if key in r.extra
-                        and isinstance(r.extra[key], (int, float))]
+                vals = [
+                    r.extra[key]
+                    for r in results
+                    if key in r.extra and isinstance(r.extra[key], (int, float))
+                ]
                 if vals:
                     avg_val = sum(vals) / len(vals)
                     lines.append(f"  Avg {key}: {avg_val * 1000:8.1f} ms")
 
         lines.append(f"\n{'=' * 80}")
-        return '\n'.join(lines)
+        return "\n".join(lines)
 
     def to_dict(self) -> dict:
         output = {"name": self.name, "classifiers": {}}
@@ -133,19 +146,36 @@ class BenchmarkReport:
             n = len(results)
             if n == 0:
                 continue
-            model_load = next((r.model_load_s for r in self.results
-                               if r.classifier == classifier and r.model_load_s > 0), 0.0)
-            warmup = next((r for r in self.results
-                           if r.classifier == classifier and r.is_warmup), None)
+            model_load = next(
+                (
+                    r.model_load_s
+                    for r in self.results
+                    if r.classifier == classifier and r.model_load_s > 0
+                ),
+                0.0,
+            )
+            warmup = next(
+                (r for r in self.results if r.classifier == classifier and r.is_warmup),
+                None,
+            )
             output["classifiers"][classifier] = {
                 "n_files": n,
                 "model_load_s": round(model_load, 4),
                 "warmup_inference_s": round(warmup.inference_s, 4) if warmup else None,
-                "avg_preprocess_ms": round(sum(r.preprocess_s for r in results) / n * 1000, 2),
-                "avg_inference_ms": round(sum(r.inference_s for r in results) / n * 1000, 2),
-                "avg_postprocess_ms": round(sum(r.postprocess_s for r in results) / n * 1000, 2),
+                "avg_preprocess_ms": round(
+                    sum(r.preprocess_s for r in results) / n * 1000, 2
+                ),
+                "avg_inference_ms": round(
+                    sum(r.inference_s for r in results) / n * 1000, 2
+                ),
+                "avg_postprocess_ms": round(
+                    sum(r.postprocess_s for r in results) / n * 1000, 2
+                ),
                 "avg_total_ms": round(sum(r.total_s for r in results) / n * 1000, 2),
-                "gpu_mem_max_mb": round(max((r.gpu_mem_mb for r in results if r.gpu_mem_mb > 0), default=0), 0),
+                "gpu_mem_max_mb": round(
+                    max((r.gpu_mem_mb for r in results if r.gpu_mem_mb > 0), default=0),
+                    0,
+                ),
             }
             # Extra averages
             extra_keys = set()
@@ -153,8 +183,11 @@ class BenchmarkReport:
                 extra_keys.update(r.extra.keys())
             extras = {}
             for key in sorted(extra_keys):
-                vals = [r.extra[key] for r in results if key in r.extra
-                        and isinstance(r.extra[key], (int, float))]
+                vals = [
+                    r.extra[key]
+                    for r in results
+                    if key in r.extra and isinstance(r.extra[key], (int, float))
+                ]
                 if vals:
                     extras[f"avg_{key}_ms"] = round(sum(vals) / len(vals) * 1000, 2)
             if extras:
@@ -169,17 +202,22 @@ def gpu_snapshot() -> dict:
     """Query nvidia-smi for current GPU memory and utilization."""
     try:
         out = subprocess.check_output(
-            ['nvidia-smi', '--query-gpu=memory.used,utilization.gpu',
-             '--format=csv,noheader,nounits'],
-            text=True, timeout=5, stderr=subprocess.DEVNULL,
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=5,
+            stderr=subprocess.DEVNULL,
         )
-        parts = out.strip().split(',')
+        parts = out.strip().split(",")
         return {
-            'memory_used_mb': float(parts[0].strip()),
-            'utilization_pct': float(parts[1].strip()),
+            "memory_used_mb": float(parts[0].strip()),
+            "utilization_pct": float(parts[1].strip()),
         }
     except Exception:
-        return {'memory_used_mb': 0.0, 'utilization_pct': 0.0}
+        return {"memory_used_mb": 0.0, "utilization_pct": 0.0}
 
 
 def print_err(*args, **kwargs):
