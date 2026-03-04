@@ -204,9 +204,8 @@ def main():
         sys.exit(1)
 
     ffmpeg_binary = base_classifier.get_ffmpeg_binary()
-    paths = base_classifier.get_paths()
 
-    for path in paths:
+    for path in base_classifier.iter_paths():
         try:
             if use_yamnet:
                 # YAMNet pipeline: 16kHz mono → model handles preprocessing

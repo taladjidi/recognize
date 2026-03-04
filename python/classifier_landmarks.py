@@ -136,11 +136,8 @@ def main():
     sessions, input_names, output_names = _load_models_v1()
     print("All landmark models loaded", file=sys.stderr)
 
-    paths = base_classifier.get_paths()
-
     # Process in batches
-    for batch_start in range(0, len(paths), BATCH_SIZE):
-        batch_paths = paths[batch_start : batch_start + BATCH_SIZE]
+    for batch_paths in base_classifier.iter_batches(BATCH_SIZE):
 
         # Parallel preprocessing
         preprocessed = [None] * len(batch_paths)

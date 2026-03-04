@@ -88,9 +88,7 @@ def convert_dms_to_dd(dms_values, direction):
 
 
 def main():
-    paths = base_classifier.get_paths()
-
-    for path in paths:
+    for path in base_classifier.iter_paths():
         try:
             with open(path, "rb") as f:
                 tags = exifread.process_file(f, details=False)

@@ -159,9 +159,8 @@ def main():
         sys.exit(1)
 
     ffmpeg_binary = base_classifier.get_ffmpeg_binary()
-    paths = base_classifier.get_paths()
 
-    for path in paths:
+    for path in base_classifier.iter_paths():
         try:
             frames = extract_frames(path, ffmpeg_binary)
             if frames is None or len(frames) == 0:

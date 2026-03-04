@@ -212,11 +212,8 @@ def main():
     input_key = list(infer_fn.structured_input_signature[1].keys())[0]
     print("Model loaded", file=sys.stderr)
 
-    paths = base_classifier.get_paths()
-
     # Process in batches with parallel preprocessing
-    for batch_start in range(0, len(paths), BATCH_SIZE):
-        batch_paths = paths[batch_start : batch_start + BATCH_SIZE]
+    for batch_paths in base_classifier.iter_batches(BATCH_SIZE):
 
         # Parallel preprocessing (PIL releases GIL during I/O and resize)
         preprocessed = [None] * len(batch_paths)

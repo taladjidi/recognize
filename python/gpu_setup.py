@@ -40,6 +40,15 @@ def configure():
         os.environ.setdefault("TF_CUDNN_CACHEDIR", _CACHE_DIR)
         os.environ.setdefault("TF_CUDNN_USE_AUTOTUNE", "1")
 
+        # Enable persistent XLA compilation cache — avoids recompiling GPU
+        # kernels on every process start (~10-30s savings after first run)
+        xla_cache_dir = os.path.join(_CACHE_DIR, "xla")
+        os.makedirs(xla_cache_dir, exist_ok=True)
+        xla_flags = os.environ.get("TF_XLA_FLAGS", "")
+        new_flag = f"--xla_gpu_persistent_cache_dir={xla_cache_dir}"
+        if new_flag not in xla_flags:
+            os.environ["TF_XLA_FLAGS"] = f"{xla_flags} {new_flag}".strip()
+
     # Now safe to import tensorflow
     import tensorflow as tf
 

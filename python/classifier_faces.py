@@ -192,9 +192,7 @@ def main():
 
     print("InsightFace model loaded", file=sys.stderr)
 
-    paths = base_classifier.get_paths()
-
-    for path in paths:
+    for path in base_classifier.iter_paths():
         try:
             img = Image.open(path).convert("RGB")
             img_array = np.array(img)

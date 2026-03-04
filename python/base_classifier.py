@@ -35,6 +35,46 @@ def get_paths():
     return [p for p in paths if p.strip()]
 
 
+def iter_paths():
+    """Yield file paths one at a time from stdin or argv.
+
+    Unlike get_paths(), this does not block until all stdin is consumed.
+    Results can be emitted as each file completes, and the process can be
+    killed between files without losing work.
+    """
+    if len(sys.argv) < 2:
+        print(
+            "Usage: python classifier_<model>.py <file1> [file2 ...] | python classifier_<model>.py -",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if sys.argv[1] == "-":
+        for line in sys.stdin:
+            path = line.rstrip("\n")
+            if path:
+                yield path
+    else:
+        for path in sys.argv[1:]:
+            if path.strip():
+                yield path
+
+
+def iter_batches(batch_size):
+    """Yield lists of up to batch_size paths from iter_paths().
+
+    For classifiers that benefit from batched GPU inference (imagenet, landmarks).
+    """
+    batch = []
+    for path in iter_paths():
+        batch.append(path)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
 def output_result(result):
     """Write one JSON line to stdout and flush."""
     print(json.dumps(result, ensure_ascii=False), flush=True)
