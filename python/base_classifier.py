@@ -17,6 +17,13 @@ import sys
 # when running as the apache user whose home dir is not writable.
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-recognize")
 
+# Register HEIC/HEIF support so PIL can open iPhone photos directly
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
+
 
 def get_paths():
     """Read file paths from stdin (if arg is '-') or from argv."""

@@ -24,6 +24,7 @@ echo "Done"
 
 echo "=== Deploying PHP files ==="
 cp -v "$SRC_DIR"/lib/Service/FaceClusterAnalyzer.php "$APP_DIR/lib/Service/"
+cp -v "$SRC_DIR"/lib/Classifiers/Classifier.php "$APP_DIR/lib/Classifiers/"
 echo "Done"
 
 echo "=== Setting MoViNet batch size to 200 ==="

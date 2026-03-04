@@ -105,7 +105,7 @@ abstract class Classifier {
 					$filesize = filesize($path);
 					if ($filesize !== false) {
 						$filesizeMb = $filesize / (1024 * 1024);
-						if ($filesizeMb > 8) {
+						if ($filesizeMb > 50) {
 							$this->logger->debug('File is too large for classifier: ' . $file->getPath());
 							try {
 								$this->logger->debug('removing ' . $queueFile->getFileId() . ' from ' . $model . ' queue');
@@ -116,19 +116,7 @@ abstract class Classifier {
 							continue;
 						}
 					}
-					// Check file dimensions
-					$dimensions = @getimagesize($path);
-					if (isset($dimensions) && $dimensions !== false && ($dimensions[0] > 1024 || $dimensions[1] > 1024)) {
-						$this->logger->debug('File dimensions are too large for classifier: ' . $file->getPath());
-						try {
-							$this->logger->debug('removing ' . $queueFile->getFileId() . ' from ' . $model . ' queue');
-							$this->queue->removeFromQueue($model, $queueFile);
-						} catch (Exception $e) {
-							$this->logger->warning($e->getMessage(), ['exception' => $e]);
-						}
-						continue;
 					}
-				}
 				$paths[] = $path;
 				$processedFiles[] = $queueFile;
 				$fileNames[] = $file->getPath();
@@ -300,33 +288,10 @@ abstract class Classifier {
 			throw new NotFoundException();
 		}
 
-		// check if this is an image to convert / downscale
-		$mime = $file->getMimeType();
-		if (!in_array($mime, Constants::IMAGE_FORMATS)) {
-			return $path;
-		}
-
-		if ($this->previewProvider->isAvailable($file)) {
-			try {
-				$this->logger->debug('generating preview of ' . $file->getId() . ' with dimension ' . self::TEMP_FILE_DIMENSION . ' using nextcloud preview manager');
-				return $this->generatePreviewWithProvider($file);
-			} catch (\Throwable $e) {
-				$this->logger->warning('Failed to generate preview of ' . $file->getId() . ' with dimension ' . self::TEMP_FILE_DIMENSION . ' with nextcloud preview manager: ' . $e->getMessage());
-			}
-		}
-
-		try {
-			$imageType = exif_imagetype($path);
-			if ($imageType > 0) {
-				$this->logger->debug('generating preview of ' . $file->getId() . ' with dimension ' . self::TEMP_FILE_DIMENSION . ' using gdlib');
-				return $this->generatePreviewWithGD($path);
-			}
-
-			return $path;
-		} catch (\Throwable $e) {
-			$this->logger->warning('Failed to generate preview of ' . $file->getId() . ' with dimension ' . self::TEMP_FILE_DIMENSION . ' with gdlib: ' . $e->getMessage());
-			return $path;
-		}
+		// Skip PHP preview generation — Python classifiers handle their own
+		// resizing (PIL/numpy) which is faster than PHP GD/Imagick and avoids
+		// the CPU bottleneck of generating intermediate preview files.
+		return $path;
 	}
 
 	public function cleanUpTmpFiles():void {
