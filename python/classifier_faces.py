@@ -157,7 +157,7 @@ def _extract_face(face, width, height):
 
     return {
         "angle": angle,
-        "vector": face.embedding.tolist(),
+        "vector": (face.embedding / np.linalg.norm(face.embedding)).tolist(),
         "x": float(x1) / width,
         "y": float(y1) / height,
         "height": float(y2 - y1) / height,

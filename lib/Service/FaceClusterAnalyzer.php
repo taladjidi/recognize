@@ -18,8 +18,8 @@ use OCA\Recognize\Db\FaceDetectionMapper;
 final class FaceClusterAnalyzer {
 	public const MIN_DATASET_SIZE = 120;
 	public const MIN_DETECTION_SIZE = 0.03;
-	public const MIN_CLUSTER_SEPARATION = 0.35;
-	public const MAX_CLUSTER_EDGE_LENGTH = 0.5;
+	public const MIN_CLUSTER_SEPARATION = 0.5;
+	public const MAX_CLUSTER_EDGE_LENGTH = 1.0;
 	public const DIMENSIONS = 512;
 	public const MAX_OVERLAP_NEW_CLUSTER = 0.1;
 	public const MIN_OVERLAP_EXISTING_CLUSTER = 0.5;

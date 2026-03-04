@@ -30,9 +30,11 @@ echo "=== Setting MoViNet batch size to 200 ==="
 sudo -u apache $OCC config:app:set recognize movinet.batchSize --value=200
 echo "Done"
 
-echo "=== Clustering faces ==="
-sudo -u apache $OCC recognize:cluster-faces
+echo "=== Resetting all face detections ==="
+sudo -u apache $OCC recognize:reset-face-clusters
+mysql nextcloud -e "DELETE FROM oc_recognize_face_detections;"
 echo "Done"
 
 echo "=== Restarting classify ==="
 echo "Run in tmux: sudo -u apache $OCC recognize:classify"
+echo "After faces are re-scanned, run: sudo -u apache $OCC recognize:cluster-faces"
