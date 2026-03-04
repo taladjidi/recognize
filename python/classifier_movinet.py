@@ -160,9 +160,13 @@ def main():
 
     ffmpeg_binary = base_classifier.get_ffmpeg_binary()
 
-    for path in base_classifier.iter_paths():
+    def prefetch_frames(p):
+        return extract_frames(p, ffmpeg_binary)
+
+    for path, frames in base_classifier.prefetch_map(
+        base_classifier.iter_paths(), prefetch_frames, prefetch=2
+    ):
         try:
-            frames = extract_frames(path, ffmpeg_binary)
             if frames is None or len(frames) == 0:
                 base_classifier.output_error()
                 continue

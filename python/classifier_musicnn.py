@@ -205,11 +205,20 @@ def main():
 
     ffmpeg_binary = base_classifier.get_ffmpeg_binary()
 
-    for path in base_classifier.iter_paths():
+    def transcode_fn(p):
+        if use_yamnet:
+            return transcode_audio_16khz(p, ffmpeg_binary)
+        return transcode_audio_8khz(p, ffmpeg_binary)
+
+    for path, audio_data in base_classifier.prefetch_map(
+        base_classifier.iter_paths(), transcode_fn, prefetch=2
+    ):
         try:
+            if audio_data is None:
+                base_classifier.output_error()
+                continue
+
             if use_yamnet:
-                # YAMNet pipeline: 16kHz mono → model handles preprocessing
-                audio_data = transcode_audio_16khz(path, ffmpeg_binary)
                 waveform = tf.constant(audio_data, dtype=tf.float32)
                 scores, embeddings, spectrogram = model(waveform)
 
@@ -228,8 +237,6 @@ def main():
 
                 labels = rules_engine.apply_rules(results, rules_data, uppercase=False)
             else:
-                # MusicNN fallback pipeline: 8kHz mono → STFT → mel → batched inference
-                audio_data = transcode_audio_8khz(path, ffmpeg_binary)
                 labels = _run_musicnn(
                     musicnn_model, input_key, output_key,
                     audio_data, mel_matrix, msd_classes, rules_data,

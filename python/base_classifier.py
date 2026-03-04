@@ -75,6 +75,47 @@ def iter_batches(batch_size):
         yield batch
 
 
+def prefetch_map(iterable, fn, prefetch=4):
+    """Apply fn to items in background threads, staying prefetch items ahead.
+
+    Yields (item, result) tuples. While the main thread does GPU inference,
+    background threads preprocess upcoming items (image loading, FFmpeg, etc.),
+    keeping the GPU fed. If fn(item) raises, result is None.
+    """
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    def safe_fn(item):
+        try:
+            return fn(item)
+        except Exception as e:
+            print(f"Prefetch error for {item}: {e}", file=sys.stderr)
+            return None
+
+    with ThreadPoolExecutor(max_workers=prefetch) as pool:
+        buf = deque()
+        it = iter(iterable)
+
+        # Fill initial buffer
+        for _ in range(prefetch):
+            try:
+                item = next(it)
+            except StopIteration:
+                break
+            buf.append((item, pool.submit(safe_fn, item)))
+
+        # Stream: yield oldest, submit next
+        for item in it:
+            old_item, future = buf.popleft()
+            yield old_item, future.result()
+            buf.append((item, pool.submit(safe_fn, item)))
+
+        # Drain remaining
+        while buf:
+            old_item, future = buf.popleft()
+            yield old_item, future.result()
+
+
 def output_result(result):
     """Write one JSON line to stdout and flush."""
     print(json.dumps(result, ensure_ascii=False), flush=True)

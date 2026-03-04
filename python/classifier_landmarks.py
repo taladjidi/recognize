@@ -136,15 +136,23 @@ def main():
     sessions, input_names, output_names = _load_models_v1()
     print("All landmark models loaded", file=sys.stderr)
 
-    # Process in batches
-    for batch_paths in base_classifier.iter_batches(BATCH_SIZE):
-
-        # Parallel preprocessing
+    def _preprocess_batch(batch_paths):
+        """Preprocess a full batch in parallel threads."""
         preprocessed = [None] * len(batch_paths)
         args = [(i, p) for i, p in enumerate(batch_paths)]
         with ThreadPoolExecutor(max_workers=4) as pool:
             for idx, arr in pool.map(_preprocess_one, args):
                 preprocessed[idx] = arr
+        return preprocessed
+
+    # Double-buffer: preprocess next batch while GPU processes current batch
+    for batch_paths, preprocessed in base_classifier.prefetch_map(
+        base_classifier.iter_batches(BATCH_SIZE), _preprocess_batch, prefetch=1
+    ):
+        if preprocessed is None:
+            for _ in batch_paths:
+                base_classifier.output_error()
+            continue
 
         valid_indices = [i for i, arr in enumerate(preprocessed) if arr is not None]
         failed_indices = set(i for i, arr in enumerate(preprocessed) if arr is None)

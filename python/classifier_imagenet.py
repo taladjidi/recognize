@@ -212,15 +212,23 @@ def main():
     input_key = list(infer_fn.structured_input_signature[1].keys())[0]
     print("Model loaded", file=sys.stderr)
 
-    # Process in batches with parallel preprocessing
-    for batch_paths in base_classifier.iter_batches(BATCH_SIZE):
-
-        # Parallel preprocessing (PIL releases GIL during I/O and resize)
+    def _preprocess_batch(batch_paths):
+        """Preprocess a full batch in parallel threads."""
         preprocessed = [None] * len(batch_paths)
         args = [(i, p, img_size, input_min) for i, p in enumerate(batch_paths)]
         with ThreadPoolExecutor(max_workers=4) as pool:
             for idx, arr in pool.map(_preprocess_one, args):
                 preprocessed[idx] = arr
+        return preprocessed
+
+    # Double-buffer: preprocess next batch while GPU processes current batch
+    for batch_paths, preprocessed in base_classifier.prefetch_map(
+        base_classifier.iter_batches(BATCH_SIZE), _preprocess_batch, prefetch=1
+    ):
+        if preprocessed is None:
+            for _ in batch_paths:
+                base_classifier.output_error()
+            continue
 
         # Split into valid (for batched inference) and failed
         valid_indices = [i for i, arr in enumerate(preprocessed) if arr is not None]

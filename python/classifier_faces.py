@@ -192,11 +192,18 @@ def main():
 
     print("InsightFace model loaded", file=sys.stderr)
 
-    for path in base_classifier.iter_paths():
+    def _load_image_bgr(path):
+        img = Image.open(path).convert("RGB")
+        img_array = np.array(img)
+        return img_array[:, :, ::-1]  # InsightFace expects BGR
+
+    for path, img_bgr in base_classifier.prefetch_map(
+        base_classifier.iter_paths(), _load_image_bgr
+    ):
         try:
-            img = Image.open(path).convert("RGB")
-            img_array = np.array(img)
-            img_bgr = img_array[:, :, ::-1]  # InsightFace expects BGR
+            if img_bgr is None:
+                base_classifier.output_error()
+                continue
             height, width = img_bgr.shape[:2]
 
             faces = app.get(img_bgr)
