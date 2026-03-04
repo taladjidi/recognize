@@ -1,6 +1,6 @@
 """Benchmark for classifier_imagenet.py — EfficientNet image classification.
 
-Measures: model load, preprocessing (PIL resize), inference (sess.run),
+Measures: model load, preprocessing (PIL resize), inference,
 postprocessing (top-k + rules engine).
 
 Usage:
@@ -37,7 +37,7 @@ from classifier_imagenet import (
     select_model,
     preprocess_image,
     get_top_k,
-    _load_model_v1,
+    _load_model,
     rules,
     TOP_K,
     BATCH_SIZE,
@@ -73,10 +73,8 @@ def run_benchmark():
     # Benchmark: model load
     gpu_before = gpu_snapshot()
     with TimingContext("model_load") as t_load:
-        sess, input_name, output_name = _load_model_v1(model_path)
-        with sess.graph.as_default():
-            output_tensor = sess.graph.get_tensor_by_name(output_name)
-            softmax_tensor = tf.nn.softmax(output_tensor)
+        infer_fn = _load_model(model_path)
+        input_key = list(infer_fn.structured_input_signature[1].keys())[0]
     gpu_after = gpu_snapshot()
     print_err(f"Model load: {t_load.elapsed:.3f}s")
     print_err(
@@ -99,7 +97,9 @@ def run_benchmark():
 
         # Batched inference
         with TimingContext("inference") as t_inf:
-            all_probs = sess.run(softmax_tensor, feed_dict={input_name: batch_tensor})
+            output = infer_fn(**{input_key: tf.constant(batch_tensor)})
+            logits = list(output.values())[0].numpy()
+            all_probs = tf.nn.softmax(logits).numpy()
 
         # Postprocess each result
         with TimingContext("postprocess") as t_post:

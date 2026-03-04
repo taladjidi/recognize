@@ -13,6 +13,10 @@ Performance features:
 import os
 import sys
 
+# Fix matplotlib permission error when running as apache/httpd user.
+# Must be set before any TF/numpy import triggers matplotlib.
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-recognize")
+
 # Persistent cuDNN autotuning cache — avoids re-benchmarking convolution
 # algorithms on every process start. The first run is slow (~20s), subsequent
 # runs reuse cached results and start fast.

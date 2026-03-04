@@ -86,7 +86,17 @@ def extract_frames(video_path, ffmpeg_binary):
 
 def _load_stream_model(model_path):
     """Load MoViNet-A3 Stream model. Returns (init_states_fn, call_fn)."""
+    import logging
+
+    # Suppress "is not a valid tf.function parameter name" warnings.
+    # The stream model's state keys use '/' separators (e.g. state/b2/l0/stream_buffer)
+    # which TF sanitizes to '_'. This is cosmetic — TF handles the mapping internally.
+    absl_logger = logging.getLogger("absl")
+    prev_level = absl_logger.level
+    absl_logger.setLevel(logging.ERROR)
     loaded = tf.saved_model.load(model_path)
+    absl_logger.setLevel(prev_level)
+
     init_fn = loaded.signatures["init_states"]
     call_fn = loaded.signatures["call"]
     return init_fn, call_fn

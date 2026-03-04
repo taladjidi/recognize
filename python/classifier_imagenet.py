@@ -3,7 +3,7 @@
 Replaces src/classifier_imagenet.js.
 
 Model selection:
-- GPU mode: EfficientNetV2-S (384x384, raw [0,255] float32) — default for GPU ≥4GB
+- GPU mode: EfficientNetV2-S (384x384, normalize to [0,1]) — default for GPU ≥4GB
 - GPU mode: EfficientNetV2-XL (512x512, normalize to [-1,1]) — via env override
 - CPU mode: EfficientNet-Lite4 (380x380, normalize to [0,1])
 
@@ -185,26 +185,13 @@ def get_top_k(values, k):
     return results
 
 
-def _load_model_v1(model_path):
-    """Load a SavedModel using v1 Session API.
+def _load_model(model_path):
+    """Load a SavedModel using the v2 API.
 
-    More memory-efficient for frozen graphs (weights as constants in the
-    graph) since it avoids parsing the entire protobuf into Python objects.
-    Returns (session, input_tensor_name, output_tensor_name).
+    Returns the serving_default signature function.
     """
-    sess = tf.compat.v1.Session(
-        graph=tf.compat.v1.Graph(),
-        config=tf.compat.v1.ConfigProto(allow_soft_placement=True),
-    )
-    meta_graph_def = tf.compat.v1.saved_model.loader.load(
-        sess,
-        [tf.compat.v1.saved_model.tag_constants.SERVING],
-        model_path,
-    )
-    sig = meta_graph_def.signature_def["serving_default"]
-    input_name = list(sig.inputs.values())[0].name
-    output_name = list(sig.outputs.values())[0].name
-    return sess, input_name, output_name
+    loaded = tf.saved_model.load(model_path)
+    return loaded.signatures["serving_default"]
 
 
 def _preprocess_one(args):
@@ -220,11 +207,9 @@ def main():
     model_path, img_size, input_min, model_name = select_model()
 
     print(f"Loading {model_name} model...", file=sys.stderr)
-    sess, input_name, output_name = _load_model_v1(model_path)
-    # Build a softmax op in the session graph
-    with sess.graph.as_default():
-        output_tensor = sess.graph.get_tensor_by_name(output_name)
-        softmax_tensor = tf.nn.softmax(output_tensor)
+    infer_fn = _load_model(model_path)
+    # Identify the input key from the signature
+    input_key = list(infer_fn.structured_input_signature[1].keys())[0]
     print("Model loaded", file=sys.stderr)
 
     paths = base_classifier.get_paths()
@@ -247,7 +232,9 @@ def main():
         if valid_indices:
             # Stack valid images into [N, H, W, 3] and run single inference
             batch_tensor = np.stack([preprocessed[i] for i in valid_indices], axis=0)
-            all_probs = sess.run(softmax_tensor, feed_dict={input_name: batch_tensor})
+            output = infer_fn(**{input_key: tf.constant(batch_tensor)})
+            logits = list(output.values())[0].numpy()
+            all_probs = tf.nn.softmax(logits).numpy()
 
         # Emit results in input order (PHP counts JSON lines to match files)
         prob_idx = 0
