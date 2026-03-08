@@ -166,7 +166,8 @@ def _extract_face(face, width, height):
     }
 
 
-def main():
+def _init_model():
+    """Load InsightFace model once. Returns the FaceAnalysis app."""
     print("Loading InsightFace model (buffalo_l)...", file=sys.stderr)
 
     providers = _build_providers()
@@ -191,29 +192,58 @@ def main():
         sys.stdout = real_stdout
 
     print("InsightFace model loaded", file=sys.stderr)
+    return app
 
-    def _load_image_bgr(path):
-        img = Image.open(path).convert("RGB")
-        img_array = np.array(img)
-        return img_array[:, :, ::-1]  # InsightFace expects BGR
 
-    for path, img_bgr in base_classifier.prefetch_map(
-        base_classifier.iter_paths(), _load_image_bgr
-    ):
+def _load_image_bgr(path):
+    img = Image.open(path).convert("RGB")
+    img_array = np.array(img)
+    return img_array[:, :, ::-1]  # InsightFace expects BGR
+
+
+def init_model():
+    """Initialize InsightFace model for multiprocess pipeline."""
+    return {"app": _init_model()}
+
+
+def infer_one(model_state, img_bgr):
+    """Run face detection on a BGR numpy array.
+
+    Returns list of face dicts with keys: angle, vector, x, y, height, width, score.
+    """
+    height, width = img_bgr.shape[:2]
+    faces = model_state["app"].get(img_bgr)
+    return [_extract_face(face, width, height) for face in faces]
+
+
+def create_pipeline(paths_iterable):
+    """Load model once, yield (path, faces) for each input path.
+
+    faces is a list of dicts with keys: angle, vector, x, y, height, width, score.
+    Empty list on error.
+    """
+    app = _init_model()
+
+    for path, img_bgr in base_classifier.prefetch_map(paths_iterable, _load_image_bgr, prefetch=8):
         try:
             if img_bgr is None:
-                base_classifier.output_error()
+                yield path, []
                 continue
             height, width = img_bgr.shape[:2]
 
             faces = app.get(img_bgr)
             vectors = [_extract_face(face, width, height) for face in faces]
-            base_classifier.output_result(vectors)
+            yield path, vectors
 
         except Exception as e:
             print(f"Error processing {path}: {e}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
-            base_classifier.output_error()
+            yield path, []
+
+
+def main():
+    for path, result in create_pipeline(base_classifier.iter_paths()):
+        base_classifier.output_result(result)
 
 
 if __name__ == "__main__":

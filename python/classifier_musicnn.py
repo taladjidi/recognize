@@ -173,10 +173,75 @@ def _run_musicnn(model, input_key, output_key, audio_data, mel_matrix, msd_class
     return rules_engine.apply_rules(results, rules_data, uppercase=False)
 
 
-def main():
+def init_model():
+    """Initialize audio model for multiprocess pipeline."""
     yamnet_path = os.path.join(MODELS_DIR, "yamnet_saved")
     musicnn_path = os.path.join(MODELS_DIR, "musicnn_saved")
     use_yamnet = os.path.isdir(yamnet_path)
+
+    state = {"use_yamnet": use_yamnet}
+
+    if use_yamnet:
+        print("Loading YAMNet model...", file=sys.stderr)
+        model = tf.saved_model.load(yamnet_path)
+        state["model"] = model
+        state["class_names"] = _load_yamnet_class_names(model)
+        state["rules"] = rules_engine.load_rules(os.path.join(SRC_DIR, "yamnet_rules.yml"))
+        print("Model loaded (YAMNet)", file=sys.stderr)
+    elif os.path.isdir(musicnn_path):
+        print("YAMNet not found, falling back to MusicNN...", file=sys.stderr)
+        loaded = tf.saved_model.load(musicnn_path)
+        state["musicnn_model"] = loaded.signatures["serving_default"]
+        state["input_key"] = list(state["musicnn_model"].structured_input_signature[1].keys())[0]
+        state["output_key"] = list(state["musicnn_model"].structured_outputs.keys())[0]
+        state["msd_classes"] = _load_musicnn_classes()
+        state["mel_matrix"] = _load_mel_matrix()
+        state["rules"] = rules_engine.load_rules(os.path.join(SRC_DIR, "musicnn_rules.yml"))
+        print("Model loaded (MusicNN fallback)", file=sys.stderr)
+    else:
+        raise RuntimeError("No audio model found. Download YAMNet or run convert_models.py.")
+
+    return state
+
+
+def infer_one(model_state, audio_data):
+    """Run inference on preprocessed audio waveform. Returns list of label strings."""
+    if model_state["use_yamnet"]:
+        model = model_state["model"]
+        class_names = model_state["class_names"]
+        rules_data = model_state["rules"]
+
+        waveform = tf.constant(audio_data, dtype=tf.float32)
+        scores, embeddings, spectrogram = model(waveform)
+        avg_scores = tf.reduce_mean(scores, axis=0).numpy()
+
+        indices = np.argsort(avg_scores)[::-1][:YAMNET_TOP_K]
+        results = [
+            {"className": class_names[idx], "probability": float(avg_scores[idx])}
+            for idx in indices
+        ]
+        return rules_engine.apply_rules(results, rules_data, uppercase=False)
+    else:
+        labels = _run_musicnn(
+            model_state["musicnn_model"], model_state["input_key"],
+            model_state["output_key"], audio_data, model_state["mel_matrix"],
+            model_state["msd_classes"], model_state["rules"],
+        )
+        return labels if labels is not None else []
+
+
+def create_pipeline(paths_iterable):
+    """Load model once, yield (path, labels) for each input path.
+
+    labels is a list of genre/tag strings or [] on error.
+    """
+    yamnet_path = os.path.join(MODELS_DIR, "yamnet_saved")
+    musicnn_path = os.path.join(MODELS_DIR, "musicnn_saved")
+    use_yamnet = os.path.isdir(yamnet_path)
+
+    model = musicnn_model = input_key = output_key = None
+    msd_classes = mel_matrix = None
+    class_names = rules_data = None
 
     if use_yamnet:
         print("Loading YAMNet model...", file=sys.stderr)
@@ -185,9 +250,7 @@ def main():
         rules_data = rules_engine.load_rules(os.path.join(SRC_DIR, "yamnet_rules.yml"))
         print("Model loaded (YAMNet)", file=sys.stderr)
     elif os.path.isdir(musicnn_path):
-        print(
-            "YAMNet not found, falling back to MusicNN...", file=sys.stderr
-        )
+        print("YAMNet not found, falling back to MusicNN...", file=sys.stderr)
         loaded = tf.saved_model.load(musicnn_path)
         musicnn_model = loaded.signatures["serving_default"]
         input_key = list(musicnn_model.structured_input_signature[1].keys())[0]
@@ -197,10 +260,7 @@ def main():
         rules_data = rules_engine.load_rules(os.path.join(SRC_DIR, "musicnn_rules.yml"))
         print("Model loaded (MusicNN fallback)", file=sys.stderr)
     else:
-        print(
-            "ERROR: No audio model found. Download YAMNet or run convert_models.py.",
-            file=sys.stderr,
-        )
+        print("ERROR: No audio model found. Download YAMNet or run convert_models.py.", file=sys.stderr)
         sys.exit(1)
 
     ffmpeg_binary = base_classifier.get_ffmpeg_binary()
@@ -210,22 +270,18 @@ def main():
             return transcode_audio_16khz(p, ffmpeg_binary)
         return transcode_audio_8khz(p, ffmpeg_binary)
 
-    for path, audio_data in base_classifier.prefetch_map(
-        base_classifier.iter_paths(), transcode_fn, prefetch=2
-    ):
+    for path, audio_data in base_classifier.prefetch_map(paths_iterable, transcode_fn, prefetch=4):
         try:
             if audio_data is None:
-                base_classifier.output_error()
+                yield path, []
                 continue
 
             if use_yamnet:
                 waveform = tf.constant(audio_data, dtype=tf.float32)
                 scores, embeddings, spectrogram = model(waveform)
 
-                # Average sigmoid scores across frames
                 avg_scores = tf.reduce_mean(scores, axis=0).numpy()
 
-                # Get top-K (use higher K for YAMNet's 521 classes)
                 indices = np.argsort(avg_scores)[::-1][:YAMNET_TOP_K]
                 results = [
                     {
@@ -243,14 +299,19 @@ def main():
                 )
                 if labels is None:
                     print(f"Audio too short for classification: {path}", file=sys.stderr)
-                    base_classifier.output_error()
+                    yield path, []
                     continue
 
-            base_classifier.output_result(labels)
+            yield path, labels
 
         except Exception as e:
             print(f"Error processing {path}: {e}", file=sys.stderr)
-            base_classifier.output_error()
+            yield path, []
+
+
+def main():
+    for path, labels in create_pipeline(base_classifier.iter_paths()):
+        base_classifier.output_result(labels)
 
 
 if __name__ == "__main__":

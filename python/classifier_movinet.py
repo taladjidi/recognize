@@ -135,27 +135,81 @@ def _infer_base(model, frames):
         return output["classifier_head"]
 
 
-def main():
+def _classify_one(frames, use_stream, init_fn=None, call_fn=None, base_model=None):
+    """Run inference on extracted frames, return list of label strings."""
+    if use_stream:
+        logits = _infer_stream(init_fn, call_fn, frames)
+    else:
+        logits = _infer_base(base_model, frames)
+
+    probs = tf.nn.softmax(logits).numpy().flatten()
+
+    indices = np.argsort(probs)[::-1][:TOP_K]
+    labels = []
+    seen = set()
+    for idx in indices:
+        if probs[idx] >= THRESHOLD:
+            label = KINETICS_CLASSES[idx]
+            if label not in seen:
+                seen.add(label)
+                labels.append(label)
+    return labels
+
+
+def init_model():
+    """Initialize MoViNet model for multiprocess pipeline."""
     stream_path = os.path.join(MODELS_DIR, "movinet-a3-stream")
     base_path = os.path.join(MODELS_DIR, "movinet-a3")
     use_stream = os.path.isdir(stream_path)
 
+    init_fn = call_fn = base_model = None
     if use_stream:
         print("Loading MoViNet-A3 Stream model...", file=sys.stderr)
         init_fn, call_fn = _load_stream_model(stream_path)
         print("Model loaded (stream)", file=sys.stderr)
     elif os.path.isdir(base_path):
-        print(
-            "Stream model not found, falling back to base model (CPU)...",
-            file=sys.stderr,
-        )
+        print("Stream model not found, falling back to base model (CPU)...", file=sys.stderr)
         base_model = _load_base_model(base_path)
         print("Model loaded (base, CPU)", file=sys.stderr)
     else:
-        print(
-            f"ERROR: No MoViNet model found at {stream_path} or {base_path}",
-            file=sys.stderr,
-        )
+        raise RuntimeError(f"No MoViNet model found at {stream_path} or {base_path}")
+
+    return {
+        "use_stream": use_stream,
+        "init_fn": init_fn,
+        "call_fn": call_fn,
+        "base_model": base_model,
+    }
+
+
+def infer_one(model_state, frames):
+    """Run inference on extracted video frames. Returns list of label strings."""
+    return _classify_one(
+        frames, model_state["use_stream"],
+        model_state["init_fn"], model_state["call_fn"], model_state["base_model"],
+    )
+
+
+def create_pipeline(paths_iterable):
+    """Load model once, yield (path, labels) for each input path.
+
+    labels is a list of action class strings or [] on error.
+    """
+    stream_path = os.path.join(MODELS_DIR, "movinet-a3-stream")
+    base_path = os.path.join(MODELS_DIR, "movinet-a3")
+    use_stream = os.path.isdir(stream_path)
+
+    init_fn = call_fn = base_model = None
+    if use_stream:
+        print("Loading MoViNet-A3 Stream model...", file=sys.stderr)
+        init_fn, call_fn = _load_stream_model(stream_path)
+        print("Model loaded (stream)", file=sys.stderr)
+    elif os.path.isdir(base_path):
+        print("Stream model not found, falling back to base model (CPU)...", file=sys.stderr)
+        base_model = _load_base_model(base_path)
+        print("Model loaded (base, CPU)", file=sys.stderr)
+    else:
+        print(f"ERROR: No MoViNet model found at {stream_path} or {base_path}", file=sys.stderr)
         sys.exit(1)
 
     ffmpeg_binary = base_classifier.get_ffmpeg_binary()
@@ -163,37 +217,23 @@ def main():
     def prefetch_frames(p):
         return extract_frames(p, ffmpeg_binary)
 
-    for path, frames in base_classifier.prefetch_map(
-        base_classifier.iter_paths(), prefetch_frames, prefetch=2
-    ):
+    for path, frames in base_classifier.prefetch_map(paths_iterable, prefetch_frames, prefetch=4):
         try:
             if frames is None or len(frames) == 0:
-                base_classifier.output_error()
+                yield path, []
                 continue
 
-            if use_stream:
-                logits = _infer_stream(init_fn, call_fn, frames)
-            else:
-                logits = _infer_base(base_model, frames)
-
-            probs = tf.nn.softmax(logits).numpy().flatten()
-
-            # Get top-K above threshold
-            indices = np.argsort(probs)[::-1][:TOP_K]
-            labels = []
-            seen = set()
-            for idx in indices:
-                if probs[idx] >= THRESHOLD:
-                    label = KINETICS_CLASSES[idx]
-                    if label not in seen:
-                        seen.add(label)
-                        labels.append(label)
-
-            base_classifier.output_result(labels)
+            labels = _classify_one(frames, use_stream, init_fn, call_fn, base_model)
+            yield path, labels
 
         except Exception as e:
             print(f"Error processing {path}: {e}", file=sys.stderr)
-            base_classifier.output_error()
+            yield path, []
+
+
+def main():
+    for path, labels in create_pipeline(base_classifier.iter_paths()):
+        base_classifier.output_result(labels)
 
 
 if __name__ == "__main__":

@@ -90,7 +90,7 @@ final class Classify extends Command {
 		foreach ($this->storageService->getMounts() as $mount) {
 			$this->logger->info('Processing storage ' . $mount['storage_id'] . ' with root ID ' . $mount['override_root']);
 
-			// Setup Filesystem for a users that can access this mount
+			// Setup Filesystem for a user that can access this mount
 			$mounts = array_values(array_filter($this->userMountCache->getMountsForStorageId($mount['storage_id']), function (ICachedMountInfo $mountInfo) use ($mount) {
 				return $mountInfo->getRootId() === $mount['root_id'];
 			}));
@@ -164,6 +164,7 @@ final class Classify extends Command {
 			} while ($i > 0);
 			\OC_Util::tearDownFS();
 		}
+
 		return 0;
 	}
 }

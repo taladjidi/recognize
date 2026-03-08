@@ -26,9 +26,6 @@ use OCP\IConfig;
 use OCP\IPreview;
 use OCP\ITempManager;
 use Psr\Log\LoggerInterface;
-use Symfony\Component\Process\Exception\ProcessTimedOutException;
-use Symfony\Component\Process\Exception\RuntimeException;
-use Symfony\Component\Process\Process;
 
 abstract class Classifier {
 	public const TEMP_FILE_DIMENSION = 1024;
@@ -62,90 +59,12 @@ abstract class Classifier {
 	abstract public function classify(array $queueFiles): void;
 
 	/**
+	 * Build the command and environment for the classifier subprocess.
+	 *
 	 * @param string $model
-	 * @param list<QueueFile> $queueFiles
-	 * @param int $timeout
-	 * @return \Generator
-	 * @psalm-return \Generator<QueueFile, mixed, mixed, null>
-	 * @throws \ErrorException|\RuntimeException
+	 * @return array{command: list<string>, env: array<string,string>}
 	 */
-	public function classifyFiles(string $model, array $queueFiles, int $timeout): \Generator {
-		$paths = [];
-		$processedFiles = [];
-		$fileNames = [];
-		$startTime = time();
-		foreach ($queueFiles as $queueFile) {
-			if ($this->maxExecutionTime > 0 && time() - $startTime > $this->maxExecutionTime) {
-				return;
-			}
-			$file = $this->rootFolder->getFirstNodeById($queueFile->getFileId());
-			if ($file === null) {
-				try {
-					$this->logger->debug('removing '.$queueFile->getFileId().' from '.$model.' queue because it couldn\'t be found');
-					$this->queue->removeFromQueue($model, $queueFile);
-				} catch (Exception $e) {
-					$this->logger->warning($e->getMessage(), ['exception' => $e]);
-				}
-				continue;
-			}
-			try {
-				if ($file->getSize() == 0) {
-					$this->logger->debug('File is empty: ' . $file->getPath());
-					try {
-						$this->logger->debug('removing ' . $queueFile->getFileId() . ' from ' . $model . ' queue');
-						$this->queue->removeFromQueue($model, $queueFile);
-					} catch (Exception $e) {
-						$this->logger->warning($e->getMessage(), ['exception' => $e]);
-					}
-					continue;
-				}
-				$path = $this->getConvertedFilePath($file);
-				if (in_array($model, [ImagenetClassifier::MODEL_NAME, LandmarksClassifier::MODEL_NAME, ClusteringFaceClassifier::MODEL_NAME], true)) {
-					// Check file data size
-					$filesize = filesize($path);
-					if ($filesize !== false) {
-						$filesizeMb = $filesize / (1024 * 1024);
-						if ($filesizeMb > 50) {
-							$this->logger->debug('File is too large for classifier: ' . $file->getPath());
-							try {
-								$this->logger->debug('removing ' . $queueFile->getFileId() . ' from ' . $model . ' queue');
-								$this->queue->removeFromQueue($model, $queueFile);
-							} catch (Exception $e) {
-								$this->logger->warning($e->getMessage(), ['exception' => $e]);
-							}
-							continue;
-						}
-					}
-					}
-				$paths[] = $path;
-				$processedFiles[] = $queueFile;
-				$fileNames[] = $file->getPath();
-			} catch (NotFoundException|InvalidPathException $e) {
-				$this->logger->warning('Could not find file', ['exception' => $e]);
-				try {
-					$this->queue->removeFromQueue($model, $queueFile);
-				} catch (Exception $e) {
-					$this->logger->warning($e->getMessage(), ['exception' => $e]);
-				}
-				continue;
-			} catch (GenericEncryptionException $e) {
-				$this->logger->warning('Could not load encrypted file', ['exception' => $e]);
-				try {
-					$this->queue->removeFromQueue($model, $queueFile);
-				} catch (Exception $e) {
-					$this->logger->warning($e->getMessage(), ['exception' => $e]);
-				}
-				continue;
-			}
-		}
-
-		if (count($paths) === 0) {
-			$this->logger->debug('No files left to classify');
-			return;
-		}
-
-		$this->logger->debug('Classifying '.var_export($paths, true));
-
+	private function buildCommand(string $model): array {
 		$pythonBinary = $this->config->getAppValueString('python_binary', '');
 		if ($pythonBinary !== '') {
 			$command = [
@@ -169,9 +88,6 @@ abstract class Classifier {
 			];
 		}
 
-		$this->logger->debug('Running '.var_export($command, true));
-
-		$proc = new Process($command, __DIR__);
 		$env = [];
 		if ($this->config->getAppValueString('tensorflow.gpu', 'false') === 'true') {
 			$env['RECOGNIZE_GPU'] = 'true';
@@ -179,68 +95,268 @@ abstract class Classifier {
 		if ($this->config->getAppValueString('tensorflow.purejs', 'false') === 'true') {
 			$env['RECOGNIZE_PUREJS'] = 'true';
 		}
-		// Set cores
 		$cores = $this->config->getAppValueString('tensorflow.cores', '0');
 		if ($cores !== '0') {
 			$env['RECOGNIZE_CORES'] = $cores;
 		}
-		// Pass ffmpeg binary path for Python classifiers (movinet, musicnn)
 		$ffmpegBinary = $this->config->getAppValueString('ffmpeg_binary', '');
 		if ($ffmpegBinary !== '') {
 			$env['FFMPEG_BINARY'] = $ffmpegBinary;
 		}
-		// Pass imagenet model preference (auto, efficientnetv2, efficientnet_lite4)
 		$imagenetModel = $this->config->getAppValueString('imagenet.model', 'auto');
 		if ($imagenetModel !== 'auto') {
 			$env['RECOGNIZE_IMAGENET_MODEL'] = $imagenetModel;
 		}
-		$proc->setEnv($env);
-		$proc->setTimeout(count($paths) * $timeout);
-		$proc->setInput(implode("\n", $paths));
-		try {
-			$proc->start();
 
-			if ((int)$cores !== 0) {
-				@exec('taskset -cp ' . implode(',', range(0, (int)$cores, 1)) . ' ' . ((string)$proc->getPid()));
+		return ['command' => $command, 'env' => $env];
+	}
+
+	/**
+	 * Resolve a QueueFile to a local filesystem path, or null if it should be skipped.
+	 *
+	 * @param string $model
+	 * @param QueueFile $queueFile
+	 * @return array{path: string, name: string}|null
+	 */
+	private function resolveFile(string $model, QueueFile $queueFile): ?array {
+		$file = $this->rootFolder->getFirstNodeById($queueFile->getFileId());
+		if ($file === null) {
+			try {
+				$this->logger->debug('removing '.$queueFile->getFileId().' from '.$model.' queue because it couldn\'t be found');
+				$this->queue->removeFromQueue($model, $queueFile);
+			} catch (Exception $e) {
+				$this->logger->warning($e->getMessage(), ['exception' => $e]);
+			}
+			return null;
+		}
+		try {
+			if ($file->getSize() == 0) {
+				$this->logger->debug('File is empty: ' . $file->getPath());
+				try {
+					$this->queue->removeFromQueue($model, $queueFile);
+				} catch (Exception $e) {
+					$this->logger->warning($e->getMessage(), ['exception' => $e]);
+				}
+				return null;
+			}
+			$path = $this->getConvertedFilePath($file);
+			if (in_array($model, [ImagenetClassifier::MODEL_NAME, LandmarksClassifier::MODEL_NAME, ClusteringFaceClassifier::MODEL_NAME], true)) {
+				$filesize = filesize($path);
+				if ($filesize !== false && $filesize / (1024 * 1024) > 50) {
+					$this->logger->debug('File is too large for classifier: ' . $file->getPath());
+					try {
+						$this->queue->removeFromQueue($model, $queueFile);
+					} catch (Exception $e) {
+						$this->logger->warning($e->getMessage(), ['exception' => $e]);
+					}
+					return null;
+				}
+			}
+			return ['path' => $path, 'name' => $file->getPath()];
+		} catch (NotFoundException|InvalidPathException $e) {
+			$this->logger->warning('Could not find file', ['exception' => $e]);
+			try {
+				$this->queue->removeFromQueue($model, $queueFile);
+			} catch (Exception $e) {
+				$this->logger->warning($e->getMessage(), ['exception' => $e]);
+			}
+			return null;
+		} catch (GenericEncryptionException $e) {
+			$this->logger->warning('Could not load encrypted file', ['exception' => $e]);
+			try {
+				$this->queue->removeFromQueue($model, $queueFile);
+			} catch (Exception $e) {
+				$this->logger->warning($e->getMessage(), ['exception' => $e]);
+			}
+			return null;
+		}
+	}
+
+	/**
+	 * Streaming producer/consumer classifier pipeline.
+	 *
+	 * Spawns the classifier subprocess once, then continuously:
+	 *   - PRODUCER: resolves the next file to a local path and writes it to stdin
+	 *   - CONSUMER: reads JSON results from stdout and yields them
+	 *
+	 * File resolution (DB lookup + filesystem) overlaps with inference on the GPU,
+	 * keeping the GPU saturated instead of idle between batches.
+	 *
+	 * @param string $model
+	 * @param list<QueueFile> $queueFiles
+	 * @param int $timeout Seconds per file
+	 * @return \Generator
+	 * @psalm-return \Generator<QueueFile, mixed, mixed, null>
+	 * @throws \ErrorException|\RuntimeException
+	 */
+	public function classifyFiles(string $model, array $queueFiles, int $timeout): \Generator {
+		if (count($queueFiles) === 0) {
+			$this->logger->debug('No files left to classify');
+			return;
+		}
+
+		$startTime = time();
+		$built = $this->buildCommand($model);
+		$command = $built['command'];
+		$env = $built['env'];
+
+		$this->logger->debug('Running '.var_export($command, true));
+		$this->logger->info('Classifying ' . count($queueFiles) . ' files with ' . $model);
+
+		// Use proc_open for full control over stdin/stdout pipes.
+		// This lets us write paths incrementally while reading results,
+		// overlapping PHP file resolution with Python GPU inference.
+		$descriptors = [
+			0 => ['pipe', 'r'],  // stdin: child reads, parent writes
+			1 => ['pipe', 'w'],  // stdout: child writes, parent reads
+			2 => ['pipe', 'w'],  // stderr: child writes, parent reads
+		];
+
+		// Merge env with current environment
+		$procEnv = array_merge(getenv(), $env);
+
+		$proc = proc_open($command, $descriptors, $pipes, __DIR__, $procEnv);
+		if (!is_resource($proc)) {
+			throw new \ErrorException('Classifier process could not be started');
+		}
+
+		$stdin = $pipes[0];
+		$stdout = $pipes[1];
+		$stderr = $pipes[2];
+
+		// Make stdout and stderr non-blocking so we can poll them
+		stream_set_blocking($stdout, false);
+		stream_set_blocking($stderr, false);
+
+		// Set CPU affinity if cores are configured
+		$cores = $this->config->getAppValueString('tensorflow.cores', '0');
+		if ((int)$cores !== 0) {
+			$status = proc_get_status($proc);
+			if ($status['running']) {
+				@exec('taskset -cp ' . implode(',', range(0, (int)$cores, 1)) . ' ' . ((string)$status['pid']));
+			}
+		}
+
+		// Pipeline state
+		$sentFiles = [];      // QueueFiles we've sent to the process (in order)
+		$sentPaths = [];      // Corresponding paths (for logging)
+		$sentNames = [];      // Corresponding display names (for logging)
+		$sendIndex = 0;       // Next queueFile to resolve and send
+		$recvIndex = 0;       // Next result to read
+		$buffer = '';
+		$errOut = '';
+		$stdinOpen = true;
+
+		// Pre-resolve a window of files ahead of the process to keep it fed.
+		// We'll resolve and send files as fast as possible, then drain results.
+		$totalFiles = count($queueFiles);
+
+		// How many files to keep "in flight" (sent but not yet received)
+		// This controls how far ahead the producer runs vs the consumer.
+		$prefetchWindow = 8;
+
+		while ($recvIndex < count($sentFiles) || $sendIndex < $totalFiles) {
+			// Check max execution time
+			if ($this->maxExecutionTime > 0 && time() - $startTime > $this->maxExecutionTime) {
+				break;
 			}
 
-			$i = 0;
-			$errOut = '';
-			$buffer = '';
-			foreach ($proc as $type => $data) {
-				if ($type !== $proc::OUT) {
-					$errOut .= $data;
-					$this->logger->debug('Classifier process output: '.$data);
-					continue;
-				}
+			// PRODUCER: resolve and send files while we have room in the preflight window
+			while ($stdinOpen && $sendIndex < $totalFiles && (count($sentFiles) - $recvIndex) < $prefetchWindow) {
 				if ($this->maxExecutionTime > 0 && time() - $startTime > $this->maxExecutionTime) {
-					$proc->stop(10, 9);
-					$this->cleanUpTmpFiles();
-					return;
+					break;
 				}
+
+				$queueFile = $queueFiles[$sendIndex];
+				$sendIndex++;
+
+				$resolved = $this->resolveFile($model, $queueFile);
+				if ($resolved === null) {
+					continue; // Skip this file, don't send to process
+				}
+
+				$line = $resolved['path'] . "\n";
+				$written = @fwrite($stdin, $line);
+				if ($written === false) {
+					$this->logger->warning('Failed to write to classifier stdin');
+					break;
+				}
+				fflush($stdin);
+
+				$sentFiles[] = $queueFile;
+				$sentPaths[] = $resolved['path'];
+				$sentNames[] = $resolved['name'];
+			}
+
+			// Close stdin once all files have been sent
+			if ($stdinOpen && $sendIndex >= $totalFiles && (count($sentFiles) - $recvIndex) <= count($sentFiles)) {
+				// Only close once we've sent everything
+				if ($sendIndex >= $totalFiles) {
+					fclose($stdin);
+					$stdinOpen = false;
+				}
+			}
+
+			// Nothing was sent (all files were invalid)
+			if (count($sentFiles) === 0 && $sendIndex >= $totalFiles) {
+				if ($stdinOpen) {
+					fclose($stdin);
+					$stdinOpen = false;
+				}
+				break;
+			}
+
+			// CONSUMER: read results from stdout
+			$readStreams = [$stdout, $stderr];
+			$write = null;
+			$except = null;
+			$changed = @stream_select($readStreams, $write, $except, $timeout);
+
+			if ($changed === false) {
+				$this->logger->warning('stream_select failed');
+				break;
+			}
+
+			// Read stderr (non-blocking)
+			$errData = stream_get_contents($stderr);
+			if ($errData !== false && $errData !== '') {
+				$errOut .= $errData;
+				$this->logger->debug('Classifier process output: ' . $errData);
+			}
+
+			// Read stdout
+			$data = stream_get_contents($stdout);
+			if ($data !== false && $data !== '') {
 				$buffer .= $data;
 				$lines = explode("\n", $buffer);
 				$buffer = '';
+
 				foreach ($lines as $result) {
 					if (trim($result) === '') {
 						continue;
 					}
+					// Validate JSON before processing
 					try {
 						json_decode($result, true, 512, JSON_OBJECT_AS_ARRAY | JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_IGNORE);
-						$invalid = false;
+						$valid = true;
 					} catch (\JsonException $e) {
-						$invalid = true;
+						$valid = false;
 					}
-					if ($invalid) {
-						$buffer .= "\n".$result;
+					if (!$valid) {
+						$buffer .= "\n" . $result;
 						continue;
 					}
-					$this->logger->debug('Result for ' . $fileNames[$i] .'(' . basename($paths[$i]) . ') = ' . $result);
+
+					if ($recvIndex >= count($sentFiles)) {
+						$this->logger->warning('Received more results than files sent');
+						break;
+					}
+
+					$this->logger->debug('Result for ' . $sentNames[$recvIndex] . '(' . basename($sentPaths[$recvIndex]) . ') = ' . $result);
 					try {
-						// decode json
 						$results = json_decode($result, true, 512, JSON_OBJECT_AS_ARRAY | JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_IGNORE);
-						yield $processedFiles[$i] => $results;
-						$this->queue->removeFromQueue($model, $processedFiles[$i]);
+						yield $sentFiles[$recvIndex] => $results;
+						$this->queue->removeFromQueue($model, $sentFiles[$recvIndex]);
 					} catch (\JsonException $e) {
 						$this->logger->warning('JSON exception');
 						$this->logger->warning($e->getMessage(), ['exception' => $e]);
@@ -248,30 +364,66 @@ abstract class Classifier {
 					} catch (Exception $e) {
 						$this->logger->warning($e->getMessage(), ['exception' => $e]);
 					}
-					$i++;
+					$recvIndex++;
 				}
 			}
-			$proc->stop();
-			$this->cleanUpTmpFiles();
-			if ($i !== count($paths)) {
-				$this->logger->warning('Classifier process output: '.$errOut);
-				throw new \ErrorException('Classifier process error');
+
+			// Check if process has exited
+			$status = proc_get_status($proc);
+			if (!$status['running'] && ($data === false || $data === '')) {
+				// Drain any remaining stdout
+				$remaining = stream_get_contents($stdout);
+				if ($remaining !== false && $remaining !== '') {
+					$buffer .= $remaining;
+					// Process remaining buffer (same logic as above)
+					$lines = explode("\n", $buffer);
+					foreach ($lines as $result) {
+						if (trim($result) === '' || $recvIndex >= count($sentFiles)) {
+							continue;
+						}
+						try {
+							$results = json_decode($result, true, 512, JSON_OBJECT_AS_ARRAY | JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_IGNORE);
+							$this->logger->debug('Result for ' . $sentNames[$recvIndex] . '(' . basename($sentPaths[$recvIndex]) . ') = ' . $result);
+							yield $sentFiles[$recvIndex] => $results;
+							$this->queue->removeFromQueue($model, $sentFiles[$recvIndex]);
+							$recvIndex++;
+						} catch (\JsonException $e) {
+							continue;
+						} catch (Exception $e) {
+							$this->logger->warning($e->getMessage(), ['exception' => $e]);
+							$recvIndex++;
+						}
+					}
+				}
+				break;
 			}
-		} catch (ProcessTimedOutException $e) {
-			$this->cleanUpTmpFiles();
-			$this->logger->warning($proc->getErrorOutput());
-			throw new \RuntimeException('Classifier process timeout');
-		} catch (RuntimeException $e) {
-			$this->cleanUpTmpFiles();
-			$this->logger->warning($proc->getErrorOutput());
-			throw new \ErrorException('Classifier process could not be started');
+		}
+
+		// Cleanup
+		if ($stdinOpen) {
+			@fclose($stdin);
+		}
+		@fclose($stdout);
+
+		// Drain stderr
+		$errRemaining = stream_get_contents($stderr);
+		if ($errRemaining !== false && $errRemaining !== '') {
+			$errOut .= $errRemaining;
+		}
+		@fclose($stderr);
+
+		$exitCode = proc_close($proc);
+		$this->cleanUpTmpFiles();
+
+		if ($recvIndex !== count($sentFiles)) {
+			$this->logger->warning('Classifier process output (stderr): ' . substr($errOut, 0, 2000));
+			$this->logger->warning('Expected ' . count($sentFiles) . ' results, got ' . $recvIndex . ', exit code: ' . $exitCode);
+			throw new \ErrorException('Classifier process error');
 		}
 	}
 
 	/**
 	 * Get path of file to process.
-	 * If the file is an image and not JPEG, it will be converted using ImageMagick.
-	 * Images will also be downscaled to a max dimension of 4096px.
 	 *
 	 * @param \OCP\Files\Node $file
 	 * @return string Path to file to process

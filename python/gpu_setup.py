@@ -15,12 +15,32 @@ import sys
 
 # Fix matplotlib permission error when running as apache/httpd user.
 # Must be set before any TF/numpy import triggers matplotlib.
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-recognize")
+# Use a per-uid directory to avoid permission conflicts between users.
+os.environ.setdefault("MPLCONFIGDIR", f"/tmp/matplotlib-recognize-{os.getuid()}")
 
 # Persistent cuDNN autotuning cache — avoids re-benchmarking convolution
 # algorithms on every process start. The first run is slow (~20s), subsequent
 # runs reuse cached results and start fast.
-_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tf_cache")
+# Prefer cache next to script; fall back to /tmp if not writable (e.g. running
+# from dev directory as apache user)
+_CACHE_DIR_PREFERRED = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tf_cache")
+_CACHE_DIR_FALLBACK = "/tmp/recognize-tf-cache"
+
+
+def _pick_cache_dir():
+    try:
+        os.makedirs(_CACHE_DIR_PREFERRED, exist_ok=True)
+        # Also check we can actually write inside it
+        test_file = os.path.join(_CACHE_DIR_PREFERRED, ".write_test")
+        with open(test_file, "w") as f:
+            f.write("ok")
+        os.unlink(test_file)
+        return _CACHE_DIR_PREFERRED
+    except OSError:
+        return _CACHE_DIR_FALLBACK
+
+
+_CACHE_DIR = _pick_cache_dir()
 
 
 def configure():
@@ -40,14 +60,9 @@ def configure():
         os.environ.setdefault("TF_CUDNN_CACHEDIR", _CACHE_DIR)
         os.environ.setdefault("TF_CUDNN_USE_AUTOTUNE", "1")
 
-        # Enable persistent XLA compilation cache — avoids recompiling GPU
-        # kernels on every process start (~10-30s savings after first run)
-        xla_cache_dir = os.path.join(_CACHE_DIR, "xla")
-        os.makedirs(xla_cache_dir, exist_ok=True)
-        xla_flags = os.environ.get("TF_XLA_FLAGS", "")
-        new_flag = f"--xla_gpu_persistent_cache_dir={xla_cache_dir}"
-        if new_flag not in xla_flags:
-            os.environ["TF_XLA_FLAGS"] = f"{xla_flags} {new_flag}".strip()
+        # Note: XLA persistent cache (--xla_gpu_persistent_cache_dir) was removed
+        # as it causes a fatal crash in TF 2.20 ("Unknown flag in TF_XLA_FLAGS").
+        # XLA JIT still works, just without cross-run caching.
 
     # Now safe to import tensorflow
     import tensorflow as tf

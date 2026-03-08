@@ -1,11 +1,9 @@
-"""Run all classifier benchmarks and produce a combined report.
+"""Run all classifier benchmarks in subprocess isolation.
 
-Runs each benchmark as a subprocess to avoid GPU memory conflicts between
-TF-based and ONNX-based classifiers sharing the same process.
+Each classifier gets its own process to avoid GPU memory conflicts.
+Aggregates results into a combined JSON report.
 
-Usage:
-    RECOGNIZE_GPU=true python python/tests/bench_all.py
-    RECOGNIZE_GPU=true python python/tests/bench_all.py 2>summary.txt >baseline.json
+Run: python tests/bench_all.py [--no-gpu] [--json]
 """
 
 import json
@@ -14,97 +12,86 @@ import subprocess
 import sys
 import time
 
-TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-PYTHON_DIR = os.path.dirname(TESTS_DIR)
-PROJECT_ROOT = os.path.dirname(PYTHON_DIR)
-
-PYTHON_BIN = sys.executable
+BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
+PYTHON = sys.executable
 
 BENCHMARKS = [
     ("imagenet", "bench_imagenet.py"),
-    ("landmarks", "bench_landmarks.py"),
     ("faces", "bench_faces.py"),
+    ("landmarks", "bench_landmarks.py"),
     ("movinet", "bench_movinet.py"),
     ("musicnn", "bench_musicnn.py"),
 ]
 
 
-def run_single_benchmark(name, script):
-    """Run a benchmark script as subprocess, return parsed JSON result."""
-    script_path = os.path.join(TESTS_DIR, script)
-    env = os.environ.copy()
-    env.setdefault("RECOGNIZE_GPU", "true")
+def run_one(name, script, gpu=True):
+    """Run a single benchmark in a subprocess."""
+    cmd = [PYTHON, os.path.join(BENCH_DIR, script)]
+    if not gpu:
+        cmd.append("--no-gpu")
 
     print(f"\n{'=' * 60}", file=sys.stderr)
-    print(f"  Running {name} benchmark...", file=sys.stderr)
+    print(f"  Running: {name}", file=sys.stderr)
     print(f"{'=' * 60}", file=sys.stderr)
 
-    start = time.perf_counter()
-    proc = subprocess.run(
-        [PYTHON_BIN, script_path],
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=PROJECT_ROOT,
-        timeout=600,
-    )
-    elapsed = time.perf_counter() - start
-
-    # Print stderr (human-readable summary) to our stderr
-    if proc.stderr:
-        for line in proc.stderr.strip().split("\n"):
-            print(f"  [{name}] {line}", file=sys.stderr)
+    t0 = time.perf_counter()
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    elapsed = time.perf_counter() - t0
 
     if proc.returncode != 0:
-        print(f"  [{name}] FAILED (exit code {proc.returncode})", file=sys.stderr)
-        return None
+        print(f"  FAILED ({proc.returncode}): {proc.stderr[:500]}", file=sys.stderr)
+        return {"error": proc.stderr[:500], "elapsed_s": elapsed}
 
-    # Parse JSON from stdout
-    try:
-        result = json.loads(proc.stdout)
-        result["wall_time_s"] = round(elapsed, 2)
-        return result
-    except json.JSONDecodeError:
-        print(f"  [{name}] Failed to parse JSON output", file=sys.stderr)
-        return None
+    # Output contains summary table (text) then JSON
+    lines = proc.stdout.strip().split("\n")
+    # Find the JSON blob (starts with '{')
+    json_start = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("{"):
+            json_start = i
+            break
+
+    if json_start is not None:
+        # Print the text portion to stderr
+        for line in lines[:json_start]:
+            print(line, file=sys.stderr)
+        # Parse the JSON
+        json_text = "\n".join(lines[json_start:])
+        try:
+            return json.loads(json_text)
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: print all output
+    print(proc.stdout, file=sys.stderr)
+    return {"raw_output": proc.stdout[:1000], "elapsed_s": elapsed}
 
 
 def main():
-    combined = {
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "gpu_env": os.environ.get("RECOGNIZE_GPU", "not set"),
-        "benchmarks": {},
-    }
+    gpu = "--no-gpu" not in sys.argv
+    json_output = "--json" in sys.argv
 
-    total_start = time.perf_counter()
+    results = {}
+    total_t0 = time.perf_counter()
 
     for name, script in BENCHMARKS:
-        result = run_single_benchmark(name, script)
-        if result:
-            combined["benchmarks"][name] = result
+        results[name] = run_one(name, script, gpu=gpu)
 
-    total_elapsed = time.perf_counter() - total_start
+    total_elapsed = time.perf_counter() - total_t0
 
-    # Summary
-    print(f"\n{'=' * 60}", file=sys.stderr)
-    print(f"  ALL BENCHMARKS COMPLETE ({total_elapsed:.1f}s total)", file=sys.stderr)
-    print(f"{'=' * 60}", file=sys.stderr)
+    combined = {
+        "total_elapsed_s": round(total_elapsed, 2),
+        "gpu": gpu,
+        "benchmarks": results,
+    }
 
-    for name, data in combined["benchmarks"].items():
-        classifiers = data.get("classifiers", {})
-        for cls_name, cls_data in classifiers.items():
-            avg_total = cls_data.get("avg_total_ms", 0)
-            n = cls_data.get("n_files", 0)
-            throughput = 1000.0 / avg_total if avg_total > 0 else 0
-            print(
-                f"  {cls_name:12s}: {avg_total:7.1f} ms/file  ({throughput:.1f} files/s, n={n})",
-                file=sys.stderr,
-            )
-
-    combined["total_wall_time_s"] = round(total_elapsed, 2)
-
-    # JSON to stdout
-    print(json.dumps(combined, indent=2))
+    if json_output:
+        print(json.dumps(combined, indent=2))
+    else:
+        print(f"\n{'=' * 60}", file=sys.stderr)
+        print(f"  All benchmarks complete in {total_elapsed:.1f}s", file=sys.stderr)
+        print(f"{'=' * 60}", file=sys.stderr)
+        print(json.dumps(combined, indent=2))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,37 @@
+[Unit]
+Description=Nextcloud Recognize ML Service
+After=network.target mysql.service postgresql.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__GROUP__
+WorkingDirectory=__PYTHON_DIR__
+ExecStart=__PYTHON_BIN__ service.py __CONFIG_PATH__ --models-dir __MODELS_DIR__ --ffmpeg __FFMPEG_BIN__
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# GPU environment
+Environment=LD_LIBRARY_PATH=__NVIDIA_LIB_PATH__
+Environment=CUDA_VISIBLE_DEVICES=__CUDA_DEVICES__
+Environment=ORT_TENSORRT_CACHE=__MODELS_DIR__/.ort_cache
+
+# GPU device access (render group for /dev/dri, video for some drivers)
+SupplementaryGroups=video render
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__DATA_DIR__ __MODELS_DIR__
+PrivateTmp=true
+
+# Resource limits
+MemoryMax=8G
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -15,7 +15,8 @@ import sys
 # Set a stable writable matplotlib config dir before any transitive import
 # (TensorFlow and InsightFace pull in matplotlib). Avoids permission errors
 # when running as the apache user whose home dir is not writable.
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-recognize")
+# Use a per-uid directory to avoid permission conflicts between users.
+os.environ.setdefault("MPLCONFIGDIR", f"/tmp/matplotlib-recognize-{os.getuid()}")
 
 # Register HEIC/HEIF support so PIL can open iPhone photos directly
 try:
@@ -121,6 +122,109 @@ def prefetch_map(iterable, fn, prefetch=4):
         while buf:
             old_item, future = buf.popleft()
             yield old_item, future.result()
+
+
+def iter_batches_from_list(paths, batch_size):
+    """Yield lists of up to batch_size paths from an iterable.
+
+    Like iter_batches() but takes any iterable of paths instead of reading
+    from stdin. Used by db_worker to feed resolved file paths to classifiers.
+    """
+    batch = []
+    for path in paths:
+        batch.append(path)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def batched_producer_consumer(path_source, preprocess_fn, batch_size,
+                               prefetch_batches=3, workers=4):
+    """Queue-based producer-consumer pipeline for batched GPU inference.
+
+    A thread pool preprocesses individual files continuously while the main
+    thread (GPU) consumes ready batches. Multiple preprocessed batches are
+    buffered to keep the GPU fed even when preprocessing is slower than
+    inference.
+
+    Unlike prefetch_map on whole batches, this submits individual files to
+    the thread pool as they arrive, achieving overlap between batches:
+    while the GPU processes batch N, workers are already preprocessing
+    items for batches N+1, N+2, etc.
+
+    Args:
+        path_source: iterable of file paths (generator or list)
+        preprocess_fn: callable(path) -> preprocessed_data or None on error
+        batch_size: images per GPU batch
+        prefetch_batches: number of ready batches to buffer ahead of GPU
+        workers: number of parallel preprocessing threads
+
+    Yields: (batch_paths, batch_results) tuples where batch_results is a list
+            of preprocess_fn outputs (None for failed files).
+    """
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue
+    from threading import Thread
+
+    SENTINEL = object()
+    batch_queue = Queue(maxsize=prefetch_batches)
+
+    def _safe(path):
+        try:
+            return preprocess_fn(path)
+        except Exception as e:
+            print(f"Preprocess error for {path}: {e}", file=sys.stderr)
+            return None
+
+    def producer():
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                pending = deque()  # (path, Future)
+
+                for path in path_source:
+                    pending.append((path, pool.submit(_safe, path)))
+
+                    # Drain oldest batch once we have enough items queued
+                    # to keep the pool busy on the next batch's items
+                    while len(pending) >= batch_size + workers:
+                        batch_paths = []
+                        batch_results = []
+                        for _ in range(batch_size):
+                            p, f = pending.popleft()
+                            batch_paths.append(p)
+                            batch_results.append(f.result())
+                        batch_queue.put((batch_paths, batch_results))
+
+                # Drain remaining items as final batches
+                while pending:
+                    batch_paths = []
+                    batch_results = []
+                    count = min(batch_size, len(pending))
+                    for _ in range(count):
+                        p, f = pending.popleft()
+                        batch_paths.append(p)
+                        batch_results.append(f.result())
+                    batch_queue.put((batch_paths, batch_results))
+        except Exception as e:
+            print(f"Pipeline producer error: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+        finally:
+            batch_queue.put(SENTINEL)
+
+    t = Thread(target=producer, daemon=True)
+    t.start()
+
+    while True:
+        item = batch_queue.get()
+        if item is SENTINEL:
+            break
+        yield item
+
+    t.join()
 
 
 def output_result(result):
