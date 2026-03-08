@@ -34,7 +34,8 @@ if [ ! -f "$VENV_DIR/bin/python" ]; then
         'scikit-learn>=1.4' \
         'requests>=2.31' \
         'soundfile>=0.12' \
-        'scipy>=1.12'
+        'scipy>=1.12' \
+        'mysql-connector-python>=8.0'
 else
     echo "  Venv already exists at $VENV_DIR"
     echo "  To force recreation: rm -rf $VENV_DIR && re-run deploy.sh"

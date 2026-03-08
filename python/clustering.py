@@ -13,14 +13,15 @@ HDBSCAN parameters are tuned for face recognition:
   - min_samples=2: Allow small clusters (pairs of photos)
   - metric="euclidean": Works on L2-normalized embeddings (euclidean distance is
     monotonically related to cosine distance for unit vectors: d²=2(1-cos_sim))
-  - cluster_selection_epsilon=1.0: Merge nearby clusters — on unit vectors,
-    d_euc=1.0 corresponds to cosine_sim=0.5, suitable for same-person variations
+  - cluster_selection_epsilon=0.0: Disabled (sklearn HDBSCAN bug with numpy 2.x).
+    HDBSCAN's default leaf selection still merges well for face embeddings.
   - allow_single_cluster=True: Required so a dataset with only one person still
     forms a cluster instead of being labeled as all-noise
 """
 
 import logging
 import time
+import traceback
 
 import numpy as np
 
@@ -30,7 +31,7 @@ log = logging.getLogger(__name__)
 MIN_CLUSTER_SIZE = 3
 MIN_SAMPLES = 2
 METRIC = "euclidean"
-CLUSTER_SELECTION_EPSILON = 1.0
+CLUSTER_SELECTION_EPSILON = 0.0
 ALLOW_SINGLE_CLUSTER = True
 
 
@@ -95,11 +96,12 @@ def cluster_user_faces(db, user_id, **kwargs):
     # Run clustering
     labels = cluster_faces(embeddings, **kwargs)
 
-    # Write cluster IDs back to DB
-    db.update_face_clusters(ids, labels.tolist())
+    # Write cluster IDs back to DB (convert to pure Python ints)
+    labels_list = labels.tolist()
+    db.update_face_clusters(ids, labels_list)
 
-    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    n_noise = int(np.sum(labels == -1))
+    n_clusters = len(set(labels_list)) - (1 if -1 in labels_list else 0)
+    n_noise = labels_list.count(-1)
     elapsed = time.monotonic() - t0
 
     log.info(
@@ -133,7 +135,7 @@ def cluster_all_users(db, user_ids=None, **kwargs):
             stats = cluster_user_faces(db, user_id, **kwargs)
             results[user_id] = stats
         except Exception as e:
-            log.error("Clustering failed for user %s: %s", user_id, e)
+            log.error("Clustering failed for user %s: %s\n%s", user_id, e, traceback.format_exc())
             results[user_id] = {"error": str(e)}
 
     return results
