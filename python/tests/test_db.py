@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from db import DB, VALID_MODELS
+from db import DB
 
 
 @pytest.fixture
@@ -90,7 +90,7 @@ class TestPending:
         assert len(creates) == 1
         assert creates[0]["file_id"] == 100
 
-        deletes = db.fetch_deletions(limit=10)
+        deletes = db.fetch_pending(limit=10, action_filter=(2,))
         assert len(deletes) == 1
         assert deletes[0]["file_id"] == 200
 
@@ -185,47 +185,6 @@ class TestFaceDetections:
 
         updated = db.get_face_detections_for_user("alice")
         assert updated[0]["cluster_id"] is None
-
-
-class TestQueueLegacy:
-    """Test legacy queue table operations (for migration period)."""
-
-    def _create_legacy_queue(self, db, model):
-        t = db._queue_table(model)
-        db._execute(
-            f"CREATE TABLE IF NOT EXISTS {t} ("
-            f"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            f"  file_id INTEGER NOT NULL,"
-            f"  storage_id INTEGER NOT NULL,"
-            f"  root_id INTEGER NOT NULL"
-            f")"
-        )
-        db._commit()
-
-    def test_invalid_model_rejected(self, db):
-        with pytest.raises(ValueError, match="Invalid model"):
-            db._queue_table("'; DROP TABLE users; --")
-
-    def test_valid_models(self, db):
-        for model in VALID_MODELS:
-            table = db._queue_table(model)
-            assert model in table
-
-    def test_fetch_and_remove(self, db):
-        self._create_legacy_queue(db, "imagenet")
-        t = db._queue_table("imagenet")
-        db._execute(
-            f"INSERT INTO {t} (file_id, storage_id, root_id) VALUES (?, ?, ?)",
-            (42, 1, 1)
-        )
-        db._commit()
-
-        rows = db.fetch_queue("imagenet", limit=10)
-        assert len(rows) == 1
-        assert rows[0]["file_id"] == 42
-
-        db.remove_from_queue("imagenet", [rows[0]["id"]])
-        assert db.fetch_queue("imagenet", limit=10) == []
 
 
 class TestMimeClassification:

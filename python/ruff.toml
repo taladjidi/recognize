@@ -1,4 +1,1 @@
 [lint]
-# E402: Module-level import not at top of file — intentional in classifiers
-# because gpu_setup.configure() must run before tensorflow/numpy imports.
-ignore = ["E402"]

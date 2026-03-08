@@ -97,22 +97,6 @@ def get_models_dir(config: dict) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models")
 
 
-def get_nextcloud_url(config: dict) -> str:
-    """Return the Nextcloud base URL for internal API calls."""
-    url = config.get("nextcloud_url", "")
-    if not url:
-        raise ConfigError("'nextcloud_url' is required in config")
-    return url.rstrip("/")
-
-
-def get_internal_secret(config: dict) -> str:
-    """Return the shared secret for authenticating to the PHP internal API."""
-    secret = config.get("internal_secret", "")
-    if not secret:
-        raise ConfigError("'internal_secret' is required in config")
-    return secret
-
-
 def get_nvidia_lib_path() -> str:
     """Build LD_LIBRARY_PATH entries for NVIDIA pip packages.
 

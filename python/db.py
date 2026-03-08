@@ -13,8 +13,6 @@ import time
 log = logging.getLogger(__name__)
 
 PREFIX_RE = re.compile(r"^[a-zA-Z0-9_]*$")
-# Whitelist of model names that can appear in table names
-VALID_MODELS = frozenset({"imagenet", "faces", "landmarks", "movinet", "musicnn"})
 
 # MIME types by media category (from Nextcloud Constants.php)
 IMAGE_MIMES = (
@@ -163,9 +161,6 @@ class DB:
     def _commit(self):
         self._conn.commit()
 
-    def _rollback(self):
-        self._conn.rollback()
-
     def _last_insert_id(self, cursor) -> int:
         """Get the last auto-increment ID."""
         if self.dialect == "sqlite3":
@@ -201,10 +196,6 @@ class DB:
         )
         cur = self._execute(sql, (*action_filter, limit))
         return self._fetchall_dicts(cur)
-
-    def fetch_deletions(self, limit: int = 100) -> list[dict]:
-        """Fetch pending deletions (action=2)."""
-        return self.fetch_pending(limit=limit, action_filter=(2,))
 
     def upsert_pending(self, file_id: int, storage_id: int, action: int = 0):
         """Insert or update a pending entry.
@@ -380,40 +371,11 @@ class DB:
     def get_users_with_faces(self) -> list[str]:
         """Get distinct user IDs that have face detections."""
         t = self._table("recognize_face_detections")
-        rows = self._fetchall(f"SELECT DISTINCT user_id FROM {t}")
+        cur = self._execute(f"SELECT DISTINCT user_id FROM {t}")
+        rows = self._fetchall_dicts(cur)
         return [row["user_id"] for row in rows]
 
-    def get_users_for_file(self, file_id: int) -> list[str]:
-        """Get user IDs with access to a file via the mount cache."""
-        mounts = self._table("mounts")
-        fc = self._table("filecache")
-
-        sql = (
-            f"SELECT DISTINCT m.user_id "
-            f"FROM {mounts} m "
-            f"INNER JOIN {fc} f ON m.root_id = f.fileid "
-            f"WHERE m.storage_id = ("
-            f"  SELECT storage FROM {fc} WHERE fileid = {self._ph()}"
-            f")"
-        )
-        cur = self._execute(sql, (file_id,))
-        return [row[0] if isinstance(row, tuple) else row["user_id"]
-                for row in cur.fetchall()]
-
     # ── Settings & maintenance ──────────────────────────────────────────
-
-    def get_setting(self, key: str) -> str:
-        """Read an app config value from oc_appconfig."""
-        t = self._table("appconfig")
-        cur = self._execute(
-            f"SELECT configvalue FROM {t} "
-            f"WHERE appid = {self._ph()} AND configkey = {self._ph()}",
-            ("recognize", key),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return ""
-        return row[0] if isinstance(row, tuple) else row["configvalue"]
 
     def check_maintenance_mode(self) -> bool:
         """Check if Nextcloud is in maintenance mode."""
@@ -421,32 +383,6 @@ class DB:
         # We check by reading the config's 'maintenance' key if present,
         # or by trying a simple query (if DB is locked, we're in maintenance).
         return self._config.get("maintenance", False)
-
-    # ── Queue table operations (legacy compat) ──────────────────────────
-
-    def _queue_table(self, model: str) -> str:
-        """Return queue table name, with model name validation."""
-        if model not in VALID_MODELS:
-            raise ValueError(f"Invalid model name: {model!r}")
-        return self._table(f"recognize_queue_{model}")
-
-    def fetch_queue(self, model: str, limit: int = 1000) -> list[dict]:
-        """Fetch from legacy per-model queue table."""
-        t = self._queue_table(model)
-        cur = self._execute(
-            f"SELECT id, file_id, storage_id, root_id "
-            f"FROM {t} ORDER BY id LIMIT {self._ph()}", (limit,)
-        )
-        return self._fetchall_dicts(cur)
-
-    def remove_from_queue(self, model: str, queue_ids: list[int]):
-        """Remove entries from legacy queue table."""
-        if not queue_ids:
-            return
-        t = self._queue_table(model)
-        phs = self._ph(len(queue_ids))
-        self._execute(f"DELETE FROM {t} WHERE id IN ({phs})", tuple(queue_ids))
-        self._commit()
 
     # ── MIME type helpers ───────────────────────────────────────────────
 

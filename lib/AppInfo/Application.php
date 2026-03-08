@@ -16,13 +16,9 @@ use OCP\AppFramework\Bootstrap\IBootContext;
 use OCP\AppFramework\Bootstrap\IBootstrap;
 use OCP\AppFramework\Bootstrap\IRegistrationContext;
 use OCP\EventDispatcher\IEventDispatcher;
-use OCP\Files\Cache\CacheEntryInsertedEvent;
 use OCP\Files\Events\Node\BeforeNodeDeletedEvent;
-use OCP\Files\Events\Node\BeforeNodeRenamedEvent;
 use OCP\Files\Events\Node\NodeCreatedEvent;
-use OCP\Files\Events\Node\NodeDeletedEvent;
 use OCP\Files\Events\Node\NodeRenamedEvent;
-use OCP\Files\Events\NodeRemovedFromCache;
 
 final class Application extends App implements IBootstrap {
 	public const APP_ID = 'recognize';
@@ -33,17 +29,9 @@ final class Application extends App implements IBootstrap {
 		 * @var IEventDispatcher $dispatcher
 		 */
 		$dispatcher = $this->getContainer()->get(IEventDispatcher::class);
-		$dispatcher->addServiceListener(BeforeNodeDeletedEvent::class, FileListener::class);
-		$dispatcher->addServiceListener(NodeDeletedEvent::class, FileListener::class);
 		$dispatcher->addServiceListener(NodeCreatedEvent::class, FileListener::class);
 		$dispatcher->addServiceListener(NodeRenamedEvent::class, FileListener::class);
-		$dispatcher->addServiceListener(BeforeNodeRenamedEvent::class, FileListener::class);
-		$dispatcher->addServiceListener(CacheEntryInsertedEvent::class, FileListener::class);
-		$dispatcher->addServiceListener(NodeRemovedFromCache::class, FileListener::class);
-		$dispatcher->addServiceListener('OCP\Files\Config\Event\UserMountAddedEvent', FileListener::class);
-		$dispatcher->addServiceListener('OCP\Files\Config\Event\UserMountRemovedEvent', FileListener::class);
-		// it is not fired as of now, Added and Removed events are fired instead in that order
-		// $context->addServiceListener('OCP\Files\Config\Event\UserMountUpdatedEvent', FileListener::class);
+		$dispatcher->addServiceListener(BeforeNodeDeletedEvent::class, FileListener::class);
 	}
 
 	public function register(IRegistrationContext $context): void {

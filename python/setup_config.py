@@ -13,7 +13,6 @@ The internal secret is stored in both nc_config.json and Nextcloud's
 oc_appconfig table so the Python daemon and PHP controller can authenticate.
 """
 
-import getpass
 import grp
 import json
 import os
@@ -108,7 +107,7 @@ def generate_service_file(config, nc_root, python_bin):
     with open(SERVICE_TEMPLATE) as f:
         template = f.read()
 
-    # Determine user/group (apache, www-data, nginx, or current user)
+    # Determine user/group (web server user)
     user = "apache"
     group = "apache"
     for candidate in ["apache", "www-data", "nginx", "http"]:

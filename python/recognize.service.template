@@ -24,10 +24,8 @@ SupplementaryGroups=video render
 
 # Security hardening
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=__DATA_DIR__ __MODELS_DIR__
 PrivateTmp=true
+ReadWritePaths=__DATA_DIR__ __MODELS_DIR__
 
 # Resource limits
 MemoryMax=8G
