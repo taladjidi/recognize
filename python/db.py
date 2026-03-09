@@ -347,7 +347,7 @@ class DB:
         """Get all face detections for a user (for clustering)."""
         t = self._table("recognize_face_detections")
         cur = self._execute(
-            f"SELECT id, file_id, x, y, height, width, face_vector, cluster_id "
+            f"SELECT id, file_id, x, y, height, width, face_vector, cluster_id, threshold "
             f"FROM {t} WHERE user_id = {self._ph()}", (user_id,)
         )
         rows = self._fetchall_dicts(cur)
@@ -355,6 +355,87 @@ class DB:
             if isinstance(row["face_vector"], str):
                 row["face_vector"] = json.loads(row["face_vector"])
         return rows
+
+    def get_face_clusters_for_user(self, user_id: str) -> list[dict]:
+        """Get all face cluster rows for a user."""
+        t = self._table("recognize_face_clusters")
+        cur = self._execute(
+            f"SELECT id, title FROM {t} WHERE user_id = {self._ph()}", (user_id,)
+        )
+        return self._fetchall_dicts(cur)
+
+    def get_cluster_sample(self, cluster_id: int, limit: int) -> list[dict]:
+        """Sample detections from an existing cluster (for reference during clustering)."""
+        t = self._table("recognize_face_detections")
+        cur = self._execute(
+            f"SELECT id, file_id, face_vector, cluster_id, threshold "
+            f"FROM {t} WHERE cluster_id = {self._ph()} LIMIT {int(limit)}",
+            (cluster_id,),
+        )
+        rows = self._fetchall_dicts(cur)
+        for row in rows:
+            if isinstance(row["face_vector"], str):
+                row["face_vector"] = json.loads(row["face_vector"])
+        return rows
+
+    def get_unclustered_detections(self, user_id: str, min_size: float = 0.0) -> list[dict]:
+        """Get face detections that have never been clustered (cluster_id IS NULL)."""
+        t = self._table("recognize_face_detections")
+        cur = self._execute(
+            f"SELECT id, file_id, face_vector, cluster_id, threshold "
+            f"FROM {t} WHERE user_id = {self._ph()} AND cluster_id IS NULL "
+            f"AND height >= {self._ph()} AND width >= {self._ph()}",
+            (user_id, min_size, min_size),
+        )
+        rows = self._fetchall_dicts(cur)
+        for row in rows:
+            if isinstance(row["face_vector"], str):
+                row["face_vector"] = json.loads(row["face_vector"])
+        return rows
+
+    def get_rejected_detections(self, user_id: str, min_size: float = 0.0) -> list[dict]:
+        """Get detections previously rejected from clustering (threshold > 0)."""
+        t = self._table("recognize_face_detections")
+        cur = self._execute(
+            f"SELECT id, file_id, face_vector, cluster_id, threshold "
+            f"FROM {t} WHERE user_id = {self._ph()} AND threshold > 0 "
+            f"AND height >= {self._ph()} AND width >= {self._ph()}",
+            (user_id, min_size, min_size),
+        )
+        rows = self._fetchall_dicts(cur)
+        for row in rows:
+            if isinstance(row["face_vector"], str):
+                row["face_vector"] = json.loads(row["face_vector"])
+        return rows
+
+    def create_face_cluster(self, user_id: str, title: str = "") -> int:
+        """Create a new face cluster row and return its ID."""
+        t = self._table("recognize_face_clusters")
+        if self.dialect == "pgsql":
+            cur = self._execute(
+                f"INSERT INTO {t} (title, user_id) VALUES ({self._ph()}, {self._ph()}) RETURNING id",
+                (title, user_id),
+            )
+        else:
+            cur = self._execute(
+                f"INSERT INTO {t} (title, user_id) VALUES ({self._ph()}, {self._ph()})",
+                (title, user_id),
+            )
+        self._commit()
+        return self._last_insert_id(cur)
+
+    def assign_detection_to_cluster(self, detection_id: int, cluster_id: int):
+        """Assign a single face detection to a cluster (auto-commits)."""
+        t = self._table("recognize_face_detections")
+        self._execute(
+            f"UPDATE {t} SET cluster_id = {self._ph()} WHERE id = {self._ph()}",
+            (cluster_id, detection_id),
+        )
+        # Caller should call db.commit() after batch assignments
+
+    def commit(self):
+        """Explicit commit for batching multiple writes."""
+        self._commit()
 
     def update_face_clusters(self, detection_ids: list[int], cluster_ids: list[int]):
         """Batch-update cluster assignments for face detections."""
@@ -468,6 +549,28 @@ class DB:
                 f"  face_vector LONGTEXT,"
                 f"  cluster_id BIGINT,"
                 f"  threshold DOUBLE DEFAULT 0.0"
+                f")"
+            )
+        self._execute(sql)
+        self._commit()
+
+    def create_face_clusters_table(self):
+        """Create recognize_face_clusters table (for testing)."""
+        t = self._table("recognize_face_clusters")
+        if self.dialect == "sqlite3":
+            sql = (
+                f"CREATE TABLE IF NOT EXISTS {t} ("
+                f"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                f"  title TEXT NOT NULL DEFAULT '',"
+                f"  user_id TEXT NOT NULL DEFAULT ''"
+                f")"
+            )
+        else:
+            sql = (
+                f"CREATE TABLE IF NOT EXISTS {t} ("
+                f"  id BIGINT AUTO_INCREMENT PRIMARY KEY,"
+                f"  title VARCHAR(4000) NOT NULL DEFAULT '',"
+                f"  user_id VARCHAR(64) NOT NULL DEFAULT ''"
                 f")"
             )
         self._execute(sql)

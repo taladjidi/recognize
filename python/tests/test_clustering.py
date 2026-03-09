@@ -1,9 +1,9 @@
-"""Tests for face clustering."""
+"""Tests for semi-supervised face clustering."""
 
 import numpy as np
 import pytest
 
-from clustering import cluster_faces, cluster_user_faces, cluster_all_users
+from clustering import cluster_user_faces, cluster_all_users
 from db import DB
 
 
@@ -24,6 +24,7 @@ def sqlite_config():
 def db(sqlite_config):
     d = DB(sqlite_config)
     d.create_face_detections_table()
+    d.create_face_clusters_table()
     yield d
     d.close()
 
@@ -35,7 +36,7 @@ def _make_embedding(cluster_center, noise_scale=0.02):
     return vec
 
 
-def _insert_faces(db, user_id, embeddings):
+def _insert_faces(db, user_id, embeddings, file_id_start=1000):
     """Insert face detections with given embeddings, return face IDs."""
     ids = []
     for i, emb in enumerate(embeddings):
@@ -43,111 +44,51 @@ def _insert_faces(db, user_id, embeddings):
             "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4,
             "vector": emb.tolist(),
         }
-        fid = db.insert_face_detection(file_id=1000 + i, user_id=user_id, face=face)
+        fid = db.insert_face_detection(
+            file_id=file_id_start + i, user_id=user_id, face=face,
+        )
         ids.append(fid)
     return ids
 
 
-class TestClusterFaces:
-    def test_too_few_faces(self):
-        """Fewer faces than min_cluster_size should all be noise."""
-        embeddings = np.random.randn(2, 512).astype(np.float32)
-        labels = cluster_faces(embeddings)
-        assert len(labels) == 2
-        assert all(l == -1 for l in labels)
-
-    def test_single_cluster(self):
-        """Tight embeddings with allow_single_cluster should form one cluster."""
-        np.random.seed(42)
-        center = np.random.randn(512).astype(np.float32)
-        center /= np.linalg.norm(center)
-        embeddings = np.stack([_make_embedding(center, noise_scale=0.02) for _ in range(15)])
-
-        labels = cluster_faces(embeddings)
-        unique = set(labels)
-        unique.discard(-1)
-        assert len(unique) == 1, f"Expected 1 cluster, got {len(unique)}: {labels}"
-
-    def test_two_clusters(self):
-        """Two well-separated groups should form two clusters."""
-        np.random.seed(42)
-        center_a = np.random.randn(512).astype(np.float32)
-        center_a /= np.linalg.norm(center_a)
-        center_b = -center_a  # Opposite direction = max distance
-
-        embs_a = [_make_embedding(center_a, noise_scale=0.02) for _ in range(10)]
-        embs_b = [_make_embedding(center_b, noise_scale=0.02) for _ in range(10)]
-        embeddings = np.stack(embs_a + embs_b)
-
-        labels = cluster_faces(embeddings)
-        unique = set(labels)
-        unique.discard(-1)
-        assert len(unique) == 2, f"Expected 2 clusters, got {len(unique)}: {labels}"
-
-        # First 10 should be same cluster, last 10 should be different
-        cluster_a = set(labels[:10]) - {-1}
-        cluster_b = set(labels[10:]) - {-1}
-        assert len(cluster_a) == 1
-        assert len(cluster_b) == 1
-        assert cluster_a != cluster_b
-
-    def test_noise_points(self):
-        """Outlier embeddings far from a tight cluster should be noise."""
-        np.random.seed(42)
-        center = np.random.randn(512).astype(np.float32)
-        center /= np.linalg.norm(center)
-
-        # 10 tight cluster + 3 orthogonal outliers (far away in euclidean)
-        tight = [_make_embedding(center, noise_scale=0.02) for _ in range(10)]
-        # Create outliers that are far from center
-        outliers = []
-        for _ in range(3):
-            v = np.random.randn(512).astype(np.float32)
-            v -= v.dot(center) * center  # Make orthogonal to center
-            v /= np.linalg.norm(v)
-            outliers.append(v)
-
-        embeddings = np.stack(tight + outliers)
-        # Use allow_single_cluster=False to see noise behavior
-        labels = cluster_faces(embeddings, allow_single_cluster=False)
-
-        # With allow_single_cluster=False, outliers might be noise
-        # At minimum, the tight group should have some structure
-        assert len(labels) == 13
-
-    def test_empty_input(self):
-        """Empty input should return empty labels."""
-        embeddings = np.zeros((0, 512), dtype=np.float32)
-        labels = cluster_faces(embeddings)
-        assert len(labels) == 0
-
-    def test_custom_params(self):
-        """Custom HDBSCAN params should be respected."""
-        center = np.random.randn(512).astype(np.float32)
-        center /= np.linalg.norm(center)
-        embeddings = np.stack([_make_embedding(center) for _ in range(5)])
-
-        # Very high min_cluster_size should make everything noise
-        labels = cluster_faces(embeddings, min_cluster_size=100)
-        assert all(l == -1 for l in labels)
-
-
 class TestClusterUserFaces:
-    def test_cluster_user(self, db):
-        """Cluster faces for a single user."""
+    def test_empty_user(self, db):
+        """User with no faces should return zeros."""
+        stats = cluster_user_faces(db, "nobody")
+        assert stats["n_faces"] == 0
+        assert stats["n_clusters"] == 0
+
+    def test_no_fresh_detections(self, db):
+        """If all detections are already clustered, skip clustering."""
         np.random.seed(42)
         center = np.random.randn(512).astype(np.float32)
         center /= np.linalg.norm(center)
         embeddings = [_make_embedding(center, noise_scale=0.02) for _ in range(10)]
         _insert_faces(db, "alice", embeddings)
 
-        stats = cluster_user_faces(db, "alice")
-        assert stats["n_faces"] == 10
-        assert stats["n_clusters"] >= 1
-        assert stats["elapsed_s"] >= 0
+        # First clustering: assigns to clusters
+        stats1 = cluster_user_faces(db, "alice")
+        assert stats1["n_assigned"] > 0
 
-    def test_cluster_writes_back_to_db(self, db):
-        """Cluster IDs should be written back to DB."""
+        # Second clustering: no fresh detections, should skip
+        stats2 = cluster_user_faces(db, "alice")
+        assert stats2["n_assigned"] == 0
+
+    def test_creates_cluster_rows(self, db):
+        """Clustering should create rows in recognize_face_clusters."""
+        np.random.seed(42)
+        center = np.random.randn(512).astype(np.float32)
+        center /= np.linalg.norm(center)
+        embeddings = [_make_embedding(center, noise_scale=0.02) for _ in range(10)]
+        _insert_faces(db, "alice", embeddings)
+
+        cluster_user_faces(db, "alice")
+
+        clusters = db.get_face_clusters_for_user("alice")
+        assert len(clusters) >= 1
+
+    def test_cluster_ids_reference_cluster_table(self, db):
+        """Detection cluster_ids should reference actual face_clusters rows."""
         np.random.seed(42)
         center = np.random.randn(512).astype(np.float32)
         center /= np.linalg.norm(center)
@@ -157,29 +98,78 @@ class TestClusterUserFaces:
         cluster_user_faces(db, "alice")
 
         faces = db.get_face_detections_for_user("alice")
-        cluster_ids = [f["cluster_id"] for f in faces]
-        non_null = [c for c in cluster_ids if c is not None]
-        assert len(non_null) > 0
+        clusters = db.get_face_clusters_for_user("alice")
+        cluster_ids = {c["id"] for c in clusters}
 
-    def test_empty_user(self, db):
-        """User with no faces should return zeros."""
-        stats = cluster_user_faces(db, "nobody")
-        assert stats["n_faces"] == 0
-        assert stats["n_clusters"] == 0
+        for f in faces:
+            if f["cluster_id"] is not None:
+                assert f["cluster_id"] in cluster_ids, (
+                    f"Detection {f['id']} has cluster_id={f['cluster_id']} "
+                    f"not in clusters table: {cluster_ids}"
+                )
 
-    def test_noise_becomes_null(self, db):
-        """Noise labels (-1) should become NULL cluster_id in DB."""
-        # Insert 2 faces (below min_cluster_size=3) → all noise
-        embeddings = [np.random.randn(512).astype(np.float32) for _ in range(2)]
-        for e in embeddings:
-            e /= np.linalg.norm(e)
-        _insert_faces(db, "bob", embeddings)
+    def test_two_clusters(self, db):
+        """Two well-separated groups should form two clusters."""
+        np.random.seed(42)
+        center_a = np.random.randn(512).astype(np.float32)
+        center_a /= np.linalg.norm(center_a)
+        center_b = -center_a
 
-        stats = cluster_user_faces(db, "bob")
-        assert stats["n_noise"] == 2
+        embs_a = [_make_embedding(center_a, noise_scale=0.02) for _ in range(10)]
+        embs_b = [_make_embedding(center_b, noise_scale=0.02) for _ in range(10)]
+        _insert_faces(db, "alice", embs_a, file_id_start=1000)
+        _insert_faces(db, "alice", embs_b, file_id_start=2000)
 
-        faces = db.get_face_detections_for_user("bob")
-        assert all(f["cluster_id"] is None for f in faces)
+        stats = cluster_user_faces(db, "alice")
+        assert stats["n_clusters"] >= 2
+
+    def test_preserves_existing_clusters(self, db):
+        """New detections near an existing cluster should join it, not create a new one."""
+        np.random.seed(42)
+        center = np.random.randn(512).astype(np.float32)
+        center /= np.linalg.norm(center)
+
+        # First batch: 10 faces → creates a cluster
+        embs1 = [_make_embedding(center, noise_scale=0.02) for _ in range(10)]
+        _insert_faces(db, "alice", embs1, file_id_start=1000)
+        stats1 = cluster_user_faces(db, "alice")
+        n_clusters_1 = stats1["n_clusters"]
+
+        # Second batch: 5 more faces near same center
+        embs2 = [_make_embedding(center, noise_scale=0.02) for _ in range(5)]
+        _insert_faces(db, "alice", embs2, file_id_start=2000)
+        stats2 = cluster_user_faces(db, "alice")
+
+        # Should not create additional clusters for the same person
+        assert stats2["n_clusters"] == n_clusters_1
+        assert stats2["n_assigned"] > 0
+
+    def test_respects_threshold(self, db):
+        """Detections with threshold set should not be assigned if too far."""
+        np.random.seed(42)
+        center = np.random.randn(512).astype(np.float32)
+        center /= np.linalg.norm(center)
+
+        # Create faces and cluster them
+        embs = [_make_embedding(center, noise_scale=0.02) for _ in range(10)]
+        ids = _insert_faces(db, "alice", embs, file_id_start=1000)
+        cluster_user_faces(db, "alice")
+
+        # Now simulate user removing a face: set threshold very low so it
+        # should be blocked from re-clustering
+        t = db._table("recognize_face_detections")
+        db._execute(
+            f"UPDATE {t} SET cluster_id = NULL, threshold = 0.001 WHERE id = {db._ph()}",
+            (ids[0],),
+        )
+        db._commit()
+
+        # Re-cluster — the face with threshold should NOT be re-assigned
+        # (its distance to any centroid will be > 0.001)
+        stats = cluster_user_faces(db, "alice")
+        face = [f for f in db.get_face_detections_for_user("alice") if f["id"] == ids[0]]
+        assert len(face) == 1
+        assert face[0]["cluster_id"] is None, "Face with tiny threshold should stay unassigned"
 
 
 class TestClusterAllUsers:
@@ -191,26 +181,26 @@ class TestClusterAllUsers:
         center_b = np.random.randn(512).astype(np.float32)
         center_b /= np.linalg.norm(center_b)
 
-        _insert_faces(db, "alice", [_make_embedding(center_a) for _ in range(8)])
-        _insert_faces(db, "bob", [_make_embedding(center_b) for _ in range(6)])
+        _insert_faces(db, "alice", [_make_embedding(center_a) for _ in range(10)], 1000)
+        _insert_faces(db, "bob", [_make_embedding(center_b) for _ in range(10)], 2000)
 
         results = cluster_all_users(db, user_ids=["alice", "bob"])
 
         assert "alice" in results
         assert "bob" in results
-        assert results["alice"]["n_faces"] == 8
-        assert results["bob"]["n_faces"] == 6
+        assert results["alice"]["n_faces"] > 0
+        assert results["bob"]["n_faces"] > 0
 
     def test_error_handling(self, db):
         """Errors for one user shouldn't affect others."""
         np.random.seed(42)
         center = np.random.randn(512).astype(np.float32)
         center /= np.linalg.norm(center)
-        _insert_faces(db, "alice", [_make_embedding(center) for _ in range(8)])
+        _insert_faces(db, "alice", [_make_embedding(center) for _ in range(10)])
 
         results = cluster_all_users(db, user_ids=["alice", "nobody"])
 
         assert "alice" in results
-        assert results["alice"]["n_faces"] == 8
+        assert results["alice"]["n_faces"] > 0
         assert "nobody" in results
         assert results["nobody"]["n_faces"] == 0
