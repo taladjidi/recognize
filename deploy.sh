@@ -64,19 +64,9 @@ for f in yamnet_class_map.csv; do
 done
 echo "Done"
 
-echo "=== Step 4: Deploy PHP files ==="
-# New files
-cp -v "$SRC_DIR"/lib/Controller/InternalController.php "$APP_DIR/lib/Controller/"
-cp -v "$SRC_DIR"/lib/Migration/Version011000003Date20260308094821.php "$APP_DIR/lib/Migration/"
-cp -v "$SRC_DIR"/appinfo/routes.php "$APP_DIR/appinfo/"
-
-# Simplified FileListener + updated Application.php
-cp -v "$SRC_DIR"/lib/Hooks/FileListener.php "$APP_DIR/lib/Hooks/"
-cp -v "$SRC_DIR"/lib/AppInfo/Application.php "$APP_DIR/lib/AppInfo/"
-
-# Previously modified files
-cp -v "$SRC_DIR"/lib/Classifiers/Classifier.php "$APP_DIR/lib/Classifiers/"
-cp -v "$SRC_DIR"/lib/Command/Classify.php "$APP_DIR/lib/Command/"
+echo "=== Step 4: Deploy PHP + appinfo files ==="
+rsync -av --delete "$SRC_DIR/lib/" "$APP_DIR/lib/"
+rsync -av --delete "$SRC_DIR/appinfo/" "$APP_DIR/appinfo/"
 echo "Done"
 
 echo "=== Step 5: Fix ownership ==="

@@ -19,6 +19,7 @@ use OCP\AppFramework\Utility\ITimeFactory;
 use OCP\DB\Exception;
 use OCP\Files\DavUtil;
 use OCP\IPreview;
+use OCP\IUserSession;
 use OCP\Security\ICrypto;
 use Psr\Log\LoggerInterface;
 use Sabre\DAV\Exception\Forbidden;
@@ -44,6 +45,7 @@ final class PropFindPlugin extends ServerPlugin {
 		private FaceDetectionMapper $faceDetectionMapper,
 		private IPreview $previewManager,
 		private FaceClusterMapper $faceClusterMapper,
+		private IUserSession $userSession,
 		private ICrypto $crypto,
 		private LoggerInterface $logger,
 		private ITimeFactory $timeFactory,
@@ -130,6 +132,14 @@ final class PropFindPlugin extends ServerPlugin {
 		if (!str_starts_with($request->getPath(), 'recognize')) {
 			return;
 		}
+
+		// Allow authenticated Nextcloud users through (e.g. Photos app DAV requests)
+		$user = $this->userSession->getUser();
+		if ($user !== null) {
+			return;
+		}
+
+		// For unauthenticated requests, require a valid API key (internal Python service)
 		$key = $request->getHeader('X-Recognize-Api-Key');
 		if ($key === null) {
 			throw new Forbidden('You must provide a valid X-Recognize-Api-Key');
