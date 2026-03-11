@@ -157,15 +157,22 @@ def cluster_user_faces(db, user_id):
     min_cs = _get_min_cluster_size(n_total)
     min_ss = _get_min_sample_size(n_total)
 
-    clusterer = HDBSCAN(
+    hdbscan_kwargs = dict(
         min_cluster_size=max(min_cs, MIN_CLUSTER_SIZE),
         min_samples=max(min_ss, MIN_SAMPLES),
         metric=METRIC,
-        cluster_selection_epsilon=CLUSTER_SELECTION_EPSILON,
         allow_single_cluster=ALLOW_SINGLE_CLUSTER,
         store_centers="centroid",
     )
-    labels = clusterer.fit_predict(embeddings)
+
+    # Try with epsilon first (better merging); fall back without if numpy bug hits
+    try:
+        clusterer = HDBSCAN(cluster_selection_epsilon=CLUSTER_SELECTION_EPSILON, **hdbscan_kwargs)
+        labels = clusterer.fit_predict(embeddings)
+    except TypeError:
+        log.warning("HDBSCAN epsilon_search failed (numpy 2.x bug), retrying without epsilon")
+        clusterer = HDBSCAN(cluster_selection_epsilon=0.0, **hdbscan_kwargs)
+        labels = clusterer.fit_predict(embeddings)
 
     # Step 4: Process each HDBSCAN cluster — vote to map to existing clusters
     hdbscan_clusters = {}

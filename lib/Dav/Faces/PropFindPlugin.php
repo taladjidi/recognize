@@ -63,33 +63,65 @@ final class PropFindPlugin extends ServerPlugin {
 
 	public function propFind(PropFind $propFind, INode $node): void {
 		if ($node instanceof FacePhoto) {
+			// All file-dependent properties are wrapped in try-catch:
+			// files may have been deleted since the detection was created.
+			// Use a lazy file getter that caches the result and returns null on missing files.
+			$getFile = function () use ($node): ?\OCP\Files\File {
+				try {
+					return $node->getFile();
+				} catch (\Sabre\DAV\Exception\NotFound $e) {
+					return null;
+				}
+			};
+
 			$propFind->handle(self::FACE_DETECTIONS_PROPERTYNAME, function () use ($node) {
 				return json_encode(
 					array_map(
 						fn (FaceDetectionWithTitle $face) => $face->toArray(),
-						$this->faceDetectionMapper->findByFileIdWithTitle($node->getFile()->getId())
+						$this->faceDetectionMapper->findByFileIdWithTitle($node->getFaceDetection()->getFileId())
 					)
 				);
 			});
-			$propFind->handle(self::FILE_NAME_PROPERTYNAME, fn () => $node->getFile()->getName());
-			$propFind->handle(self::REALPATH_PROPERTYNAME, fn () => $node->getFile()->getPath());
-			$propFind->handle(FilesPlugin::INTERNAL_FILEID_PROPERTYNAME, fn () => $node->getFile()->getId());
-			$propFind->handle(FilesPlugin::GETETAG_PROPERTYNAME, fn () => $node->getETag());
-			$propFind->handle(TagsPlugin::FAVORITE_PROPERTYNAME, fn () => $node->isFavorite() ? 1 : 0);
-			$propFind->handle(FilesPlugin::HAS_PREVIEW_PROPERTYNAME, fn () => json_encode($this->previewManager->isAvailable($node->getFile()->getFileInfo())));
-			$propFind->handle(FilesPlugin::PERMISSIONS_PROPERTYNAME, function () use ($node): string {
-				$permissions = DavUtil::getDavPermissions($node->getFile()->getFileInfo());
-				$filteredPermissions = str_replace('R', '', $permissions);
-				return $filteredPermissions;
+			$propFind->handle(self::FILE_NAME_PROPERTYNAME, function () use ($getFile) {
+				$file = $getFile();
+				return $file !== null ? $file->getName() : 'unknown';
+			});
+			$propFind->handle(self::REALPATH_PROPERTYNAME, function () use ($getFile) {
+				$file = $getFile();
+				return $file !== null ? $file->getPath() : '';
+			});
+			$propFind->handle(FilesPlugin::INTERNAL_FILEID_PROPERTYNAME, fn () => $node->getFaceDetection()->getFileId());
+			$propFind->handle(FilesPlugin::GETETAG_PROPERTYNAME, function () use ($getFile) {
+				$file = $getFile();
+				return $file !== null ? $file->getEtag() : '';
+			});
+			$propFind->handle(TagsPlugin::FAVORITE_PROPERTYNAME, function () use ($getFile, $node) {
+				$file = $getFile();
+				if ($file === null) {
+					return 0;
+				}
+				return $node->isFavorite() ? 1 : 0;
+			});
+			$propFind->handle(FilesPlugin::HAS_PREVIEW_PROPERTYNAME, function () use ($getFile) {
+				$file = $getFile();
+				return $file !== null ? json_encode($this->previewManager->isAvailable($file->getFileInfo())) : 'false';
+			});
+			$propFind->handle(FilesPlugin::PERMISSIONS_PROPERTYNAME, function () use ($getFile): string {
+				$file = $getFile();
+				if ($file === null) {
+					return '';
+				}
+				$permissions = DavUtil::getDavPermissions($file->getFileInfo());
+				return str_replace('R', '', $permissions);
 			});
 
-			foreach ($node->getFile()->getFileInfo()->getMetadata() as $metadataKey => $metadataValue) {
-				/** @var string $metadataKey */
-				$propFind->handle(FilesPlugin::FILE_METADATA_PREFIX.$metadataKey, $metadataValue);
-			}
+			// Note: file metadata (EXIF etc.) registration skipped for face photos
+			// to avoid eager file lookups. Metadata is available via the file's own DAV node.
 		}
 
-		if ($node instanceof FaceRoot || $node instanceof UnassignedFacesHome) {
+		if ($node instanceof FaceRoot) {
+			$propFind->handle(self::NBITEMS_PROPERTYNAME, fn () => $node->getDetectionCount());
+		} elseif ($node instanceof UnassignedFacesHome) {
 			$propFind->handle(self::NBITEMS_PROPERTYNAME, fn () => count($node->getChildren()));
 		}
 

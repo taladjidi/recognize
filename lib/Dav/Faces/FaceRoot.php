@@ -89,12 +89,11 @@ final class FaceRoot implements ICollection, IMoveTarget {
 	 */
 	public function getChildren(): array {
 		if (count($this->children) === 0) {
-			$detections = $this->detectionMapper->findByClusterId($this->cluster->getId());
+			$detections = $this->detectionMapper->findByClusterIdWithExistingFiles($this->cluster->getId(), $this->user->getUID());
 			$userFolder = $this->rootFolder->getUserFolder($this->user->getUID());
-			$detectionsWithFile = array_filter($detections, fn (FaceDetection $detection): bool => $userFolder->getFirstNodeById($detection->getFileId()) !== null);
 			$this->children = array_map(function (FaceDetection $detection) use ($userFolder) {
 				return new FacePhoto($this->detectionMapper, $detection, $userFolder, $this->tagManager, $this->previewManager);
-			}, $detectionsWithFile);
+			}, $detections);
 		}
 		return $this->children;
 	}
@@ -114,7 +113,7 @@ final class FaceRoot implements ICollection, IMoveTarget {
 		} catch (DoesNotExistException $e) {
 			throw new NotFound();
 		}
-		if ($detection->getClusterId() !== $this->cluster->getId()) {
+		if ($detection->getClusterId() !== $this->cluster->getId() || $detection->getUserId() !== $this->user->getUID()) {
 			throw new NotFound();
 		}
 		return new FacePhoto($this->detectionMapper, $detection, $this->rootFolder->getUserFolder($this->user->getUID()), $this->tagManager, $this->previewManager);
@@ -146,6 +145,10 @@ final class FaceRoot implements ICollection, IMoveTarget {
 		$this->clusterMapper->delete($this->cluster);
 	}
 
+	public function getDetectionCount() : int {
+		return $this->detectionMapper->countByClusterId($this->cluster->getId(), $this->user->getUID());
+	}
+
 	/**
 	 * @inheritDoc
 	 */
@@ -154,7 +157,16 @@ final class FaceRoot implements ICollection, IMoveTarget {
 	}
 
 	public function getPreviewImage() : string {
-		$detection = $this->detectionMapper->findDetectionForPreviewImageByClusterId($this->cluster->getId());
+		try {
+			$detection = $this->detectionMapper->findDetectionForPreviewImageByClusterId($this->cluster->getId(), $this->user->getUID());
+		} catch (DoesNotExistException $e) {
+			// Fallback: use any detection from this cluster for this user
+			$detections = $this->detectionMapper->findByClusterIdWithExistingFiles($this->cluster->getId(), $this->user->getUID());
+			if (count($detections) === 0) {
+				return json_encode(null);
+			}
+			$detection = $detections[0];
+		}
 		return json_encode([
 			'fileid' => $detection->getFileId(),
 			'detection' => $detection->toArray()

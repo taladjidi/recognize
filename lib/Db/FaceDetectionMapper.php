@@ -98,6 +98,35 @@ final class FaceDetectionMapper extends QBMapper {
 	}
 
 	/**
+	 * Like findByClusterId but filters out detections whose files no longer exist
+	 * and restricts to a specific user's detections.
+	 * Uses a single INNER JOIN instead of N individual file lookups.
+	 */
+	public function findByClusterIdWithExistingFiles(int $clusterId, string $userId) : array {
+		$qb = $this->db->getQueryBuilder();
+		$columns = array_map(fn ($col) => 'd.'.$col, FaceDetection::$columns);
+		$qb->select($columns)
+			->from('recognize_face_detections', 'd')
+			->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
+			->where($qb->expr()->eq('d.cluster_id', $qb->createPositionalParameter($clusterId)))
+			->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)));
+		return $this->findEntities($qb);
+	}
+
+	public function countByClusterId(int $clusterId, string $userId) : int {
+		$qb = $this->db->getQueryBuilder();
+		$qb->select($qb->func()->count('d.id'))
+			->from('recognize_face_detections', 'd')
+			->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
+			->where($qb->expr()->eq('d.cluster_id', $qb->createPositionalParameter($clusterId)))
+			->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)));
+		$result = $qb->executeQuery();
+		$count = $result->fetch(\PDO::FETCH_COLUMN);
+		$result->closeCursor();
+		return (int) $count;
+	}
+
+	/**
 	 * @throws \OCP\DB\Exception
 	 * @return list<\OCA\Recognize\Db\FaceDetection>
 	 */
@@ -300,11 +329,13 @@ final class FaceDetectionMapper extends QBMapper {
 		$qb->executeStatement();
 	}
 
-	public function findDetectionForPreviewImageByClusterId(int $clusterId) : FaceDetection {
+	public function findDetectionForPreviewImageByClusterId(int $clusterId, string $userId) : FaceDetection {
 		$qb = $this->db->getQueryBuilder();
 		$qb->select(array_map(fn ($col) => 'd.'.$col, FaceDetection::$columns))
 			->from('recognize_face_detections', 'd')
+			->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
 			->where($qb->expr()->eq('d.cluster_id', $qb->createPositionalParameter($clusterId)))
+			->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)))
 			->andWhere($qb->expr()->gt($qb->createFunction('d.x - d.width * 0.5'), $qb->createFunction('0')))
 			->andWhere($qb->expr()->gt($qb->createFunction('d.y - d.height * 0.5'), $qb->createFunction('0')))
 			->andWhere($qb->expr()->gt($qb->createFunction('1 - (d.x + d.width) - d.width * 0.5'), $qb->createFunction('0')))
@@ -319,7 +350,9 @@ final class FaceDetectionMapper extends QBMapper {
 			$qb = $this->db->getQueryBuilder();
 			$qb->select(array_map(fn ($col) => 'd.'.$col, FaceDetection::$columns))
 				->from('recognize_face_detections', 'd')
+				->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
 				->where($qb->expr()->eq('d.cluster_id', $qb->createPositionalParameter($clusterId)))
+				->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)))
 				->groupBy('d.id')
 				->addOrderBy('d.height', 'DESC')
 				->addOrderBy('d.width', 'DESC')

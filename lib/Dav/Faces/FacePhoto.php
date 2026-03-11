@@ -7,10 +7,8 @@
 declare(strict_types=1);
 namespace OCA\Recognize\Dav\Faces;
 
-use \OCA\Recognize\Vendor\Rubix\ML\Kernels\Distance\Euclidean;
 use OCA\Recognize\Db\FaceDetection;
 use OCA\Recognize\Db\FaceDetectionMapper;
-use OCA\Recognize\Service\FaceClusterAnalyzer;
 use OCP\Files\File;
 use OCP\Files\Folder;
 use OCP\IPreview;
@@ -39,20 +37,38 @@ class FacePhoto implements IFile {
 
 	#[Override]
 	public function getName(): string {
-		$file = $this->getFile();
-		$detection = $this->getFaceDetection();
-		return $detection->getId() . '-' . $file->getName();
+		try {
+			$file = $this->getFile();
+			return $this->faceDetection->getId() . '-' . $file->getName();
+		} catch (NotFound $e) {
+			return $this->faceDetection->getId() . '-unknown';
+		}
 	}
 
 	#[Override]
 	public function delete(): void {
 		$detections = $this->detectionMapper->findByClusterId($this->faceDetection->getClusterId());
 		if (count($detections) > 1) {
-			$centroid = FaceClusterAnalyzer::calculateCentroidOfDetections($detections);
-			$distance = new Euclidean();
-			$distanceValue = $distance->compute($centroid, $this->faceDetection->getVector());
-			// Set threshold to avoid recreating the same mistake
-			$this->faceDetection->setThreshold($distanceValue);
+			// Calculate centroid of all detections in the cluster
+			$dim = 512;
+			$sum = array_fill(0, $dim, 0.0);
+			foreach ($detections as $det) {
+				$vec = $det->getVector();
+				for ($i = 0; $i < $dim; $i++) {
+					$sum[$i] += $vec[$i];
+				}
+			}
+			$n = (float)count($detections);
+			$centroid = array_map(fn (float $v) => $v / $n, $sum);
+
+			// Euclidean distance from this detection to centroid
+			$thisVec = $this->faceDetection->getVector();
+			$sqSum = 0.0;
+			for ($i = 0; $i < $dim; $i++) {
+				$diff = $centroid[$i] - $thisVec[$i];
+				$sqSum += $diff * $diff;
+			}
+			$this->faceDetection->setThreshold(sqrt($sqSum));
 		}
 		$this->faceDetection->setClusterId(null);
 		$this->detectionMapper->update($this->faceDetection);

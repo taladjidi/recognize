@@ -43,7 +43,10 @@ final class FaceClusterMapper extends QBMapper {
 		$columns = array_map(fn ($c) => 'fc.'.$c, FaceCluster::$columns);
 		$qb->selectDistinct($columns)
 			->from('recognize_face_clusters', 'fc')
-			->innerJoin('fc', 'recognize_face_detections', 'fd', 'fc.id = fd.cluster_id')
+			->innerJoin('fc', 'recognize_face_detections', 'fd', $qb->expr()->andX(
+				$qb->expr()->eq('fc.id', 'fd.cluster_id'),
+				$qb->expr()->eq('fd.user_id', $qb->createPositionalParameter($userId))
+			))
 			->where($qb->expr()->eq('fc.user_id', $qb->createPositionalParameter($userId)));
 		return $this->findEntities($qb);
 	}
