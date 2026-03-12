@@ -20,3 +20,4 @@ bench_*.json
 bench_*.txt
 tests/res/
 sync_and_classify.sh
+deploy.sh
