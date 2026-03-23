@@ -18,6 +18,7 @@ StartLimitIntervalSec=300
 Environment=LD_LIBRARY_PATH=__NVIDIA_LIB_PATH__
 Environment=CUDA_VISIBLE_DEVICES=__CUDA_DEVICES__
 Environment=ORT_TENSORRT_CACHE=__MODELS_DIR__/.ort_cache
+Environment=MPLCONFIGDIR=/tmp/matplotlib
 
 # GPU device access (render group for /dev/dri, video for some drivers)
 SupplementaryGroups=video render

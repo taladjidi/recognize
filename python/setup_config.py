@@ -16,10 +16,39 @@ oc_appconfig table so the Python daemon and PHP controller can authenticate.
 import grp
 import json
 import os
+import shutil
 import subprocess
 import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Python dependencies for the recognize service
+BASE_DEPS = [
+    'onnxruntime-gpu>=1.24',
+    'numpy>=2.0',
+    'pillow>=10.0',
+    'opencv-python-headless>=4.8',
+    'insightface>=0.7',
+    'scikit-learn>=1.4',
+    'requests>=2.31',
+    'soundfile>=0.12',
+    'scipy>=1.12',
+]
+
+DB_DEPS = [
+    'mysql-connector-python>=8.0',
+    # 'psycopg2-binary>=2.9',  # uncomment for PostgreSQL
+]
+
+NVIDIA_DEPS = [
+    'nvidia-cuda-runtime-cu12',
+    'nvidia-cublas-cu12',
+    'nvidia-cudnn-cu12',
+    'nvidia-cufft-cu12',
+    'nvidia-curand-cu12',
+    'nvidia-cusolver-cu12',
+    'nvidia-cusparse-cu12',
+]
 NEXTCLOUD_ROOT = os.environ.get("NEXTCLOUD_ROOT", "/usr/share/nextcloud")
 OUTPUT_CONFIG = os.path.join(SCRIPT_DIR, "nc_config.json")
 SERVICE_TEMPLATE = os.path.join(SCRIPT_DIR, "recognize.service.template")
@@ -74,6 +103,61 @@ def store_secret_in_nextcloud(nc_root, secret):
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"WARNING: Could not store secret via occ: {e}", file=sys.stderr)
         return False
+
+
+def has_nvidia_gpu():
+    """Check if an NVIDIA GPU is available."""
+    if shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0 and result.stdout.strip() != ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def setup_venv(venv_dir, source_python=None, force=False, no_gpu=False):
+    """Create a Python venv and install all dependencies.
+
+    Auto-detects NVIDIA GPU and installs CUDA pip packages when available.
+    """
+    python_bin = source_python or sys.executable
+
+    if force and os.path.isdir(venv_dir):
+        print(f"  Removing existing venv: {venv_dir}")
+        shutil.rmtree(venv_dir)
+
+    if os.path.isfile(os.path.join(venv_dir, "bin", "python")):
+        print(f"  Venv already exists at {venv_dir}")
+        print(f"  To force recreation: pass --force-venv or delete {venv_dir}")
+        return os.path.join(venv_dir, "bin", "python")
+
+    print(f"  Creating venv with --copies (self-contained)...")
+    subprocess.run(
+        [python_bin, "-m", "venv", "--copies", venv_dir],
+        check=True,
+    )
+
+    pip_bin = os.path.join(venv_dir, "bin", "pip")
+    deps = BASE_DEPS + DB_DEPS
+
+    gpu = not no_gpu and has_nvidia_gpu()
+    if gpu:
+        print(f"  NVIDIA GPU detected — installing CUDA dependencies")
+        deps += NVIDIA_DEPS
+    else:
+        print(f"  No NVIDIA GPU detected — CPU-only mode")
+
+    print(f"  Installing {len(deps)} packages...")
+    subprocess.run(
+        [pip_bin, "install", "--no-cache-dir"] + deps,
+        check=True,
+    )
+
+    return os.path.join(venv_dir, "bin", "python")
 
 
 def get_nvidia_lib_path():
@@ -150,7 +234,29 @@ def main():
                         help=f"Nextcloud installation root (default: {NEXTCLOUD_ROOT})")
     parser.add_argument("--python-bin", default=sys.executable,
                         help=f"Python binary path (default: {sys.executable})")
+    parser.add_argument("--setup-venv", metavar="VENV_DIR",
+                        help="Create/update Python venv at VENV_DIR with all dependencies")
+    parser.add_argument("--source-python", default=None,
+                        help="Python binary to create the venv from (default: current interpreter)")
+    parser.add_argument("--force-venv", action="store_true",
+                        help="Delete and recreate the venv even if it exists")
+    parser.add_argument("--no-gpu", action="store_true",
+                        help="Skip GPU detection, install CPU-only dependencies")
     args = parser.parse_args()
+
+    # Optional: set up venv before anything else
+    if args.setup_venv:
+        print("=== Setting up Python venv ===")
+        venv_python = setup_venv(
+            args.setup_venv,
+            source_python=args.source_python,
+            force=args.force_venv,
+            no_gpu=args.no_gpu,
+        )
+        print(f"  Venv Python: {venv_python}")
+        # Use the venv python as the service python
+        args.python_bin = venv_python
+        print("Done\n")
 
     nc_root = args.nextcloud_root
 
@@ -191,13 +297,15 @@ def main():
     print(f"  Data dir: {nc_config['datadirectory']}")
     print(f"  NC URL: {nc_config['nextcloud_url']}")
 
-    # 5. Store secret in Nextcloud appconfig
+    # 5. Store secret in Nextcloud appconfig (requires root or web-server user)
     print("\nStoring internal secret in Nextcloud appconfig...")
+    print("  (requires root — runs: php occ config:app:set)")
     if store_secret_in_nextcloud(nc_root, secret):
         print("  Secret stored successfully")
     else:
-        print("  WARNING: Manual step needed — run:")
-        print(f"    php {nc_root}/occ config:app:set recognize internal_secret --value {secret}")
+        print("  WARNING: Could not store secret automatically.")
+        print("  Run manually as root:")
+        print(f"    sudo -u apache php {nc_root}/occ config:app:set recognize internal_secret --value {secret}")
 
     # 6. Generate systemd service file
     print("\nGenerating systemd service file...")
@@ -210,7 +318,7 @@ def main():
         nvidia_lib = get_nvidia_lib_path()
         print(f"\n  LD_LIBRARY_PATH = {nvidia_lib or '(none — CPU mode)'}")
 
-        print(f"\n  To install:")
+        print(f"\n  To install (requires root):")
         print(f"    sudo cp {OUTPUT_SERVICE} /etc/systemd/system/recognize.service")
         print(f"    sudo systemctl daemon-reload")
         print(f"    sudo systemctl enable --now recognize")
@@ -218,6 +326,10 @@ def main():
         print("  Skipped (template not found)")
 
     print("\nSetup complete.")
+    print("NOTE: If not running as root, the following steps require elevated privileges:")
+    print("  - Writing config to app directory (step 4)")
+    print("  - Storing secret via occ (step 5)")
+    print("  - Installing systemd service (step 6)")
 
 
 if __name__ == "__main__":
