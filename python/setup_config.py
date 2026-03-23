@@ -90,15 +90,37 @@ def generate_secret():
     return os.urandom(32).hex()
 
 
+def _detect_web_user():
+    """Detect the web server user (apache, www-data, nginx, http)."""
+    for candidate in ["apache", "www-data", "nginx", "http"]:
+        try:
+            grp.getgrnam(candidate)
+            return candidate
+        except KeyError:
+            continue
+    return None
+
+
 def store_secret_in_nextcloud(nc_root, secret):
-    """Store the internal secret in Nextcloud's appconfig via occ."""
+    """Store the internal secret in Nextcloud's appconfig via occ.
+
+    Tries running as the web server user first (required when running as root),
+    falls back to direct invocation.
+    """
     occ = os.path.join(nc_root, "occ")
+    web_user = _detect_web_user()
+
+    # If running as root, occ must run as the web server user
+    if os.getuid() == 0 and web_user:
+        cmd = ["sudo", "-u", web_user, "php", occ,
+               "config:app:set", "recognize", "internal_secret",
+               "--value", secret]
+    else:
+        cmd = ["php", occ, "config:app:set", "recognize", "internal_secret",
+               "--value", secret]
+
     try:
-        subprocess.run(
-            ["php", occ, "config:app:set", "recognize", "internal_secret",
-             "--value", secret],
-            capture_output=True, text=True, timeout=10, check=True,
-        )
+        subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=True)
         return True
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"WARNING: Could not store secret via occ: {e}", file=sys.stderr)
@@ -192,16 +214,8 @@ def generate_service_file(config, nc_root, python_bin):
         template = f.read()
 
     # Determine user/group (web server user)
-    user = "apache"
-    group = "apache"
-    for candidate in ["apache", "www-data", "nginx", "http"]:
-        try:
-            grp.getgrnam(candidate)
-            user = candidate
-            group = candidate
-            break
-        except KeyError:
-            continue
+    user = _detect_web_user() or "apache"
+    group = user
 
     nvidia_lib_path = get_nvidia_lib_path()
     models_dir = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "models"))
