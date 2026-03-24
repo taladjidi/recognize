@@ -1,137 +1,78 @@
 """Classification pipeline: routes files to the appropriate classifier by mimetype.
 
-The pipeline manages classifier lifecycle (init, warm-up) and provides a
-unified interface for the service daemon to process pending files.
+Each classifier group runs in a **subprocess** to guarantee GPU memory is fully
+released between passes.  ONNX Runtime's CUDA allocator never frees memory back
+to the device, so the only reliable way to reclaim VRAM is process termination.
 
-Flow:
-  1. Fetch pending files from DB
-  2. Group by media type (image, video, audio)
-  3. Route to appropriate classifier(s)
-  4. Submit results via NC API or directly to DB
-  5. Delete processed entries from pending queue
+Architecture:
+  Main process  — orchestrates work, manages DB, submits results
+  Worker process — loads model(s), processes files, returns results via pipe, exits
+
+Model groups (ordered by VRAM requirement):
+  1. faces     — insightface (det + rec + landmark) ~1-2 GB — runs ALONE
+  2. tags      — imagenet + landmarks ~1.4 GB — coexist in VRAM
+  3. movinet   — video classifier ~200 MB
+  4. musicnn   — audio classifier ~100 MB
 """
 
+import json
 import logging
+import multiprocessing as mp
 import os
 import time
 import traceback
 
 import numpy as np
 
-from classifiers.imagenet import ImageNetClassifier, BATCH_SIZE as IMAGENET_BATCH_SIZE
-from classifiers.landmarks import LandmarkClassifier, BATCH_SIZE as LANDMARK_BATCH_SIZE
-from classifiers.movinet import MoViNetClassifier
-from classifiers.musicnn import AudioClassifier
 from db import DB
 
 log = logging.getLogger(__name__)
 
-# Which classifiers to run for each media type
-MEDIA_CLASSIFIERS = {
-    "image": ["imagenet", "landmarks", "faces"],
-    "video": ["movinet"],
-    "audio": ["musicnn"],
-}
+# Batch sizes for GPU inference
+IMAGENET_BATCH_SIZE = 32
+LANDMARK_BATCH_SIZE = 32
 
 
-class Pipeline:
-    """Classification pipeline that manages classifiers and processes files.
+# ---------------------------------------------------------------------------
+# Worker functions — each runs in a subprocess with its own CUDA context
+# ---------------------------------------------------------------------------
 
-    Classifiers are lazily initialized on first use to avoid loading unused
-    models into GPU memory.
-    """
-
-    def __init__(self, config, models_dir, gpu=True, ffmpeg_binary="/usr/bin/ffmpeg",
-                 nc_api=None):
-        """Initialize the pipeline.
-
-        Args:
-            config: Nextcloud config dict (passed to DB).
-            models_dir: Path to directory containing ONNX models.
-            gpu: Whether to use GPU providers.
-            ffmpeg_binary: Path to ffmpeg binary.
-            nc_api: Optional NextcloudAPI instance for submitting results.
-                    If None, results are written directly to DB.
-        """
-        self.db = DB(config)
-        self.models_dir = models_dir
-        self.gpu = gpu
-        self.ffmpeg_binary = ffmpeg_binary
-        self.nc_api = nc_api
-        self._classifiers = {}
-        self._enabled = set()
-
-    def _get_classifier(self, name):
-        """Get or lazily initialize a classifier."""
-        if name in self._classifiers:
-            return self._classifiers[name]
-
-        log.info("Initializing classifier: %s", name)
-        t0 = time.monotonic()
-
-        if name == "imagenet":
-            clf = ImageNetClassifier(self.models_dir, gpu=self.gpu)
-        elif name == "landmarks":
-            clf = LandmarkClassifier(self.models_dir, gpu=self.gpu)
-        elif name == "faces":
-            from classifiers.faces import FaceClassifier
-            clf = FaceClassifier(self.models_dir, gpu=self.gpu)
-        elif name == "movinet":
-            clf = MoViNetClassifier(self.models_dir, gpu=self.gpu,
-                                     ffmpeg_binary=self.ffmpeg_binary)
-        elif name == "musicnn":
-            clf = AudioClassifier(self.models_dir, gpu=self.gpu,
-                                   ffmpeg_binary=self.ffmpeg_binary)
-        else:
-            raise ValueError(f"Unknown classifier: {name}")
-
-        elapsed = time.monotonic() - t0
-        log.info("Classifier %s initialized in %.1fs", name, elapsed)
-
+def _worker_faces(models_dir, gpu, file_items_json, result_pipe):
+    """Subprocess: load insightface, detect faces, send results, exit."""
+    try:
+        from classifiers.faces import FaceClassifier
+        clf = FaceClassifier(models_dir, gpu=gpu)
         clf.warm_up()
-        self._classifiers[name] = clf
-        return clf
 
-    def enable_classifiers(self, names=None):
-        """Set which classifiers are enabled.
+        results = {}
+        for item in json.loads(file_items_json):
+            try:
+                faces = clf.classify(item["path"])
+                results[item["file_id"]] = {"faces": faces}
+            except Exception as e:
+                log.warning("Face detection error for %s: %s", item["path"], e)
+                results[item["file_id"]] = {"faces": []}
 
-        Args:
-            names: Set of classifier names to enable. If None, enable all.
-        """
-        if names is None:
-            self._enabled = {"imagenet", "landmarks", "faces", "movinet", "musicnn"}
-        else:
-            self._enabled = set(names)
-        log.info("Enabled classifiers: %s", self._enabled)
+        result_pipe.send(results)
+    except Exception as e:
+        log.error("Face worker failed: %s\n%s", e, traceback.format_exc())
+        result_pipe.send({})
+    finally:
+        result_pipe.close()
 
-    def process_images(self, file_items):
-        """Process a batch of image files through enabled image classifiers.
 
-        Args:
-            file_items: List of dicts with keys: file_id, path, mimetype.
+def _worker_tags(models_dir, gpu, file_items_json, result_pipe):
+    """Subprocess: load imagenet + landmarks, classify, send results, exit."""
+    try:
+        from classifiers.imagenet import ImageNetClassifier, BATCH_SIZE as IMG_BS
+        from classifiers.landmarks import LandmarkClassifier, BATCH_SIZE as LM_BS
 
-        Returns:
-            Dict mapping file_id to result dict:
-              {tags: [...], faces: [...]}
-        """
-        results = {item["file_id"]: {"tags": [], "faces": []} for item in file_items}
+        file_items = json.loads(file_items_json)
+        results = {item["file_id"]: {"tags": []} for item in file_items}
 
-        if "imagenet" in self._enabled:
-            self._run_imagenet_batch(file_items, results)
-
-        if "landmarks" in self._enabled:
-            self._run_landmarks_batch(file_items, results)
-
-        if "faces" in self._enabled:
-            self._run_faces(file_items, results)
-
-        return results
-
-    def _run_imagenet_batch(self, file_items, results):
-        """Run ImageNet classifier on a batch of images."""
-        clf = self._get_classifier("imagenet")
-
-        # Preprocess all images, tracking which ones succeed
+        # ImageNet
+        clf = ImageNetClassifier(models_dir, gpu=gpu)
+        clf.warm_up()
         preprocessed = []
         for item in file_items:
             try:
@@ -140,60 +81,48 @@ class Pipeline:
             except Exception as e:
                 log.warning("ImageNet preprocess error for %s: %s", item["path"], e)
 
-        # Process in batches
-        for start in range(0, len(preprocessed), IMAGENET_BATCH_SIZE):
-            chunk = preprocessed[start:start + IMAGENET_BATCH_SIZE]
+        for start in range(0, len(preprocessed), IMG_BS):
+            chunk = preprocessed[start:start + IMG_BS]
             batch = np.stack([arr for _, arr in chunk])
             labels_list = clf.infer_batch(batch)
             for (file_id, _), labels in zip(chunk, labels_list):
                 results[file_id]["tags"].extend(labels)
 
-    def _run_landmarks_batch(self, file_items, results):
-        """Run landmark classifier on a batch of images."""
-        clf = self._get_classifier("landmarks")
-
+        # Landmarks
+        clf2 = LandmarkClassifier(models_dir, gpu=gpu)
+        clf2.warm_up()
         preprocessed = []
         for item in file_items:
             try:
-                arr = clf.preprocess(item["path"])
+                arr = clf2.preprocess(item["path"])
                 preprocessed.append((item["file_id"], arr))
             except Exception as e:
                 log.warning("Landmark preprocess error for %s: %s", item["path"], e)
 
-        for start in range(0, len(preprocessed), LANDMARK_BATCH_SIZE):
-            chunk = preprocessed[start:start + LANDMARK_BATCH_SIZE]
+        for start in range(0, len(preprocessed), LM_BS):
+            chunk = preprocessed[start:start + LM_BS]
             batch = np.stack([arr for _, arr in chunk])
-            labels_list = clf.infer_batch(batch)
+            labels_list = clf2.infer_batch(batch)
             for (file_id, _), labels in zip(chunk, labels_list):
                 results[file_id]["tags"].extend(labels)
 
-    def _run_faces(self, file_items, results):
-        """Run face detector on each image individually."""
-        clf = self._get_classifier("faces")
+        result_pipe.send(results)
+    except Exception as e:
+        log.error("Tags worker failed: %s\n%s", e, traceback.format_exc())
+        result_pipe.send({})
+    finally:
+        result_pipe.close()
 
-        for item in file_items:
-            try:
-                faces = clf.classify(item["path"])
-                results[item["file_id"]]["faces"] = faces
-            except Exception as e:
-                log.warning("Face detection error for %s: %s", item["path"], e)
 
-    def process_videos(self, file_items):
-        """Process video files through the MoViNet classifier.
+def _worker_video(models_dir, gpu, ffmpeg_binary, file_items_json, result_pipe):
+    """Subprocess: load movinet, classify videos, send results, exit."""
+    try:
+        from classifiers.movinet import MoViNetClassifier
+        clf = MoViNetClassifier(models_dir, gpu=gpu, ffmpeg_binary=ffmpeg_binary)
+        clf.warm_up()
 
-        Args:
-            file_items: List of dicts with keys: file_id, path, mimetype.
-
-        Returns:
-            Dict mapping file_id to result dict: {tags: [...]}
-        """
         results = {}
-        if "movinet" not in self._enabled:
-            return {item["file_id"]: {"tags": []} for item in file_items}
-
-        clf = self._get_classifier("movinet")
-
-        for item in file_items:
+        for item in json.loads(file_items_json):
             try:
                 labels = clf.classify(item["path"])
                 results[item["file_id"]] = {"tags": labels}
@@ -201,24 +130,23 @@ class Pipeline:
                 log.warning("MoViNet error for %s: %s", item["path"], e)
                 results[item["file_id"]] = {"tags": []}
 
-        return results
+        result_pipe.send(results)
+    except Exception as e:
+        log.error("Video worker failed: %s\n%s", e, traceback.format_exc())
+        result_pipe.send({})
+    finally:
+        result_pipe.close()
 
-    def process_audio(self, file_items):
-        """Process audio files through the audio classifier.
 
-        Args:
-            file_items: List of dicts with keys: file_id, path, mimetype.
+def _worker_audio(models_dir, gpu, ffmpeg_binary, file_items_json, result_pipe):
+    """Subprocess: load musicnn, classify audio, send results, exit."""
+    try:
+        from classifiers.musicnn import AudioClassifier
+        clf = AudioClassifier(models_dir, gpu=gpu, ffmpeg_binary=ffmpeg_binary)
+        clf.warm_up()
 
-        Returns:
-            Dict mapping file_id to result dict: {tags: [...]}
-        """
         results = {}
-        if "musicnn" not in self._enabled:
-            return {item["file_id"]: {"tags": []} for item in file_items}
-
-        clf = self._get_classifier("musicnn")
-
-        for item in file_items:
+        for item in json.loads(file_items_json):
             try:
                 labels = clf.classify(item["path"])
                 results[item["file_id"]] = {"tags": labels}
@@ -226,104 +154,143 @@ class Pipeline:
                 log.warning("Audio error for %s: %s", item["path"], e)
                 results[item["file_id"]] = {"tags": []}
 
-        return results
+        result_pipe.send(results)
+    except Exception as e:
+        log.error("Audio worker failed: %s\n%s", e, traceback.format_exc())
+        result_pipe.send({})
+    finally:
+        result_pipe.close()
 
-    def process_batch(self, pending_rows):
-        """Process a batch of pending rows from the DB.
 
-        Routes each file to the correct classifier(s) based on mimetype,
-        submits results, and removes processed entries from the queue.
+# ---------------------------------------------------------------------------
+# Pipeline — orchestrates subprocess workers
+# ---------------------------------------------------------------------------
+
+class Pipeline:
+    """Classification pipeline using subprocess isolation for GPU memory.
+
+    Each classifier group runs in a child process that exits after processing,
+    guaranteeing full GPU memory release between passes.
+    """
+
+    def __init__(self, config, models_dir, gpu=True, ffmpeg_binary="/usr/bin/ffmpeg",
+                 nc_api=None):
+        self.config = config
+        self.db = DB(config)
+        self.models_dir = models_dir
+        self.gpu = gpu
+        self.ffmpeg_binary = ffmpeg_binary
+        self.nc_api = nc_api
+        self._enabled = set()
+
+    def enable_classifiers(self, names=None):
+        if names is None:
+            self._enabled = {"imagenet", "landmarks", "faces", "movinet", "musicnn"}
+        else:
+            self._enabled = set(names)
+        log.info("Enabled classifiers: %s", self._enabled)
+
+    def _run_in_subprocess(self, target, args, timeout=600):
+        """Run a worker function in a subprocess, return results via pipe.
+
+        The subprocess gets its own CUDA context. When it exits, all GPU
+        memory is freed by the OS — no leaks possible.
 
         Args:
-            pending_rows: List of row dicts from db.fetch_pending().
+            target: Worker function (must accept result_pipe as last arg).
+            args: Args to pass before result_pipe.
+            timeout: Max seconds to wait for the worker.
 
         Returns:
-            Number of files successfully processed.
+            Results dict from the worker, or empty dict on failure.
         """
-        if not pending_rows:
-            return 0
+        parent_conn, child_conn = mp.Pipe(duplex=False)
+        proc = mp.Process(target=target, args=(*args, child_conn), daemon=True)
+        proc.start()
+        child_conn.close()  # Parent doesn't write to child's end
 
-        # Resolve file paths and group by media type
-        images, videos, audios = [], [], []
-        skipped_ids = []
-
-        for row in pending_rows:
-            file_id = row["file_id"]
-            path = row.get("path")
-            mimetype = row.get("mimetype", "")
-
-            if not path or not os.path.isfile(path):
-                log.warning("File not found for file_id=%d: %s", file_id, path)
-                skipped_ids.append(row["id"])
-                continue
-
-            media_type = DB.classify_mimetype(mimetype)
-            item = {"file_id": file_id, "path": path, "mimetype": mimetype,
-                    "pending_id": row["id"]}
-
-            if media_type == "image":
-                images.append(item)
-            elif media_type == "video":
-                videos.append(item)
-            elif media_type == "audio":
-                audios.append(item)
+        try:
+            if parent_conn.poll(timeout):
+                results = parent_conn.recv()
             else:
-                log.debug("Unsupported mimetype %s for file_id=%d", mimetype, file_id)
-                skipped_ids.append(row["id"])
+                log.error("Worker %s timed out after %ds", target.__name__, timeout)
+                proc.kill()
+                results = {}
+        except EOFError:
+            log.error("Worker %s crashed (pipe closed)", target.__name__)
+            results = {}
+        finally:
+            parent_conn.close()
+            proc.join(timeout=10)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
 
-        processed = 0
-        processed_ids = []
+        return results
 
-        # Process each media type
-        if images:
-            try:
-                results = self.process_images(images)
-                for item in images:
-                    fid = item["file_id"]
-                    self._submit_result(fid, results.get(fid, {}))
-                    processed_ids.append(item["pending_id"])
-                    processed += 1
-            except Exception as e:
-                log.error("Image batch processing failed: %s", e)
-                traceback.print_exc()
+    def _serialize_items(self, file_items):
+        """Serialize file items to JSON for passing to subprocess."""
+        return json.dumps([{"file_id": i["file_id"], "path": i["path"]}
+                          for i in file_items])
 
-        if videos:
-            try:
-                results = self.process_videos(videos)
-                for item in videos:
-                    fid = item["file_id"]
-                    self._submit_result(fid, results.get(fid, {}))
-                    processed_ids.append(item["pending_id"])
-                    processed += 1
-            except Exception as e:
-                log.error("Video processing failed: %s", e)
-                traceback.print_exc()
+    def process_images_faces(self, file_items):
+        """Run face detection in a subprocess."""
+        if "faces" not in self._enabled or not file_items:
+            return {}
+        t0 = time.monotonic()
+        results = self._run_in_subprocess(
+            _worker_faces,
+            (self.models_dir, self.gpu, self._serialize_items(file_items)),
+        )
+        log.info("Faces subprocess: %d items in %.1fs",
+                 len(file_items), time.monotonic() - t0)
+        return results
 
-        if audios:
-            try:
-                results = self.process_audio(audios)
-                for item in audios:
-                    fid = item["file_id"]
-                    self._submit_result(fid, results.get(fid, {}))
-                    processed_ids.append(item["pending_id"])
-                    processed += 1
-            except Exception as e:
-                log.error("Audio processing failed: %s", e)
-                traceback.print_exc()
+    def process_images_tags(self, file_items):
+        """Run imagenet + landmarks in a subprocess."""
+        if not file_items:
+            return {}
+        if "imagenet" not in self._enabled and "landmarks" not in self._enabled:
+            return {}
+        t0 = time.monotonic()
+        results = self._run_in_subprocess(
+            _worker_tags,
+            (self.models_dir, self.gpu, self._serialize_items(file_items)),
+        )
+        log.info("Tags subprocess: %d items in %.1fs",
+                 len(file_items), time.monotonic() - t0)
+        return results
 
-        # Clean up processed and skipped entries from the queue
-        all_done = processed_ids + skipped_ids
-        if all_done:
-            self.db.delete_pending(all_done)
+    def process_videos(self, file_items):
+        """Run movinet in a subprocess."""
+        if "movinet" not in self._enabled or not file_items:
+            return {}
+        t0 = time.monotonic()
+        results = self._run_in_subprocess(
+            _worker_video,
+            (self.models_dir, self.gpu, self.ffmpeg_binary,
+             self._serialize_items(file_items)),
+        )
+        log.info("Video subprocess: %d items in %.1fs",
+                 len(file_items), time.monotonic() - t0)
+        return results
 
-        return processed
+    def process_audio(self, file_items):
+        """Run musicnn in a subprocess."""
+        if "musicnn" not in self._enabled or not file_items:
+            return {}
+        t0 = time.monotonic()
+        results = self._run_in_subprocess(
+            _worker_audio,
+            (self.models_dir, self.gpu, self.ffmpeg_binary,
+             self._serialize_items(file_items)),
+        )
+        log.info("Audio subprocess: %d items in %.1fs",
+                 len(file_items), time.monotonic() - t0)
+        return results
 
     def _submit_result(self, file_id, result):
-        """Submit classification results for a file.
-
-        If nc_api is configured, submits via HTTP (proper event dispatch).
-        Otherwise, writes tags directly to DB (useful for testing).
-        """
+        """Submit classification results for a file."""
         tags = result.get("tags", [])
         faces = result.get("faces", [])
 
@@ -345,4 +312,3 @@ class Pipeline:
         self.db.close()
         if self.nc_api:
             self.nc_api.close()
-        self._classifiers.clear()

@@ -104,7 +104,12 @@ class FaceClassifier:
                 providers=providers,
                 root=insightface_root,
             )
-            self.app.prepare(ctx_id=0 if gpu else -1, det_size=(640, 640))
+            # det_size controls face detection input resolution. 640x640 needs ~4GB
+            # VRAM for conv buffers alone; 320x320 needs ~1GB. Recognition model
+            # (w600k_r50) always runs at 112x112 regardless.
+            # Detect faces down to ~40px at 320x320 (sufficient for most photos).
+            det = (320, 320) if gpu else (640, 640)  # CPU has no VRAM limit
+            self.app.prepare(ctx_id=0 if gpu else -1, det_size=det)
         finally:
             sys.stdout = real_stdout
 

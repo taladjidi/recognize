@@ -172,7 +172,7 @@ final class InternalController extends Controller {
 			$detection->setY((float)($face['y'] ?? 0));
 			$detection->setWidth((float)($face['width'] ?? 0));
 			$detection->setHeight((float)($face['height'] ?? 0));
-			$detection->setVector(json_encode($face['vector'] ?? []));
+			$detection->setVector($face['vector'] ?? []);
 			$this->faceDetectionMapper->insert($detection);
 		}
 	}

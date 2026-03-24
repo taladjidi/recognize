@@ -13,6 +13,7 @@ Features:
 
 import argparse
 import logging
+import multiprocessing as mp
 import os
 import signal
 import sys
@@ -24,7 +25,8 @@ log = logging.getLogger("recognize")
 POLL_MIN_INTERVAL = 0.1      # 100ms when busy
 POLL_MAX_INTERVAL = 30.0     # 30s when idle
 POLL_BACKOFF_FACTOR = 1.5    # Multiply interval on empty poll
-BATCH_SIZE = 50              # Files per poll cycle
+BATCH_SIZE = 200             # Files per classifier pass
+MAX_PASS_FILES = 5000        # Max files per single classifier pass
 
 # Clustering interval
 CLUSTER_INTERVAL = 300       # Re-cluster every 5 minutes
@@ -106,7 +108,14 @@ class Service:
         self._running = False
 
     def _main_loop(self):
-        """Poll-process-sleep loop with adaptive backoff."""
+        """Classifier-pass loop: load one model group, process all files, unload.
+
+        Instead of loading all models and processing small batches, this loads
+        one classifier at a time and processes all pending files for that type.
+        This maximizes GPU utilization on limited VRAM (8GB).
+
+        Pass order: faces → imagenet+landmarks → movinet → musicnn
+        """
         while self._running:
             # Check maintenance mode
             if self.pipeline.db.check_maintenance_mode():
@@ -114,64 +123,16 @@ class Service:
                 time.sleep(POLL_MAX_INTERVAL)
                 continue
 
-            # Fetch pending files
-            try:
-                rows = self.pipeline.db.fetch_pending(limit=BATCH_SIZE)
-            except Exception as e:
-                log.error("Failed to fetch pending: %s", e)
-                time.sleep(POLL_MAX_INTERVAL)
-                continue
+            had_work = self._run_classifier_passes()
 
-            if rows:
-                # Reset backoff on activity
-                self._poll_interval = POLL_MIN_INTERVAL
-
-                # Resolve file paths from filecache
-                file_ids = [r["file_id"] for r in rows]
-                try:
-                    path_map = self.pipeline.db.resolve_file_paths(file_ids)
-                except Exception as e:
-                    log.error("Failed to resolve paths: %s", e)
-                    time.sleep(1.0)
-                    continue
-
-                # Merge pending rows with resolved paths into the format
-                # process_batch expects: {id, file_id, path, mimetype}
-                merged = []
-                orphan_ids = []
-                for r in rows:
-                    info = path_map.get(r["file_id"])
-                    if info:
-                        merged.append({
-                            "id": r["id"],
-                            "file_id": r["file_id"],
-                            "path": info["path"],
-                            "mimetype": info["mimetype"],
-                        })
-                    else:
-                        # File not in filecache (deleted?) — remove from queue
-                        orphan_ids.append(r["id"])
-
-                if orphan_ids:
-                    log.info("Removing %d orphaned pending entries", len(orphan_ids))
-                    self.pipeline.db.delete_pending(orphan_ids)
-
-                # Process batch
-                t0 = time.monotonic()
-                processed = self.pipeline.process_batch(merged)
-                elapsed = time.monotonic() - t0
-
-                pending_count = self.pipeline.db.pending_count()
-                log.info(
-                    "Processed %d/%d files in %.1fs (%d pending)",
-                    processed, len(merged), elapsed, pending_count,
-                )
-            else:
+            if not had_work:
                 # Exponential backoff when idle
                 self._poll_interval = min(
                     self._poll_interval * POLL_BACKOFF_FACTOR,
                     POLL_MAX_INTERVAL,
                 )
+            else:
+                self._poll_interval = POLL_MIN_INTERVAL
 
             # Periodic face clustering
             now = time.monotonic()
@@ -182,6 +143,135 @@ class Service:
             # Sleep with interruptibility
             if self._running:
                 time.sleep(self._poll_interval)
+
+    def _fetch_and_resolve(self, limit):
+        """Fetch pending rows and resolve to file paths.
+
+        Returns:
+            Tuple of (images, videos, audios) — each a list of item dicts,
+            or (None, None, None) on error.
+        """
+        try:
+            rows = self.pipeline.db.fetch_pending(limit=limit)
+        except Exception as e:
+            log.error("Failed to fetch pending: %s", e)
+            return None, None, None
+
+        if not rows:
+            return [], [], []
+
+        file_ids = [r["file_id"] for r in rows]
+        try:
+            path_map = self.pipeline.db.resolve_file_paths(file_ids)
+        except Exception as e:
+            log.error("Failed to resolve paths: %s", e)
+            return None, None, None
+
+        images, videos, audios = [], [], []
+        orphan_ids = []
+
+        for r in rows:
+            info = path_map.get(r["file_id"])
+            if not info:
+                orphan_ids.append(r["id"])
+                continue
+
+            import os
+            path = info["path"]
+            mimetype = info["mimetype"]
+            if not path or not os.path.isfile(path):
+                orphan_ids.append(r["id"])
+                continue
+
+            item = {"id": r["id"], "file_id": r["file_id"],
+                    "path": path, "mimetype": mimetype}
+            media_type = self.pipeline.db.classify_mimetype(mimetype)
+            if media_type == "image":
+                images.append(item)
+            elif media_type == "video":
+                videos.append(item)
+            elif media_type == "audio":
+                audios.append(item)
+            else:
+                orphan_ids.append(r["id"])
+
+        if orphan_ids:
+            log.info("Removing %d orphaned pending entries", len(orphan_ids))
+            self.pipeline.db.delete_pending(orphan_ids)
+
+        return images, videos, audios
+
+    def _run_classifier_passes(self):
+        """Run each classifier group as a separate pass over pending files.
+
+        Returns True if any work was done.
+        """
+        images, videos, audios = self._fetch_and_resolve(limit=BATCH_SIZE)
+        if images is None:
+            time.sleep(POLL_MAX_INTERVAL)
+            return False
+
+        if not images and not videos and not audios:
+            return False
+
+        had_work = False
+        pending_count = self.pipeline.db.pending_count()
+
+        # === Pass 1: Faces (subprocess — gets full VRAM) ===
+        if images and "faces" in self.pipeline._enabled:
+            face_results = self.pipeline.process_images_faces(images)
+            for item in images:
+                fid = item["file_id"]
+                result = face_results.get(fid, {})
+                if result.get("faces"):
+                    self.pipeline._submit_result(fid, {"tags": [], "faces": result["faces"]})
+            had_work = True
+
+        # === Pass 2: Tags (subprocess — imagenet + landmarks coexist) ===
+        if images and ("imagenet" in self.pipeline._enabled or
+                       "landmarks" in self.pipeline._enabled):
+            tag_results = self.pipeline.process_images_tags(images)
+            processed_ids = []
+            for item in images:
+                fid = item["file_id"]
+                result = tag_results.get(fid, {})
+                tags = result.get("tags", [])
+                if tags:
+                    self.pipeline._submit_result(fid, {"tags": tags, "faces": []})
+                processed_ids.append(item["id"])
+
+            if processed_ids:
+                self.pipeline.db.delete_pending(processed_ids)
+            log.info("Processed %d images (%d pending)", len(images), pending_count)
+            had_work = True
+
+        # === Pass 3: Video (subprocess) ===
+        if videos:
+            vid_results = self.pipeline.process_videos(videos)
+            processed_ids = []
+            for item in videos:
+                fid = item["file_id"]
+                self.pipeline._submit_result(fid, vid_results.get(fid, {}))
+                processed_ids.append(item["id"])
+            if processed_ids:
+                self.pipeline.db.delete_pending(processed_ids)
+            log.info("Processed %d videos", len(videos))
+            had_work = True
+
+        # === Pass 4: Audio (subprocess) ===
+        if audios:
+            aud_results = self.pipeline.process_audio(audios)
+            processed_ids = []
+            for item in audios:
+                fid = item["file_id"]
+                self.pipeline._submit_result(fid, aud_results.get(fid, {}))
+                processed_ids.append(item["id"])
+            if processed_ids:
+                self.pipeline.db.delete_pending(processed_ids)
+            log.info("Processed %d audio files", len(audios))
+            had_work = True
+
+        return had_work
 
     def _run_clustering(self):
         """Run face clustering for all users with recent changes."""
@@ -222,6 +312,13 @@ def main():
                         help="Enable ONNX Runtime profiling (chrome://tracing JSON)")
 
     args = parser.parse_args()
+
+    # Use 'spawn' to get clean CUDA contexts in worker subprocesses.
+    # 'fork' would inherit the parent's CUDA state and leak memory.
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass  # Already set
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
