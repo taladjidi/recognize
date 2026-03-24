@@ -1,17 +1,20 @@
-"""Semi-supervised face clustering using HDBSCAN.
+"""Semi-supervised face clustering using two-pass DBSCAN + Agglomerative.
 
 Groups face detections by visual similarity using their 512-dim embeddings.
 Runs per-user: each user's faces are clustered independently.
 
-Architecture (ported from PHP FaceClusterAnalyzer):
-  1. Load existing clusters (user-named or previously created)
-  2. Sample reference detections from each existing cluster
-  3. Gather unclustered ("fresh") and rejected detections
-  4. Run HDBSCAN on the combined set
-  5. Use voting to map HDBSCAN clusters to existing cluster IDs
-  6. Respect per-detection thresholds (negative feedback from user removals)
-  7. Create new DB cluster rows for genuinely new clusters
-  8. Assign unclustered detections via nearest-centroid to named clusters
+Clustering approach (inspired by Apple Photos):
+  Pass 1: DBSCAN with tight threshold — high-precision micro-clusters
+  Pass 2: Agglomerative clustering on micro-cluster centroids — merge
+          nearby clusters using average linkage for balanced merging
+
+Semi-supervised integration:
+  1. Load existing clusters, sample reference detections from each
+  2. Gather unclustered ("fresh") and rejected detections
+  3. Run two-pass clustering on the combined set
+  4. Use voting to map new clusters to existing cluster IDs
+  5. Respect per-detection thresholds (negative feedback from user removals)
+  6. Create new DB cluster rows for genuinely new clusters
 
 This preserves user work (renames, merges, manual assignments) while still
 discovering new clusters from fresh detections.
@@ -25,13 +28,12 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-# HDBSCAN tuning parameters
-MIN_CLUSTER_SIZE = 3
-MIN_SAMPLES = 2
+# Two-pass clustering parameters for L2-normalized ArcFace 512-dim embeddings.
+# Same-person euclidean distance: ~0.4-0.8; different person: ~1.0+
+PASS1_EPS = 0.8       # DBSCAN eps — conservative, high-precision micro-clusters
+PASS1_MIN_SAMPLES = 2  # Minimum core point density
+PASS2_THRESHOLD = 1.0  # Agglomerative merge threshold on centroids (average linkage)
 METRIC = "euclidean"
-CLUSTER_SELECTION_EPSILON = 1.0  # Merge nearby sub-clusters; for L2-normalized 512-dim
-                                # face vectors, same-person distances are ~0.4-0.8
-ALLOW_SINGLE_CLUSTER = True
 
 # Voting thresholds (from PHP FaceClusterAnalyzer)
 MIN_OVERLAP_EXISTING_CLUSTER = 0.5  # >50% vote overlap → keep existing cluster
@@ -73,20 +75,70 @@ def _get_reference_sample_size(n_clusters):
     return int(round(75.0 * 2.0 ** (-0.007 * n_clusters) + 5.0))
 
 
-def _get_min_cluster_size(n):
-    """Dynamic min_cluster_size based on dataset size.
+def _two_pass_cluster(embeddings):
+    """Two-pass clustering: DBSCAN micro-clusters then agglomerative merge.
 
-    From PHP: max(2, min(5, n^(1/4.7)))
+    Pass 1 (DBSCAN): Creates small, high-precision clusters with a tight
+    distance threshold. False negatives (missed merges) are expected and
+    corrected in pass 2.
+
+    Pass 2 (Agglomerative): Computes centroids of pass-1 clusters and merges
+    those within PASS2_THRESHOLD using average linkage. This catches same-person
+    clusters that were too far apart for DBSCAN's single-point threshold.
+
+    Args:
+        embeddings: numpy array [N, 512] of L2-normalized face vectors.
+
+    Returns:
+        numpy array [N] of cluster labels (-1 for noise).
     """
-    return int(round(max(2.0, min(5.0, n ** (1.0 / 4.7)))))
+    from sklearn.cluster import DBSCAN, AgglomerativeClustering
 
+    # Pass 1: Conservative DBSCAN
+    pass1 = DBSCAN(eps=PASS1_EPS, min_samples=PASS1_MIN_SAMPLES,
+                   metric=METRIC, n_jobs=-1)
+    labels = pass1.fit_predict(embeddings)
 
-def _get_min_sample_size(n):
-    """Dynamic min_samples based on dataset size.
+    unique_labels = set(labels)
+    unique_labels.discard(-1)
 
-    From PHP: max(2, min(4, n^(1/5.6)))
-    """
-    return int(round(max(2, min(4, n ** (1.0 / 5.6)))))
+    if len(unique_labels) < 2:
+        return labels
+
+    # Compute micro-cluster centroids
+    centroids = {}
+    for lbl in unique_labels:
+        mask = labels == lbl
+        centroids[lbl] = embeddings[mask].mean(axis=0)
+
+    # Pass 2: Agglomerative merge on centroids
+    centroid_labels = list(centroids.keys())
+    centroid_arr = np.array([centroids[l] for l in centroid_labels])
+
+    agg = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=PASS2_THRESHOLD,
+        metric=METRIC,
+        linkage="average",
+    )
+    merge_labels = agg.fit_predict(centroid_arr)
+
+    # Build merge map and apply
+    merge_map = {centroid_labels[i]: int(merge_labels[i])
+                 for i in range(len(centroid_labels))}
+
+    final_labels = labels.copy()
+    for orig_lbl, new_lbl in merge_map.items():
+        if orig_lbl != new_lbl:
+            final_labels[labels == orig_lbl] = new_lbl
+
+    n_before = len(unique_labels)
+    n_after = len(set(merge_map.values()))
+    if n_before != n_after:
+        log.info("Two-pass clustering: %d micro-clusters merged to %d clusters",
+                 n_before, n_after)
+
+    return final_labels
 
 
 def cluster_user_faces(db, user_id):
@@ -148,43 +200,24 @@ def cluster_user_faces(db, user_id):
         len(sampled_detections), n_clusters,
     )
 
-    # Step 3: Build embedding matrix and run HDBSCAN
+    # Step 3: Build embedding matrix and run two-pass clustering
     embeddings = np.array(
         [d["face_vector"] for d in all_detections], dtype=np.float32,
     )
 
-    from sklearn.cluster import HDBSCAN
-    min_cs = _get_min_cluster_size(n_total)
-    min_ss = _get_min_sample_size(n_total)
+    labels = _two_pass_cluster(embeddings)
 
-    hdbscan_kwargs = dict(
-        min_cluster_size=max(min_cs, MIN_CLUSTER_SIZE),
-        min_samples=max(min_ss, MIN_SAMPLES),
-        metric=METRIC,
-        allow_single_cluster=ALLOW_SINGLE_CLUSTER,
-        store_centers="centroid",
-    )
-
-    # Try with epsilon first (better merging); fall back without if numpy bug hits
-    try:
-        clusterer = HDBSCAN(cluster_selection_epsilon=CLUSTER_SELECTION_EPSILON, **hdbscan_kwargs)
-        labels = clusterer.fit_predict(embeddings)
-    except TypeError:
-        log.warning("HDBSCAN epsilon_search failed (numpy 2.x bug), retrying without epsilon")
-        clusterer = HDBSCAN(cluster_selection_epsilon=0.0, **hdbscan_kwargs)
-        labels = clusterer.fit_predict(embeddings)
-
-    # Step 4: Process each HDBSCAN cluster — vote to map to existing clusters
-    hdbscan_clusters = {}
+    # Step 4: Process each cluster — vote to map to existing clusters
+    cluster_groups = {}
     for idx, label in enumerate(labels):
         if label < 0:
             continue
-        hdbscan_clusters.setdefault(label, []).append(idx)
+        cluster_groups.setdefault(label, []).append(idx)
 
     n_assigned = 0
     n_new_clusters = 0
 
-    for label, member_indices in hdbscan_clusters.items():
+    for label, member_indices in cluster_groups.items():
         # Separate unclustered from sampled members
         unclustered_indices = [i for i in member_indices if i < n_unclustered]
         sampled_indices = [i for i in member_indices if i >= n_unclustered]
@@ -241,21 +274,6 @@ def cluster_user_faces(db, user_id):
 
     # Commit all assignments in one batch
     db.commit()
-
-    # Step 5: Mark remaining unclustered detections as noise (cluster_id = -1 → NULL)
-    n_noise = 0
-    assigned_ids = set()
-    # Collect IDs that were assigned
-    # (We track this by re-reading isn't ideal; let's just mark unassigned fresh ones)
-    for det in fresh_detections:
-        if det.get("cluster_id") is None:
-            # Check if we assigned it above (we can't easily track in-loop)
-            # Instead, we'll mark all fresh detections that have NULL cluster_id
-            # as rejected (-1) so they get re-evaluated next round
-            pass
-    # The simpler approach: fresh detections that weren't assigned stay NULL
-    # and will be picked up again next clustering run. Rejected detections
-    # (cluster_id = -1) already have that status.
 
     elapsed = time.monotonic() - t0
     log.info(
