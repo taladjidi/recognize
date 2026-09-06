@@ -35,6 +35,10 @@ BASE_DEPS = [
     'opencv-python-headless>=4.8',
     'insightface>=0.7',
     'scikit-learn>=1.4',
+    # insightface's face-alignment path calls SimilarityTransform.estimate,
+    # deprecated in scikit-image 0.26 and REMOVED in 2.2. Cap it so an
+    # upgrade cannot silently break face alignment.
+    'scikit-image<2.2',
     'requests>=2.31',
     'soundfile>=0.12',
     'scipy>=1.12',
