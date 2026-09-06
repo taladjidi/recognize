@@ -1,11 +1,24 @@
-tensorflow>=2.16
+# Runtime dependencies for the Python inference service.
+#
+# setup_config.py is the source of truth for installation (it also handles
+# cuDNN and the onnxruntime-gpu ordering constraint); this file exists for
+# `pip install -r` and for tooling that reads requirements.txt.
+#
+# onnxruntime-gpu MUST be installed last and alone: it shares the
+# `onnxruntime` package namespace with the CPU build, which insightface
+# pulls in, and the CPU build silently strips CUDAExecutionProvider.
+onnxruntime-gpu==1.29.0
+
+numpy>=2.0
+Pillow>=10.0
+opencv-python-headless>=4.8
 insightface>=0.7
-onnxruntime-gpu>=1.17
-numpy
-Pillow
-PyYAML
-soundfile
-exifread
-reverse_geocoder
-pycountry
-tensorflowjs
+scikit-learn>=1.4
+scipy>=1.12
+requests>=2.31
+soundfile>=0.12
+PyYAML>=6.0
+mysql-connector-python>=8.0
+
+# cuDNN is the only CUDA component not supplied by a system CUDA 13 install.
+nvidia-cudnn-cu13~=9.0

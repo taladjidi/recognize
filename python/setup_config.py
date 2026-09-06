@@ -13,6 +13,7 @@ The internal secret is stored in both nc_config.json and Nextcloud's
 oc_appconfig table so the Python daemon and PHP controller can authenticate.
 """
 
+import glob
 import grp
 import json
 import os
@@ -22,9 +23,13 @@ import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# onnxruntime-gpu is deliberately NOT in BASE_DEPS: it must be installed
+# last and alone (see install_onnxruntime_gpu). 1.29 is the first series
+# that links CUDA 13.
+ORT_VERSION = '1.29.0'
+
 # Python dependencies for the recognize service
 BASE_DEPS = [
-    'onnxruntime-gpu>=1.24',
     'numpy>=2.0',
     'pillow>=10.0',
     'opencv-python-headless>=4.8',
@@ -33,6 +38,7 @@ BASE_DEPS = [
     'requests>=2.31',
     'soundfile>=0.12',
     'scipy>=1.12',
+    'PyYAML>=6.0',  # rules_engine, used by the imagenet and musicnn classifiers
 ]
 
 DB_DEPS = [
@@ -40,14 +46,13 @@ DB_DEPS = [
     # 'psycopg2-binary>=2.9',  # uncomment for PostgreSQL
 ]
 
+# Only cuDNN is installed into the venv. A host with the CUDA toolkit
+# already provides cudart/cublas/cublasLt/nvrtc (.so.13), cufft (.so.12),
+# curand (.so.10), cusparse and cusolver, and puts them on the default
+# linker path via /etc/ld.so.conf.d. The previous cu12 list predated
+# onnxruntime's move to CUDA 13 and duplicated ~3 GB of system libraries.
 NVIDIA_DEPS = [
-    'nvidia-cuda-runtime-cu12',
-    'nvidia-cublas-cu12',
-    'nvidia-cudnn-cu12',
-    'nvidia-cufft-cu12',
-    'nvidia-curand-cu12',
-    'nvidia-cusolver-cu12',
-    'nvidia-cusparse-cu12',
+    'nvidia-cudnn-cu13~=9.0',
 ]
 NEXTCLOUD_ROOT = os.environ.get("NEXTCLOUD_ROOT", "/usr/share/nextcloud")
 OUTPUT_CONFIG = os.path.join(SCRIPT_DIR, "nc_config.json")
@@ -179,27 +184,62 @@ def setup_venv(venv_dir, source_python=None, force=False, no_gpu=False):
         check=True,
     )
 
+    install_onnxruntime_gpu(pip_bin)
+
     return os.path.join(venv_dir, "bin", "python")
 
 
-def get_nvidia_lib_path():
-    """Build LD_LIBRARY_PATH for NVIDIA CUDA 12 libs from pip packages."""
-    python_bin = sys.executable
-    site_dir = os.path.join(
-        os.path.dirname(python_bin), "..", "lib",
-        f"python{sys.version_info[0]}.{sys.version_info[1]}",
-        "site-packages", "nvidia",
-    )
-    site_dir = os.path.normpath(site_dir)
+def install_onnxruntime_gpu(pip_bin):
+    """Install onnxruntime-gpu last, alone, and verify it stayed.
 
-    if not os.path.isdir(site_dir):
-        return ""
+    onnxruntime and onnxruntime-gpu unpack into the SAME `onnxruntime`
+    package and both own capi/onnxruntime_pybind11_state.so. insightface
+    depends on plain `onnxruntime`, so installing it afterwards overwrites
+    the GPU build's pybind state: CUDAExecutionProvider then vanishes from
+    get_available_providers() and every session silently runs on CPU.
+    """
+    print("  Installing onnxruntime-gpu (last, alone)...")
+    subprocess.run([pip_bin, "uninstall", "-y", "onnxruntime", "onnxruntime-gpu"],
+                   check=False, capture_output=True)
+    subprocess.run([pip_bin, "install", "--no-cache-dir", f"onnxruntime-gpu=={ORT_VERSION}"],
+                   check=True)
+
+    shadowed = subprocess.run([pip_bin, "show", "onnxruntime"],
+                              capture_output=True).returncode == 0
+    if shadowed:
+        raise RuntimeError(
+            "CPU 'onnxruntime' is installed alongside onnxruntime-gpu and "
+            "will shadow it; install onnxruntime-gpu last and alone")
+
+
+def get_nvidia_lib_path(python_bin=None):
+    """Build LD_LIBRARY_PATH from the NVIDIA pip packages in the venv.
+
+    Only directories that actually exist are emitted. The previous version
+    hardcoded "lib", but on Fedora the venv's real site-packages is under
+    "lib64" (with lib64 -> lib a symlink), and it emitted paths for cu12
+    packages that are no longer installed.
+    """
+    python_bin = python_bin or sys.executable
+    venv_root = os.path.dirname(os.path.dirname(python_bin))
 
     lib_dirs = []
-    for entry in os.listdir(site_dir):
-        lib_path = os.path.join(site_dir, entry, "lib")
-        if os.path.isdir(lib_path):
-            lib_dirs.append(lib_path)
+    seen = set()
+    # Glob the version rather than using sys.version_info: this script is run
+    # by the SOURCE interpreter, which need not match the venv's version.
+    for libdir in ("lib64", "lib"):
+        candidates = sorted(glob.glob(
+            os.path.join(venv_root, libdir, "python3.*", "site-packages", "nvidia")))
+        site_dir = candidates[0] if candidates else None
+        if site_dir is None or not os.path.isdir(site_dir):
+            continue
+        for entry in sorted(os.listdir(site_dir)):
+            lib_path = os.path.join(site_dir, entry, "lib")
+            real = os.path.realpath(lib_path)
+            if os.path.isdir(lib_path) and real not in seen:
+                seen.add(real)
+                lib_dirs.append(lib_path)
+        break  # lib64 and lib are the same tree; take the first that exists
 
     return ":".join(lib_dirs)
 
@@ -217,7 +257,7 @@ def generate_service_file(config, nc_root, python_bin):
     user = _detect_web_user() or "apache"
     group = user
 
-    nvidia_lib_path = get_nvidia_lib_path()
+    nvidia_lib_path = get_nvidia_lib_path(python_bin)
     models_dir = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "models"))
     data_dir = config.get("datadirectory", "/var/lib/nextcloud/data")
 
@@ -329,7 +369,7 @@ def main():
             f.write(service_content)
         print(f"  Service file written to {OUTPUT_SERVICE}")
 
-        nvidia_lib = get_nvidia_lib_path()
+        nvidia_lib = get_nvidia_lib_path(args.python_bin)
         print(f"\n  LD_LIBRARY_PATH = {nvidia_lib or '(none — CPU mode)'}")
 
         print(f"\n  To install (requires root):")
