@@ -7,11 +7,7 @@
 declare(strict_types=1);
 namespace OCA\Recognize\BackgroundJobs;
 
-use OCA\Recognize\Classifiers\Audio\MusicnnClassifier;
-use OCA\Recognize\Classifiers\Images\ClusteringFaceClassifier;
-use OCA\Recognize\Classifiers\Images\ImagenetClassifier;
-use OCA\Recognize\Classifiers\Images\LandmarksClassifier;
-use OCA\Recognize\Classifiers\Video\MovinetClassifier;
+use OCA\Recognize\Constants;
 use OCA\Recognize\Db\QueueFile;
 use OCA\Recognize\Service\Logger;
 use OCA\Recognize\Service\QueueService;
@@ -52,11 +48,11 @@ final class StorageCrawlJob extends QueuedJob {
 		 * @var list<string> $models
 		 */
 		$models = $argument['models'] ?? [
-			ClusteringFaceClassifier::MODEL_NAME,
-			ImagenetClassifier::MODEL_NAME,
-			LandmarksClassifier::MODEL_NAME,
-			MovinetClassifier::MODEL_NAME,
-			MusicnnClassifier::MODEL_NAME,
+			Constants::MODEL_FACES,
+			Constants::MODEL_IMAGENET,
+			Constants::MODEL_LANDMARKS,
+			Constants::MODEL_MOVINET,
+			Constants::MODEL_MUSICNN,
 		];
 
 		// Remove current iteration
@@ -74,28 +70,28 @@ final class StorageCrawlJob extends QueuedJob {
 			$queueFile->setUpdate(false);
 			try {
 				if ($file['image']) {
-					if (in_array(ImagenetClassifier::MODEL_NAME, $models)) {
-						$this->queue->insertIntoQueue(ImagenetClassifier::MODEL_NAME, $queueFile);
+					if (in_array(Constants::MODEL_IMAGENET, $models)) {
+						$this->queue->insertIntoQueue(Constants::MODEL_IMAGENET, $queueFile);
 					}
-					if (!in_array(ImagenetClassifier::MODEL_NAME, $models) && in_array(LandmarksClassifier::MODEL_NAME, $models)) {
+					if (!in_array(Constants::MODEL_IMAGENET, $models) && in_array(Constants::MODEL_LANDMARKS, $models)) {
 						$tags = $this->tagManager->getTagsForFiles([$queueFile->getFileId()]);
 						$fileTags = $tags[$queueFile->getFileId()];
 						$landmarkTags = array_filter($fileTags, function ($tag) {
-							return in_array($tag->getName(), LandmarksClassifier::PRECONDITION_TAGS);
+							return in_array($tag->getName(), Constants::LANDMARKS_PRECONDITION_TAGS);
 						});
 						if (count($landmarkTags) > 0) {
-							$this->queue->insertIntoQueue(LandmarksClassifier::MODEL_NAME, $queueFile);
+							$this->queue->insertIntoQueue(Constants::MODEL_LANDMARKS, $queueFile);
 						}
 					}
-					if (in_array(ClusteringFaceClassifier::MODEL_NAME, $models)) {
-						$this->queue->insertIntoQueue(ClusteringFaceClassifier::MODEL_NAME, $queueFile);
+					if (in_array(Constants::MODEL_FACES, $models)) {
+						$this->queue->insertIntoQueue(Constants::MODEL_FACES, $queueFile);
 					}
 				}
 				if ($file['video']) {
-					$this->queue->insertIntoQueue(MovinetClassifier::MODEL_NAME, $queueFile);
+					$this->queue->insertIntoQueue(Constants::MODEL_MOVINET, $queueFile);
 				}
 				if ($file['audio']) {
-					$this->queue->insertIntoQueue(MusicnnClassifier::MODEL_NAME, $queueFile);
+					$this->queue->insertIntoQueue(Constants::MODEL_MUSICNN, $queueFile);
 				}
 			} catch (Exception $e) {
 				$this->logger->error('Failed to add file to queue', ['exception' => $e]);

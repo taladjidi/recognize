@@ -8,8 +8,8 @@ declare(strict_types=1);
 namespace OCA\Recognize\Migration;
 
 use Closure;
+use OCA\Recognize\Constants;
 use OCA\Recognize\BackgroundJobs\SchedulerJob;
-use OCA\Recognize\Classifiers\Images\ClusteringFaceClassifier;
 use OCP\BackgroundJob\IJobList;
 use OCP\DB\Exception;
 use OCP\IDBConnection;
@@ -48,7 +48,7 @@ final class Version011000002Date20260301094821 extends SimpleMigrationStep {
 			$output->info('Face data cleared. Faces will be re-scanned with 512-dim vectors.');
 
 			// Schedule re-crawl for face classification
-			$this->jobList->add(SchedulerJob::class, ['models' => [ClusteringFaceClassifier::MODEL_NAME]]);
+			$this->jobList->add(SchedulerJob::class, ['models' => [Constants::MODEL_FACES]]);
 			$output->info('Scheduled face re-classification job.');
 		} catch (Exception $e) {
 			$this->logger->error('Failed to clear face data for vector migration', ['exception' => $e]);

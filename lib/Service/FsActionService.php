@@ -5,10 +5,6 @@ namespace OCA\Recognize\Service;
 use OC\Files\SetupManager;
 use OC\User\NoUserException;
 use OCA\Recognize\BackgroundJobs\ClusterFacesJob;
-use OCA\Recognize\Classifiers\Audio\MusicnnClassifier;
-use OCA\Recognize\Classifiers\Images\ClusteringFaceClassifier;
-use OCA\Recognize\Classifiers\Images\ImagenetClassifier;
-use OCA\Recognize\Classifiers\Video\MovinetClassifier;
 use OCA\Recognize\Constants;
 use OCA\Recognize\Db\FaceDetectionMapper;
 use OCA\Recognize\Db\FsAccessUpdate;
@@ -165,7 +161,7 @@ final class FsActionService {
 	 */
 	private function onAccessUpdate(int $storageId, int $rootId): void {
 		$userIds = $this->getUsersWithFileAccess($rootId);
-		$files = $this->storageService->getFilesInMount($storageId, $rootId, [ClusteringFaceClassifier::MODEL_NAME], 0, 0);
+		$files = $this->storageService->getFilesInMount($storageId, $rootId, [Constants::MODEL_FACES], 0, 0);
 		$userIdsToScheduleClustering = [];
 		foreach ($files as $fileInfo) {
 			$node = $this->rootFolder->getFirstNodeById($fileInfo['fileid']) ?: null;
@@ -244,14 +240,14 @@ final class FsActionService {
 		$queueFile->setUpdate(false);
 		try {
 			if (in_array($node->getMimetype(), Constants::IMAGE_FORMATS)) {
-				$this->queue->insertIntoQueue(ImagenetClassifier::MODEL_NAME, $queueFile);
-				$this->queue->insertIntoQueue(ClusteringFaceClassifier::MODEL_NAME, $queueFile);
+				$this->queue->insertIntoQueue(Constants::MODEL_IMAGENET, $queueFile);
+				$this->queue->insertIntoQueue(Constants::MODEL_FACES, $queueFile);
 			}
 			if (in_array($node->getMimetype(), Constants::VIDEO_FORMATS)) {
-				$this->queue->insertIntoQueue(MovinetClassifier::MODEL_NAME, $queueFile);
+				$this->queue->insertIntoQueue(Constants::MODEL_MOVINET, $queueFile);
 			}
 			if (in_array($node->getMimetype(), Constants::AUDIO_FORMATS)) {
-				$this->queue->insertIntoQueue(MusicnnClassifier::MODEL_NAME, $queueFile);
+				$this->queue->insertIntoQueue(Constants::MODEL_MUSICNN, $queueFile);
 			}
 		} catch (Exception $e) {
 			$this->logger->error('Failed to add file to queue', ['exception' => $e]);

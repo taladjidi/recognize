@@ -7,11 +7,7 @@
 declare(strict_types=1);
 namespace OCA\Recognize\Db;
 
-use OCA\Recognize\Classifiers\Audio\MusicnnClassifier;
-use OCA\Recognize\Classifiers\Images\ClusteringFaceClassifier;
-use OCA\Recognize\Classifiers\Images\ImagenetClassifier;
-use OCA\Recognize\Classifiers\Images\LandmarksClassifier;
-use OCA\Recognize\Classifiers\Video\MovinetClassifier;
+use OCA\Recognize\Constants;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\AppFramework\Db\MultipleObjectsReturnedException;
 use OCP\AppFramework\Db\QBMapper;
@@ -24,11 +20,11 @@ use OCP\IDBConnection;
  */
 final class QueueMapper extends QBMapper {
 	public const MODELS = [
-		ImagenetClassifier::MODEL_NAME,
-		ClusteringFaceClassifier::MODEL_NAME,
-		LandmarksClassifier::MODEL_NAME,
-		MovinetClassifier::MODEL_NAME,
-		MusicnnClassifier::MODEL_NAME
+		Constants::MODEL_IMAGENET,
+		Constants::MODEL_FACES,
+		Constants::MODEL_LANDMARKS,
+		Constants::MODEL_MOVINET,
+		Constants::MODEL_MUSICNN
 	];
 
 	/**

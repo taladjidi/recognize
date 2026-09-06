@@ -7,11 +7,7 @@
 declare(strict_types=1);
 namespace OCA\Recognize\Command;
 
-use OCA\Recognize\Classifiers\Audio\MusicnnClassifier;
-use OCA\Recognize\Classifiers\Classifier;
-use OCA\Recognize\Classifiers\Images\ClusteringFaceClassifier;
-use OCA\Recognize\Classifiers\Images\ImagenetClassifier;
-use OCA\Recognize\Classifiers\Video\MovinetClassifier;
+use OCA\Recognize\Constants;
 use OCA\Recognize\Db\QueueFile;
 use OCA\Recognize\Exception\Exception;
 use OCA\Recognize\Service\Logger;
@@ -44,10 +40,10 @@ final class Classify extends Command {
 		private ClearBackgroundJobs $clearBackgroundJobs,
 	) {
 		parent::__construct();
-		$this->classifiers[ImagenetClassifier::MODEL_NAME] = $imagenet;
-		$this->classifiers[ClusteringFaceClassifier::MODEL_NAME] = $faces;
-		$this->classifiers[MusicnnClassifier::MODEL_NAME] = $musicnn;
-		$this->classifiers[MovinetClassifier::MODEL_NAME] = $movinet;
+		$this->classifiers[Constants::MODEL_IMAGENET] = $imagenet;
+		$this->classifiers[Constants::MODEL_FACES] = $faces;
+		$this->classifiers[Constants::MODEL_MUSICNN] = $musicnn;
+		$this->classifiers[Constants::MODEL_MOVINET] = $movinet;
 		// Landmarks are currently processed out of band in a background job, because imagenet schedules it directly
 	}
 
@@ -79,10 +75,10 @@ final class Classify extends Command {
 		$this->clearBackgroundJobs->run($clearBackgroundJobs, $output);
 
 		$models = array_values(array_filter([
-			ClusteringFaceClassifier::MODEL_NAME,
-			ImagenetClassifier::MODEL_NAME,
-			MovinetClassifier::MODEL_NAME,
-			MusicnnClassifier::MODEL_NAME,
+			Constants::MODEL_FACES,
+			Constants::MODEL_IMAGENET,
+			Constants::MODEL_MOVINET,
+			Constants::MODEL_MUSICNN,
 		], fn ($modelName) => $this->settings->getSetting($modelName . '.enabled') === 'true'));
 
 		$processedTag = $this->tagManager->getProcessedTag();
@@ -102,10 +98,10 @@ final class Classify extends Command {
 			do {
 				$i = 0;
 				$queues = [
-					ImagenetClassifier::MODEL_NAME => [],
-					ClusteringFaceClassifier::MODEL_NAME => [],
-					MovinetClassifier::MODEL_NAME => [],
-					MusicnnClassifier::MODEL_NAME => [],
+					Constants::MODEL_IMAGENET => [],
+					Constants::MODEL_FACES => [],
+					Constants::MODEL_MOVINET => [],
+					Constants::MODEL_MUSICNN => [],
 				];
 				foreach ($this->storageService->getFilesInMount($mount['storage_id'], $mount['override_root'], $models, $lastFileId) as $file) {
 					$i++;
@@ -117,8 +113,8 @@ final class Classify extends Command {
 					$queueFile->setUpdate(false);
 
 					if ($file['image']) {
-						if (in_array(ClusteringFaceClassifier::MODEL_NAME, $models)) {
-							$queues[ClusteringFaceClassifier::MODEL_NAME][] = $queueFile;
+						if (in_array(Constants::MODEL_FACES, $models)) {
+							$queues[Constants::MODEL_FACES][] = $queueFile;
 						}
 					}
 					// if retry flag is set, skip other classifiers for tagged files
@@ -130,18 +126,18 @@ final class Classify extends Command {
 						}
 					}
 					if ($file['image']) {
-						if (in_array(ImagenetClassifier::MODEL_NAME, $models)) {
-							$queues[ImagenetClassifier::MODEL_NAME][] = $queueFile;
+						if (in_array(Constants::MODEL_IMAGENET, $models)) {
+							$queues[Constants::MODEL_IMAGENET][] = $queueFile;
 						}
 					}
 					if ($file['video']) {
-						if (in_array(MovinetClassifier::MODEL_NAME, $models)) {
-							$queues[MovinetClassifier::MODEL_NAME][] = $queueFile;
+						if (in_array(Constants::MODEL_MOVINET, $models)) {
+							$queues[Constants::MODEL_MOVINET][] = $queueFile;
 						}
 					}
 					if ($file['audio']) {
-						if (in_array(MusicnnClassifier::MODEL_NAME, $models)) {
-							$queues[MusicnnClassifier::MODEL_NAME][] = $queueFile;
+						if (in_array(Constants::MODEL_MUSICNN, $models)) {
+							$queues[Constants::MODEL_MUSICNN][] = $queueFile;
 						}
 					}
 				}

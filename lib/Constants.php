@@ -17,4 +17,30 @@ final class Constants {
 	public const IGNORE_MARKERS_VIDEO = ['.novideo'];
 	public const IGNORE_MARKERS_AUDIO = ['.nomusic'];
 	public const MAX_FILE_SIZE = 10000000;
+
+	/**
+	 * Model identifiers.
+	 *
+	 * These are persisted values: they key the `<model>.enabled` entries in
+	 * oc_appconfig and the `model` column of the recognize queue, so they must
+	 * not be renamed. They previously lived as MODEL_NAME on the TensorFlow
+	 * classifier classes; classification moved to the Python ONNX service, so
+	 * the constants outlived the classes that defined them.
+	 */
+	public const MODEL_FACES = 'faces';
+	public const MODEL_IMAGENET = 'imagenet';
+	public const MODEL_LANDMARKS = 'landmarks';
+	public const MODEL_MOVINET = 'movinet';
+	public const MODEL_MUSICNN = 'musicnn';
+
+	public const MODELS = [
+		self::MODEL_FACES,
+		self::MODEL_IMAGENET,
+		self::MODEL_LANDMARKS,
+		self::MODEL_MOVINET,
+		self::MODEL_MUSICNN,
+	];
+
+	/** Tags that must be present before landmark detection is attempted. */
+	public const LANDMARKS_PRECONDITION_TAGS = ['Architecture', 'Tower', 'Monument', 'Bridge', 'Historic'];
 }

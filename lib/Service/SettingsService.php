@@ -9,12 +9,8 @@ declare(strict_types=1);
 
 namespace OCA\Recognize\Service;
 
+use OCA\Recognize\Constants;
 use OCA\Recognize\BackgroundJobs\SchedulerJob;
-use OCA\Recognize\Classifiers\Audio\MusicnnClassifier;
-use OCA\Recognize\Classifiers\Images\ClusteringFaceClassifier;
-use OCA\Recognize\Classifiers\Images\ImagenetClassifier;
-use OCA\Recognize\Classifiers\Images\LandmarksClassifier;
-use OCA\Recognize\Classifiers\Video\MovinetClassifier;
 use OCA\Recognize\Exception\Exception;
 use OCP\AppFramework\Services\IAppConfig;
 use OCP\BackgroundJob\IJobList;
@@ -98,20 +94,20 @@ final class SettingsService {
 		if ($value === 'true' && $this->config->getAppValueString($key, 'false') === 'false') {
 			// Additional model enabled: Schedule new crawl run for the affected mime types
 			switch ($key) {
-				case ClusteringFaceClassifier::MODEL_NAME . '.enabled':
-					$this->jobList->add(SchedulerJob::class, ['models' => [ClusteringFaceClassifier::MODEL_NAME]]);
+				case Constants::MODEL_FACES . '.enabled':
+					$this->jobList->add(SchedulerJob::class, ['models' => [Constants::MODEL_FACES]]);
 					break;
-				case ImagenetClassifier::MODEL_NAME . '.enabled':
-					$this->jobList->add(SchedulerJob::class, ['models' => [ImagenetClassifier::MODEL_NAME]]);
+				case Constants::MODEL_IMAGENET . '.enabled':
+					$this->jobList->add(SchedulerJob::class, ['models' => [Constants::MODEL_IMAGENET]]);
 					break;
-				case LandmarksClassifier::MODEL_NAME . '.enabled':
-					$this->jobList->add(SchedulerJob::class, ['models' => [LandmarksClassifier::MODEL_NAME]]);
+				case Constants::MODEL_LANDMARKS . '.enabled':
+					$this->jobList->add(SchedulerJob::class, ['models' => [Constants::MODEL_LANDMARKS]]);
 					break;
-				case MovinetClassifier::MODEL_NAME . '.enabled':
-					$this->jobList->add(SchedulerJob::class, ['models' => [MovinetClassifier::MODEL_NAME]]);
+				case Constants::MODEL_MOVINET . '.enabled':
+					$this->jobList->add(SchedulerJob::class, ['models' => [Constants::MODEL_MOVINET]]);
 					break;
-				case MusicnnClassifier::MODEL_NAME . '.enabled':
-					$this->jobList->add(SchedulerJob::class, ['models' => [MusicnnClassifier::MODEL_NAME]]);
+				case Constants::MODEL_MUSICNN . '.enabled':
+					$this->jobList->add(SchedulerJob::class, ['models' => [Constants::MODEL_MUSICNN]]);
 					break;
 				default:
 					break;

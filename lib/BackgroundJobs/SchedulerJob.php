@@ -7,11 +7,7 @@
 declare(strict_types=1);
 namespace OCA\Recognize\BackgroundJobs;
 
-use OCA\Recognize\Classifiers\Audio\MusicnnClassifier;
-use OCA\Recognize\Classifiers\Images\ClusteringFaceClassifier;
-use OCA\Recognize\Classifiers\Images\ImagenetClassifier;
-use OCA\Recognize\Classifiers\Images\LandmarksClassifier;
-use OCA\Recognize\Classifiers\Video\MovinetClassifier;
+use OCA\Recognize\Constants;
 use OCA\Recognize\Service\Logger;
 use OCA\Recognize\Service\StorageService;
 use OCP\AppFramework\Utility\ITimeFactory;
@@ -50,11 +46,11 @@ final class SchedulerJob extends QueuedJob {
 	protected function run($argument): void {
 		/** @var list<string> $models */
 		$models = $argument['models'] ?? [
-			ClusteringFaceClassifier::MODEL_NAME,
-			ImagenetClassifier::MODEL_NAME,
-			LandmarksClassifier::MODEL_NAME,
-			MovinetClassifier::MODEL_NAME,
-			MusicnnClassifier::MODEL_NAME,
+			Constants::MODEL_FACES,
+			Constants::MODEL_IMAGENET,
+			Constants::MODEL_LANDMARKS,
+			Constants::MODEL_MOVINET,
+			Constants::MODEL_MUSICNN,
 		];
 
 		foreach ($this->storageService->getMounts() as $mount) {
