@@ -65,7 +65,9 @@ class Service:
             gpu=gpu, ffmpeg_binary=ffmpeg_binary,
             nc_api=nc_api,
         )
-        self.pipeline.enable_classifiers()
+        # Honour the admin page's per-model toggles. Previously every
+        # classifier ran regardless, so the settings had no effect.
+        self.pipeline.enable_classifiers(self.pipeline.db.get_enabled_models())
 
         self._running = False
         self._poll_interval = POLL_MIN_INTERVAL

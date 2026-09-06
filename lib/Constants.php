@@ -41,6 +41,25 @@ final class Constants {
 		self::MODEL_MUSICNN,
 	];
 
+	/**
+	 * Background job classes from the TensorFlow era, removed when
+	 * classification moved to the Python ONNX service.
+	 *
+	 * Existing installations can still hold oc_jobs rows for these, so the
+	 * cleanup paths keep purging them by name. They are plain strings, not
+	 * ::class references, precisely because the classes no longer exist.
+	 */
+	public const LEGACY_JOB_CLASSES = [
+		'OCA\\Recognize\\BackgroundJobs\\ClassifyFacesJob',
+		'OCA\\Recognize\\BackgroundJobs\\ClassifyImagenetJob',
+		'OCA\\Recognize\\BackgroundJobs\\ClassifyLandmarksJob',
+		'OCA\\Recognize\\BackgroundJobs\\ClassifyMovinetJob',
+		'OCA\\Recognize\\BackgroundJobs\\ClassifyMusicnnJob',
+		'OCA\\Recognize\\BackgroundJobs\\SchedulerJob',
+		'OCA\\Recognize\\BackgroundJobs\\StorageCrawlJob',
+		'OCA\\Recognize\\BackgroundJobs\\ProcessFsActionsJob',
+	];
+
 	/** Tags that must be present before landmark detection is attempted. */
 	public const LANDMARKS_PRECONDITION_TAGS = ['Architecture', 'Tower', 'Monument', 'Bridge', 'Historic'];
 }

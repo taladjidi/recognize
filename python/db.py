@@ -143,6 +143,36 @@ class DB:
 
     # ── SQL dialect helpers ─────────────────────────────────────────────
 
+    def get_enabled_models(self) -> set[str] | None:
+        """Read the enabled classifiers from Nextcloud's appconfig.
+
+        The admin page writes `<model>.enabled` = 'true'/'false' for each
+        model. Returns None when no such rows exist, so a fresh install (or a
+        database we cannot read) falls back to running everything rather than
+        silently classifying nothing.
+        """
+        t = self._table("appconfig")
+        try:
+            cur = self._execute(
+                f"SELECT configkey, configvalue FROM {t} "
+                f"WHERE appid = {self._ph()} AND configkey LIKE {self._ph()}",
+                ("recognize", "%.enabled"),
+            )
+            rows = cur.fetchall()
+        except Exception:
+            log.warning("Could not read enabled models from appconfig; enabling all", exc_info=True)
+            return None
+
+        if not rows:
+            return None
+
+        enabled = set()
+        for key, value in rows:
+            model = str(key).rsplit(".", 1)[0]
+            if str(value).lower() in ("true", "1", "yes"):
+                enabled.add(model)
+        return enabled
+
     def _ph(self, count: int = 1) -> str:
         """Return placeholder string(s) for the current dialect."""
         p = "?" if self.dialect == "sqlite3" else "%s"

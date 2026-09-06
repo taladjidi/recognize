@@ -9,6 +9,7 @@ namespace OCA\Recognize\Hooks;
 
 use OCA\Recognize\Constants;
 use OCA\Recognize\Service\IgnoreService;
+use OCA\Recognize\Service\PendingService;
 use OCP\DB\Exception;
 use OCP\DB\QueryBuilder\IQueryBuilder;
 use OCP\EventDispatcher\Event;
@@ -28,8 +29,6 @@ use Psr\Log\LoggerInterface;
  *
  * The Python daemon polls this table directly — no background jobs needed.
  *
- * Actions: 0=created, 1=updated, 2=deleted.
- *
  * @template-implements IEventListener<Event>
  */
 final class FileListener implements IEventListener {
@@ -37,6 +36,7 @@ final class FileListener implements IEventListener {
 		private LoggerInterface $logger,
 		private IgnoreService $ignoreService,
 		private IDBConnection $db,
+		private PendingService $pending,
 	) {
 	}
 
@@ -53,7 +53,7 @@ final class FileListener implements IEventListener {
 				if ($this->isFileIgnored($node)) {
 					return;
 				}
-				$this->upsertPending($node->getId(), $node->getMountPoint()->getNumericStorageId(), 0);
+				$this->pending->upsert($node->getId(), $node->getMountPoint()->getNumericStorageId(), PendingService::ACTION_CREATED);
 			}
 
 			if ($event instanceof NodeRenamedEvent) {
@@ -66,10 +66,10 @@ final class FileListener implements IEventListener {
 				}
 				if ($this->isFileIgnored($target)) {
 					// Moved into ignored territory — treat as deletion
-					$this->upsertPending($target->getId(), $target->getMountPoint()->getNumericStorageId(), 2);
+					$this->pending->upsert($target->getId(), $target->getMountPoint()->getNumericStorageId(), PendingService::ACTION_DELETED);
 				} else {
 					// Moved to non-ignored location — treat as update (re-classify)
-					$this->upsertPending($target->getId(), $target->getMountPoint()->getNumericStorageId(), 1);
+					$this->pending->upsert($target->getId(), $target->getMountPoint()->getNumericStorageId(), PendingService::ACTION_UPDATED);
 				}
 			}
 
@@ -79,43 +79,13 @@ final class FileListener implements IEventListener {
 					$this->deleteFolder($node);
 					return;
 				}
-				$this->upsertPending($node->getId(), $node->getMountPoint()->getNumericStorageId(), 2);
+				$this->pending->upsert($node->getId(), $node->getMountPoint()->getNumericStorageId(), PendingService::ACTION_DELETED);
 			}
 		} catch (\Throwable $e) {
 			$this->logger->error('Error in recognize file listener', ['exception' => $e]);
 		}
 	}
 
-	/**
-	 * Upsert into recognize_pending.
-	 *
-	 * Uses raw SQL for the ON CONFLICT clause which isn't available in
-	 * Nextcloud's query builder.
-	 */
-	private function upsertPending(int $fileId, ?int $storageId, int $action): void {
-		if ($storageId === null) {
-			return;
-		}
-		$now = time();
-
-		$platform = $this->db->getDatabasePlatform();
-		$isMySQL = $platform instanceof \Doctrine\DBAL\Platforms\AbstractMySQLPlatform;
-
-		$prefix = \OC::$server->getConfig()->getSystemValueString('dbtableprefix', 'oc_');
-		$table = $prefix . 'recognize_pending';
-
-		if ($isMySQL) {
-			$sql = "INSERT INTO `{$table}` (`file_id`, `storage_id`, `action`, `added_at`) "
-				. "VALUES (?, ?, ?, ?) "
-				. "ON DUPLICATE KEY UPDATE `action` = VALUES(`action`), `added_at` = VALUES(`added_at`)";
-		} else {
-			$sql = "INSERT INTO \"{$table}\" (\"file_id\", \"storage_id\", \"action\", \"added_at\") "
-				. "VALUES (?, ?, ?, ?) "
-				. "ON CONFLICT (\"file_id\") DO UPDATE SET \"action\" = EXCLUDED.\"action\", \"added_at\" = EXCLUDED.\"added_at\"";
-		}
-
-		$this->db->executeStatement($sql, [$fileId, $storageId, $action, $now]);
-	}
 
 	/**
 	 * Recursively insert deletion entries for all files in a folder.
@@ -127,7 +97,7 @@ final class FileListener implements IEventListener {
 				if ($child->getType() === FileInfo::TYPE_FOLDER) {
 					$this->deleteFolder($child);
 				} else {
-					$this->upsertPending($child->getId(), $child->getMountPoint()->getNumericStorageId(), 2);
+					$this->pending->upsert($child->getId(), $child->getMountPoint()->getNumericStorageId(), PendingService::ACTION_DELETED);
 				}
 			}
 		} catch (NotFoundException $e) {

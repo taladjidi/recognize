@@ -52,9 +52,6 @@
 				<NcNoteCard v-if="countQueued" type="info">
 					{{ t('recognize', 'Face recognition:') }} {{ countQueued.faces }} {{ t('recognize', 'Queued files') }}, {{ t('recognize', 'Last classification: ') }} {{ showDate(settings['faces.lastFile']) }}<span v-if="facesJobs">, {{ t('recognize', 'Scheduled background jobs: ') }} {{ facesJobs.scheduled }}, {{ facesJobs.lastRun ? t('recognize', 'Last background job execution: ') + showDate(facesJobs.lastRun) : '' }}</span>
 				</NcNoteCard>
-				<NcNoteCard v-if="countQueued && countQueued.faces && facesJobs && !facesJobs.scheduled" show-alert type="error">
-					{{ t('recognize', 'There are queued files in the face recognition queue but no background job is scheduled to process them.') }}
-				</NcNoteCard>
 				<NcNoteCard v-if="countQueued" type="info">
 					{{ t('recognize', 'Face clustering:') }} {{ countQueued.clusterFaces }} {{ t('recognize', 'faces left to cluster') }}, {{ t('recognize', 'Last clustering run: ') }} {{ showDate(settings['clusterFaces.lastRun']) }}<span v-if="clusterFacesJobs">, {{ t('recognize', 'Scheduled background jobs: ') }} {{ clusterFacesJobs.scheduled }}, {{ clusterFacesJobs.lastRun ? t('recognize', 'Last background job execution: ') + showDate(clusterFacesJobs.lastRun) : '' }}</span><br>
 					<small>{{ t('recognize', 'A minimum of 120 faces per user is necessary for clustering to kick in') }}</small>
@@ -86,9 +83,6 @@
 				<NcNoteCard v-if="countQueued" type="info">
 					{{ t('recognize', 'Object recognition:') }} {{ countQueued.imagenet }} {{ t('recognize', 'Queued files') }}, {{ t('recognize', 'Last classification: ') }} {{ showDate(settings['imagenet.lastFile']) }}<span v-if="imagenetJobs">, {{ t('recognize', 'Scheduled background jobs: ') }} {{ imagenetJobs.scheduled }}, {{ imagenetJobs.lastRun ? t('recognize', 'Last background job execution: ') + showDate(imagenetJobs.lastRun) : '' }}</span>
 				</NcNoteCard>
-				<NcNoteCard v-if="countQueued && countQueued.imagenet && imagenetJobs && !imagenetJobs.scheduled" show-alert type="error">
-					{{ t('recognize', 'There are queued files in the object detection queue but no background job is scheduled to process them.') }}
-				</NcNoteCard>
 			</template>
 			<template v-if="settings['landmarks.enabled']">
 				<NcNoteCard v-if="settings['landmarks.status'] === true" show-alert type="success">
@@ -102,9 +96,6 @@
 				</NcNoteCard>
 				<NcNoteCard v-if="countQueued" type="info">
 					{{ t('recognize', 'Landmark recognition:') }} {{ countQueued.landmarks }} {{ t('recognize', 'Queued files') }}, {{ t('recognize', 'Last classification: ') }} {{ showDate(settings['landmarks.lastFile']) }}<span v-if="landmarksJobs">, {{ t('recognize', 'Scheduled background jobs: ') }} {{ landmarksJobs.scheduled }}, {{ landmarksJobs.lastRun ? t('recognize', 'Last background job execution: ') + showDate(landmarksJobs.lastRun) : '' }}</span>
-				</NcNoteCard>
-				<NcNoteCard v-if="countQueued && countQueued.landmarks && landmarksJobs && !landmarksJobs.scheduled" show-alert type="error">
-					{{ t('recognize', 'There are queued files in the landmarks queue but no background job is scheduled to process them.') }}
 				</NcNoteCard>
 			</template>
 
@@ -149,9 +140,6 @@
 				<NcNoteCard v-if="countQueued" type="info">
 					{{ t('recognize', 'Music genre recognition:') }} {{ countQueued.musicnn }} {{ t('recognize', 'Queued files') }}, {{ t('recognize', 'Last classification: ') }} {{ showDate(settings['musicnn.lastFile']) }}<span v-if="musicnnJobs">, {{ t('recognize', 'Scheduled background jobs: ') }} {{ musicnnJobs.scheduled }}, {{ musicnnJobs.lastRun ? t('recognize', 'Last background job execution: ') + showDate(musicnnJobs.lastRun) : '' }}</span>
 				</NcNoteCard>
-				<NcNoteCard v-if="countQueued && countQueued.musicnn && musicnnJobs && !musicnnJobs.scheduled" show-alert type="error">
-					{{ t('recognize', 'There are queued files but no background job is scheduled to process them.') }}
-				</NcNoteCard>
 			</template>
 			<p>
 				<NcCheckboxRadioSwitch :checked.sync="settings['musicnn.enabled']" type="switch" @update:checked="onChange">
@@ -178,9 +166,6 @@
 				</NcNoteCard>
 				<NcNoteCard v-if="countQueued" type="info">
 					{{ t('recognize', 'Video recognition:') }} {{ countQueued.movinet }} {{ t('recognize', 'Queued files') }}, {{ t('recognize', 'Last classification: ') }} {{ showDate(settings['movinet.lastFile']) }}<span v-if="movinetJobs">, {{ t('recognize', 'Scheduled background jobs: ') }} {{ movinetJobs.scheduled }}, {{ movinetJobs.lastRun ? t('recognize', 'Last background job execution: ') + showDate(movinetJobs.lastRun) : '' }}</span>
-				</NcNoteCard>
-				<NcNoteCard v-if="countQueued && countQueued.movinet && movinetJobs && !movinetJobs.scheduled" show-alert type="error">
-					{{ t('recognize', 'There are queued files but no background job is scheduled to process them.') }}
 				</NcNoteCard>
 			</template>
 			<p>

@@ -9,17 +9,13 @@ declare(strict_types=1);
 
 namespace OCA\Recognize\Controller;
 
-use OCA\Recognize\BackgroundJobs\ClassifyFacesJob;
-use OCA\Recognize\BackgroundJobs\ClassifyImagenetJob;
-use OCA\Recognize\BackgroundJobs\ClassifyLandmarksJob;
-use OCA\Recognize\BackgroundJobs\ClassifyMovinetJob;
-use OCA\Recognize\BackgroundJobs\ClassifyMusicnnJob;
 use OCA\Recognize\BackgroundJobs\ClusterFacesJob;
 use OCA\Recognize\BackgroundJobs\SchedulerJob;
 use OCA\Recognize\BackgroundJobs\StorageCrawlJob;
+use OCA\Recognize\Constants;
 use OCA\Recognize\Db\FaceClusterMapper;
 use OCA\Recognize\Db\FaceDetectionMapper;
-use OCA\Recognize\Service\QueueService;
+use OCA\Recognize\Service\PendingService;
 use OCA\Recognize\Service\SettingsService;
 use OCA\Recognize\Service\TagManager;
 use OCP\AppFramework\Controller;
@@ -37,19 +33,19 @@ final class AdminController extends Controller {
 	private TagManager $tagManager;
 	private IJobList $jobList;
 	private SettingsService $settingsService;
-	private QueueService $queue;
+	private PendingService $pending;
 	private FaceClusterMapper $clusterMapper;
 	private FaceDetectionMapper $detectionMapper;
 	private IAppConfig $config;
 	private FaceDetectionMapper $faceDetections;
 	private IBinaryFinder $binaryFinder;
 
-	public function __construct(string $appName, IRequest $request, TagManager $tagManager, IJobList $jobList, SettingsService $settingsService, QueueService $queue, FaceClusterMapper $clusterMapper, FaceDetectionMapper $detectionMapper, IAppConfig $config, FaceDetectionMapper $faceDetections, IBinaryFinder $binaryFinder) {
+	public function __construct(string $appName, IRequest $request, TagManager $tagManager, IJobList $jobList, SettingsService $settingsService, PendingService $pending, FaceClusterMapper $clusterMapper, FaceDetectionMapper $detectionMapper, IAppConfig $config, FaceDetectionMapper $faceDetections, IBinaryFinder $binaryFinder) {
 		parent::__construct($appName, $request);
 		$this->tagManager = $tagManager;
 		$this->jobList = $jobList;
 		$this->settingsService = $settingsService;
-		$this->queue = $queue;
+		$this->pending = $pending;
 		$this->clusterMapper = $clusterMapper;
 		$this->detectionMapper = $detectionMapper;
 		$this->config = $config;
@@ -63,16 +59,11 @@ final class AdminController extends Controller {
 	}
 
 	public function clearAllJobs(): JSONResponse {
-		$this->queue->clearQueue('imagenet');
-		$this->queue->clearQueue('faces');
-		$this->queue->clearQueue('landmarks');
-		$this->queue->clearQueue('movinet');
-		$this->queue->clearQueue('musicnn');
-		$this->jobList->remove(ClassifyFacesJob::class);
-		$this->jobList->remove(ClassifyImagenetJob::class);
-		$this->jobList->remove(ClassifyLandmarksJob::class);
-		$this->jobList->remove(ClassifyMusicnnJob::class);
-		$this->jobList->remove(ClassifyMovinetJob::class);
+		// Purge rows left over from the TensorFlow-era jobs. Those classes no
+		// longer exist, so they are removed by name rather than by ::class.
+		foreach (Constants::LEGACY_JOB_CLASSES as $legacy) {
+			$this->jobList->remove($legacy);
+		}
 		$this->jobList->remove(ClusterFacesJob::class);
 		$this->jobList->remove(SchedulerJob::class);
 		$this->jobList->remove(StorageCrawlJob::class);
@@ -106,29 +97,30 @@ final class AdminController extends Controller {
 	}
 
 	public function countQueued(): JSONResponse {
-		$imagenetCount = $this->queue->count('imagenet');
-		$facesCount = $this->queue->count('faces');
-		$landmarksCount = $this->queue->count('landmarks');
-		$movinetCount = $this->queue->count('movinet');
-		$musicnnCount = $this->queue->count('musicnn');
-		$clusterFacesCount = $this->faceDetections->countUnclustered();
+		// The per-model PHP queues are gone: the Python daemon reads
+		// recognize_pending, which holds one row per file, and picks
+		// classifiers from the file's own type. Report the same split here.
+		$pending = $this->pending->countByMediaType();
 		return new JSONResponse([
-			'imagenet' => $imagenetCount,
-			'faces' => $facesCount,
-			'landmarks' => $landmarksCount,
-			'movinet' => $movinetCount,
-			'musicnn' => $musicnnCount,
-			'clusterFaces' => $clusterFacesCount,
+			'imagenet' => $pending['image'],
+			'faces' => $pending['image'],
+			'landmarks' => $pending['image'],
+			'movinet' => $pending['video'],
+			'musicnn' => $pending['audio'],
+			'clusterFaces' => $this->faceDetections->countUnclustered(),
 		]);
 	}
 
 	public function hasJobs(string $task): JSONResponse {
+		// Classification is no longer done by per-model background jobs. What
+		// is schedulable now is the crawl that feeds recognize_pending, so
+		// every model task maps to it.
 		$tasks = [
-			'faces' => ClassifyFacesJob::class,
-			'imagenet' => ClassifyImagenetJob::class,
-			'landmarks' => ClassifyLandmarksJob::class,
-			'musicnn' => ClassifyMusicnnJob::class,
-			'movinet' => ClassifyMovinetJob::class,
+			'faces' => StorageCrawlJob::class,
+			'imagenet' => StorageCrawlJob::class,
+			'landmarks' => StorageCrawlJob::class,
+			'musicnn' => StorageCrawlJob::class,
+			'movinet' => StorageCrawlJob::class,
 			'clusterFaces' => ClusterFacesJob::class,
 		];
 		if (!isset($tasks[$task])) {
