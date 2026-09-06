@@ -29,11 +29,7 @@ Environment=MPLCONFIGDIR=/tmp/matplotlib
 # "Failed to persist telemetry device ID" on every start. PrivateTmp=true
 # gives this service its own /tmp, so point HOME there.
 Environment=HOME=/tmp
-# insightface 1.0.1 calls skimage's deprecated SimilarityTransform.estimate
-# in its face-alignment path. Harmless today, noisy on every face; the real
-# guard is the scikit-image<2.2 pin in setup_config.py, since the call is
-# removed in 2.2 and face alignment would break outright.
-Environment=PYTHONWARNINGS=ignore::FutureWarning:insightface.utils.face_align
+
 
 # GPU device access (render group for /dev/dri, video for some drivers)
 SupplementaryGroups=video render

@@ -175,3 +175,106 @@ class TestInference:
         # Landscape photos might occasionally detect false positives, but
         # should have far fewer faces than a portrait dataset
         assert len(faces) <= 2
+
+
+def _require_new_skimage():
+    """Skip only if scikit-image predates from_estimate.
+
+    Keyed on the library, not on whether the patch applied: if the patch is
+    removed these tests must FAIL, not silently skip.
+    """
+    from skimage import transform as trans
+
+    if not hasattr(trans.SimilarityTransform, "from_estimate"):
+        pytest.skip("scikit-image < 0.26: legacy estimate() is still current")
+
+
+class TestFaceAlignPatch:
+    """The insightface face_align compatibility patch.
+
+    insightface 1.0.1 calls scikit-image's SimilarityTransform.estimate(),
+    deprecated in 0.26 and removed in 2.2. _patch_insightface_face_align()
+    rewrites that one function to use from_estimate(). These tests pin the
+    two properties that matter: the output must not drift (embeddings and
+    every stored face cluster depend on the alignment matrix), and the
+    deprecated call must be gone.
+    """
+
+    @staticmethod
+    def _landmarks(n=100, seed=0):
+        rng = np.random.default_rng(seed)
+        base = np.array(
+            [[38.3, 51.7], [73.5, 51.5], [56.0, 71.7], [41.5, 92.4], [70.7, 92.2]],
+            dtype=np.float32,
+        )
+        return [(base + rng.normal(0, 12, (5, 2))).astype(np.float32) for _ in range(n)]
+
+    def test_patch_output_is_identical_to_legacy(self):
+        """Patched estimate_norm must match the original bit for bit."""
+        if not _has_insightface():
+            pytest.skip("insightface not installed")
+        import warnings
+
+        from insightface.utils import face_align
+
+        from classifiers.faces import _patch_insightface_face_align
+
+        legacy = face_align.estimate_norm
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                before = [legacy(lmk, size)
+                          for lmk in self._landmarks() for size in (112, 128, 224)]
+
+            _require_new_skimage()
+            _patch_insightface_face_align()
+            patched = face_align.estimate_norm
+            assert patched is not legacy, "compatibility patch did not apply"
+
+            after = [patched(lmk, size)
+                     for lmk in self._landmarks() for size in (112, 128, 224)]
+        finally:
+            face_align.estimate_norm = legacy
+
+        assert len(before) == len(after)
+        for a, b in zip(before, after):
+            assert np.array_equal(a, b), "alignment matrix drifted"
+
+    def test_patch_emits_no_deprecation_warning(self):
+        if not _has_insightface():
+            pytest.skip("insightface not installed")
+        import warnings
+
+        from insightface.utils import face_align
+
+        from classifiers.faces import _patch_insightface_face_align
+
+        legacy = face_align.estimate_norm
+        try:
+            _require_new_skimage()
+            _patch_insightface_face_align()
+            assert face_align.estimate_norm is not legacy, "compatibility patch did not apply"
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", FutureWarning)
+                face_align.estimate_norm(self._landmarks(1)[0], 112)
+        finally:
+            face_align.estimate_norm = legacy
+
+    def test_degenerate_landmarks_fall_back_to_identity(self):
+        """Legacy code discarded estimate()'s result, leaving identity params."""
+        if not _has_insightface():
+            pytest.skip("insightface not installed")
+        from insightface.utils import face_align
+
+        from classifiers.faces import _patch_insightface_face_align
+
+        legacy = face_align.estimate_norm
+        try:
+            _require_new_skimage()
+            _patch_insightface_face_align()
+            assert face_align.estimate_norm is not legacy, "compatibility patch did not apply"
+            M = face_align.estimate_norm(np.zeros((5, 2), dtype=np.float32), 112)
+        finally:
+            face_align.estimate_norm = legacy
+
+        assert np.array_equal(M, np.eye(3)[0:2, :])

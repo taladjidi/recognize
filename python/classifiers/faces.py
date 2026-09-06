@@ -40,6 +40,53 @@ def _patch_insightface_session_options():
     PickableInferenceSession.__init__ = patched_init
 
 
+def _patch_insightface_face_align():
+    """Replace insightface's deprecated scikit-image call with the modern API.
+
+    insightface 1.0.1 (the latest release) calls
+    SimilarityTransform.estimate(), which scikit-image deprecated in 0.26 and
+    REMOVES in 2.2. At that point face alignment would not merely warn, it
+    would fail outright. There is exactly one call site
+    (insightface/utils/face_align.py::estimate_norm) and no fixed upstream
+    release to move to, so rewrite that one function to use from_estimate()
+    when the running scikit-image provides it.
+
+    arcface_onnx.py reaches estimate_norm through the module attribute, so
+    replacing it here also covers norm_crop/norm_crop2.
+
+    Failure semantics are preserved exactly: insightface discarded
+    estimate()'s boolean result, leaving SimilarityTransform's identity
+    params in place, so a failed estimation still yields the identity matrix
+    rather than raising.
+    """
+    from insightface.utils import face_align
+    from skimage import transform as trans
+
+    if not hasattr(trans.SimilarityTransform, "from_estimate"):
+        return  # scikit-image < 0.26: legacy estimate() is still current
+
+    def estimate_norm(lmk, image_size=112, mode="arcface"):
+        assert lmk.shape == (5, 2)
+        assert image_size % 112 == 0 or image_size % 128 == 0
+        if image_size % 112 == 0:
+            ratio = float(image_size) / 112.0
+            diff_x = 0
+        else:
+            ratio = float(image_size) / 128.0
+            diff_x = 8.0 * ratio
+        dst = face_align.arcface_dst * ratio
+        dst[:, 0] += diff_x
+
+        tform = trans.SimilarityTransform.from_estimate(lmk, dst)
+        if not tform:
+            # FailedEstimation is falsy; mirror the legacy identity fallback.
+            log.warning("Face alignment estimation failed; using identity transform")
+            tform = trans.SimilarityTransform()
+        return np.asarray(tform.params)[0:2, :]
+
+    face_align.estimate_norm = estimate_norm
+
+
 def _build_providers(gpu=True):
     """Build provider list for InsightFace."""
     if not gpu:
@@ -91,6 +138,7 @@ class FaceClassifier:
             gpu: Whether to use GPU providers.
         """
         _patch_insightface_session_options()
+        _patch_insightface_face_align()
         from insightface.app import FaceAnalysis
 
         insightface_root = os.path.join(models_dir, "insightface")

@@ -14,8 +14,6 @@ Pillow>=10.0
 opencv-python-headless>=4.8
 insightface>=0.7
 scikit-learn>=1.4
-# insightface calls SimilarityTransform.estimate, removed in scikit-image 2.2
-scikit-image<2.2
 scipy>=1.12
 requests>=2.31
 soundfile>=0.12
