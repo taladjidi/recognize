@@ -36,6 +36,8 @@ final class FaceRoot implements ICollection, IMoveTarget {
 	 * @var \OCA\Recognize\Dav\Faces\FacePhoto[]
 	 */
 	private array $children = [];
+	private ?int $preloadedCount = null;
+	private ?FaceDetection $preloadedPreview = null;
 
 	public function __construct(FaceClusterMapper $clusterMapper, FaceCluster $cluster, IUser $user, FaceDetectionMapper $detectionMapper, IRootFolder $rootFolder, ITagManager $tagManager, IPreview $previewManager) {
 		$this->clusterMapper = $clusterMapper;
@@ -45,6 +47,12 @@ final class FaceRoot implements ICollection, IMoveTarget {
 		$this->rootFolder = $rootFolder;
 		$this->tagManager = $tagManager;
 		$this->previewManager = $previewManager;
+	}
+
+	/** Inject pre-loaded metadata from batch queries to avoid per-cluster DB calls. */
+	public function setPreloadedData(?int $count, ?FaceDetection $preview): void {
+		$this->preloadedCount = $count;
+		$this->preloadedPreview = $preview;
 	}
 
 	/**
@@ -89,11 +97,15 @@ final class FaceRoot implements ICollection, IMoveTarget {
 	 */
 	public function getChildren(): array {
 		if (count($this->children) === 0) {
-			$detections = $this->detectionMapper->findByClusterIdWithExistingFiles($this->cluster->getId(), $this->user->getUID());
-			$userFolder = $this->rootFolder->getUserFolder($this->user->getUID());
-			$this->children = array_map(function (FaceDetection $detection) use ($userFolder) {
-				return new FacePhoto($this->detectionMapper, $detection, $userFolder, $this->tagManager, $this->previewManager);
-			}, $detections);
+			try {
+				$detections = $this->detectionMapper->findByClusterIdWithExistingFiles($this->cluster->getId(), $this->user->getUID());
+				$userFolder = $this->rootFolder->getUserFolder($this->user->getUID());
+				$this->children = array_map(function (FaceDetection $detection) use ($userFolder) {
+					return new FacePhoto($this->detectionMapper, $detection, $userFolder, $this->tagManager, $this->previewManager);
+				}, $detections);
+			} catch (\Throwable $e) {
+				throw $e;
+			}
 		}
 		return $this->children;
 	}
@@ -107,16 +119,28 @@ final class FaceRoot implements ICollection, IMoveTarget {
 			}
 			throw new NotFound("$name not found");
 		}
+
+		// Try parsing detection ID from "{detectionId}-{filename}" format
 		[$detectionId,] = explode('-', $name);
+		if ((int)$detectionId > 0) {
+			try {
+				$detection = $this->detectionMapper->find((int)$detectionId);
+				if ($detection->getClusterId() === $this->cluster->getId() && $detection->getUserId() === $this->user->getUID()) {
+					return new FacePhoto($this->detectionMapper, $detection, $this->rootFolder->getUserFolder($this->user->getUID()), $this->tagManager, $this->previewManager);
+				}
+			} catch (DoesNotExistException $e) {
+				// fall through to filename lookup
+			}
+		}
+
+		// Fallback: Photos app sends real filenames (without detection ID prefix)
+		// because FetchFacesMixin overwrites the DAV filename with realpath
 		try {
-			$detection = $this->detectionMapper->find((int)$detectionId);
+			$detection = $this->detectionMapper->findByClusterIdAndFileName($this->cluster->getId(), $this->user->getUID(), $name);
+			return new FacePhoto($this->detectionMapper, $detection, $this->rootFolder->getUserFolder($this->user->getUID()), $this->tagManager, $this->previewManager);
 		} catch (DoesNotExistException $e) {
 			throw new NotFound();
 		}
-		if ($detection->getClusterId() !== $this->cluster->getId() || $detection->getUserId() !== $this->user->getUID()) {
-			throw new NotFound();
-		}
-		return new FacePhoto($this->detectionMapper, $detection, $this->rootFolder->getUserFolder($this->user->getUID()), $this->tagManager, $this->previewManager);
 	}
 
 	public function childExists($name): bool {
@@ -146,6 +170,9 @@ final class FaceRoot implements ICollection, IMoveTarget {
 	}
 
 	public function getDetectionCount() : int {
+		if ($this->preloadedCount !== null) {
+			return $this->preloadedCount;
+		}
 		return $this->detectionMapper->countByClusterId($this->cluster->getId(), $this->user->getUID());
 	}
 
@@ -157,15 +184,13 @@ final class FaceRoot implements ICollection, IMoveTarget {
 	}
 
 	public function getPreviewImage() : string {
-		try {
-			$detection = $this->detectionMapper->findDetectionForPreviewImageByClusterId($this->cluster->getId(), $this->user->getUID());
-		} catch (DoesNotExistException $e) {
-			// Fallback: use any detection from this cluster for this user
-			$detections = $this->detectionMapper->findByClusterIdWithExistingFiles($this->cluster->getId(), $this->user->getUID());
-			if (count($detections) === 0) {
+		$detection = $this->preloadedPreview;
+		if ($detection === null) {
+			try {
+				$detection = $this->detectionMapper->findDetectionForPreviewImageByClusterId($this->cluster->getId(), $this->user->getUID());
+			} catch (DoesNotExistException|\OCP\DB\Exception $e) {
 				return json_encode(null);
 			}
-			$detection = $detections[0];
 		}
 		return json_encode([
 			'fileid' => $detection->getFileId(),

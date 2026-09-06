@@ -63,13 +63,19 @@ def _extract_face(face, width, height):
 
     embedding = face.embedding / np.linalg.norm(face.embedding)
 
+    # Clamp bbox to image boundaries (InsightFace can return out-of-bounds coords)
+    x1 = max(0.0, float(x1))
+    y1 = max(0.0, float(y1))
+    x2 = min(float(width), float(x2))
+    y2 = min(float(height), float(y2))
+
     return {
         "angle": angle,
         "vector": embedding.tolist(),
-        "x": float(x1) / width,
-        "y": float(y1) / height,
-        "height": float(y2 - y1) / height,
-        "width": float(x2 - x1) / width,
+        "x": x1 / width,
+        "y": y1 / height,
+        "height": (y2 - y1) / height,
+        "width": (x2 - x1) / width,
         "score": float(face.det_score),
     }
 

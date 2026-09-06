@@ -164,10 +164,24 @@ final class InternalController extends Controller {
 	 * @param array $faces Each face: {x, y, width, height, vector, score, user_id}
 	 */
 	private function writeFaces(int $fileId, array $faces): void {
+		// Resolve file owner from storage ID (works without user session)
+		$userId = '';
+		$qb = \OC::$server->getDatabaseConnection()->getQueryBuilder();
+		$result = $qb->select('s.id')
+			->from('filecache', 'f')
+			->innerJoin('f', 'storages', 's', $qb->expr()->eq('f.storage', 's.numeric_id'))
+			->where($qb->expr()->eq('f.fileid', $qb->createNamedParameter($fileId)))
+			->executeQuery();
+		$storageId = $result->fetchOne();
+		$result->closeCursor();
+		if ($storageId && str_starts_with($storageId, 'home::')) {
+			$userId = substr($storageId, 6);
+		}
+
 		foreach ($faces as $face) {
 			$detection = new FaceDetection();
 			$detection->setFileId($fileId);
-			$detection->setUserId($face['user_id'] ?? '');
+			$detection->setUserId($userId);
 			$detection->setX((float)($face['x'] ?? 0));
 			$detection->setY((float)($face['y'] ?? 0));
 			$detection->setWidth((float)($face['width'] ?? 0));

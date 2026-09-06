@@ -86,6 +86,8 @@ final class FacesHome implements ICollection {
 			} catch (DoesNotExistException $e) {
 				throw new NotFound();
 			}
+		} catch (\Exception $e) {
+			throw new NotFound();
 		}
 
 		return new FaceRoot($this->faceClusterMapper, $cluster, $this->user, $this->faceDetectionMapper, $this->rootFolder, $this->tagManager, $this->previewManager);
@@ -97,10 +99,20 @@ final class FacesHome implements ICollection {
 	 */
 	public function getChildren(): array {
 		if (count($this->children) === 0) {
-			// findByUserId uses INNER JOIN with detections, so empty clusters are already excluded
-			$clusters = $this->faceClusterMapper->findByUserId($this->user->getUID());
-			$this->children = array_map(function (FaceCluster $cluster) {
-				return new FaceRoot($this->faceClusterMapper, $cluster, $this->user, $this->faceDetectionMapper, $this->rootFolder, $this->tagManager, $this->previewManager);
+			$userId = $this->user->getUID();
+			$clusters = $this->faceClusterMapper->findByUserId($userId);
+
+			// Batch-prefetch counts and previews (2 queries instead of 2×N)
+			$counts = $this->faceDetectionMapper->batchCountByUser($userId);
+			$previews = $this->faceDetectionMapper->batchPreviewsByUser($userId);
+
+			$this->children = array_map(function (FaceCluster $cluster) use ($counts, $previews) {
+				$root = new FaceRoot($this->faceClusterMapper, $cluster, $this->user, $this->faceDetectionMapper, $this->rootFolder, $this->tagManager, $this->previewManager);
+				$root->setPreloadedData(
+					$counts[$cluster->getId()] ?? 0,
+					$previews[$cluster->getId()] ?? null,
+				);
+				return $root;
 			}, $clusters);
 		}
 		return $this->children;

@@ -102,15 +102,113 @@ final class FaceDetectionMapper extends QBMapper {
 	 * and restricts to a specific user's detections.
 	 * Uses a single INNER JOIN instead of N individual file lookups.
 	 */
+	private const LIGHT_COLUMNS = ['id', 'user_id', 'file_id', 'x', 'y', 'height', 'width', 'cluster_id', 'threshold'];
+
 	public function findByClusterIdWithExistingFiles(int $clusterId, string $userId) : array {
+		$qb = $this->db->getQueryBuilder();
+		$columns = array_map(fn ($col) => 'd.'.$col, self::LIGHT_COLUMNS);
+		$qb->select($columns)
+			->from('recognize_face_detections', 'd')
+			->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
+			->where($qb->expr()->eq('d.cluster_id', $qb->createPositionalParameter($clusterId)))
+			->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)))
+			->andWhere($qb->expr()->like('fc.path', $qb->createPositionalParameter('files/%')));
+		return $this->findEntities($qb);
+	}
+
+	/**
+	 * Batch count detections per cluster for a user. Single GROUP BY query
+	 * replaces N individual countByClusterId calls.
+	 * @return array<int, int> cluster_id => count
+	 */
+	public function batchCountByUser(string $userId): array {
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('d.cluster_id', $qb->func()->count('d.id', 'cnt'))
+			->from('recognize_face_detections', 'd')
+			->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
+			->where($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)))
+			->andWhere($qb->expr()->isNotNull('d.cluster_id'))
+			->andWhere($qb->expr()->gt('d.cluster_id', $qb->createPositionalParameter(0)))
+			->andWhere($qb->expr()->like('fc.path', $qb->createPositionalParameter('files/%')))
+			->groupBy('d.cluster_id');
+		$result = $qb->executeQuery();
+		$counts = [];
+		while ($row = $result->fetch()) {
+			$counts[(int)$row['cluster_id']] = (int)$row['cnt'];
+		}
+		$result->closeCursor();
+		return $counts;
+	}
+
+	/**
+	 * Batch fetch one preview detection per cluster for a user. Single query
+	 * replaces N individual findDetectionForPreviewImageByClusterId calls.
+	 * Picks the largest face (by height*width) with an existing non-trashed file.
+	 * @return array<int, FaceDetection> cluster_id => detection
+	 */
+	public function batchPreviewsByUser(string $userId): array {
+		// Use a subquery to find the best detection per cluster
+		$qb = $this->db->getQueryBuilder();
+		$columns = array_map(fn ($col) => 'd.'.$col, self::LIGHT_COLUMNS);
+		$qb->select($columns)
+			->from('recognize_face_detections', 'd')
+			->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
+			->where($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)))
+			->andWhere($qb->expr()->isNotNull('d.cluster_id'))
+			->andWhere($qb->expr()->gt('d.cluster_id', $qb->createPositionalParameter(0)))
+			->andWhere($qb->expr()->like('fc.path', $qb->createPositionalParameter('files/%')))
+			->addOrderBy('d.cluster_id')
+			->addOrderBy('d.height', 'DESC')
+			->addOrderBy('d.width', 'DESC');
+		$result = $qb->executeQuery();
+
+		$previews = [];
+		while ($row = $result->fetch()) {
+			$clusterId = (int)$row['cluster_id'];
+			if (!isset($previews[$clusterId])) {
+				try {
+					$previews[$clusterId] = $this->mapRowToEntity($row);
+				} catch (\Exception $e) {
+					// skip unmappable rows
+				}
+			}
+		}
+		$result->closeCursor();
+		return $previews;
+	}
+
+	/**
+	 * Find a detection in a cluster by the real filename (from filecache).
+	 * Used when the Photos app sends MOVE requests with real filenames
+	 * instead of detection-prefixed basenames.
+	 */
+	public function findByClusterIdAndFileName(int $clusterId, string $userId, string $fileName) : FaceDetection {
 		$qb = $this->db->getQueryBuilder();
 		$columns = array_map(fn ($col) => 'd.'.$col, FaceDetection::$columns);
 		$qb->select($columns)
 			->from('recognize_face_detections', 'd')
 			->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
 			->where($qb->expr()->eq('d.cluster_id', $qb->createPositionalParameter($clusterId)))
-			->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)));
-		return $this->findEntities($qb);
+			->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)))
+			->andWhere($qb->expr()->eq('fc.name', $qb->createPositionalParameter($fileName)))
+			->setMaxResults(1);
+		return $this->findEntity($qb);
+	}
+
+	/**
+	 * Find a rejected detection (cluster_id = -1) by user and real filename.
+	 */
+	public function findRejectedByUserIdAndFileName(string $userId, string $fileName) : FaceDetection {
+		$qb = $this->db->getQueryBuilder();
+		$columns = array_map(fn ($col) => 'd.'.$col, FaceDetection::$columns);
+		$qb->select($columns)
+			->from('recognize_face_detections', 'd')
+			->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
+			->where($qb->expr()->eq('d.cluster_id', $qb->createPositionalParameter(-1)))
+			->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)))
+			->andWhere($qb->expr()->eq('fc.name', $qb->createPositionalParameter($fileName)))
+			->setMaxResults(1);
+		return $this->findEntity($qb);
 	}
 
 	public function countByClusterId(int $clusterId, string $userId) : int {
@@ -119,7 +217,8 @@ final class FaceDetectionMapper extends QBMapper {
 			->from('recognize_face_detections', 'd')
 			->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
 			->where($qb->expr()->eq('d.cluster_id', $qb->createPositionalParameter($clusterId)))
-			->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)));
+			->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)))
+			->andWhere($qb->expr()->like('fc.path', $qb->createPositionalParameter('files/%')));
 		$result = $qb->executeQuery();
 		$count = $result->fetch(\PDO::FETCH_COLUMN);
 		$result->closeCursor();
@@ -213,7 +312,11 @@ final class FaceDetectionMapper extends QBMapper {
 	 */
 	public function findByFileIdWithTitle(int $fileId) : array {
 		$qb = $this->db->getQueryBuilder();
-		$qb->select(array_merge(array_map(fn ($col) => 'd.'.$col, FaceDetection::$columns), ['c.title']))
+		$lightWithTitle = array_merge(
+			array_map(fn ($col) => 'd.'.$col, self::LIGHT_COLUMNS),
+			['c.title']
+		);
+		$qb->select($lightWithTitle)
 			->from('recognize_face_detections', 'd')
 			->where($qb->expr()->eq('file_id', $qb->createPositionalParameter($fileId, IQueryBuilder::PARAM_INT)))
 			->leftJoin('d', 'recognize_face_clusters', 'c', $qb->expr()->eq('d.cluster_id', 'c.id'));
@@ -331,7 +434,8 @@ final class FaceDetectionMapper extends QBMapper {
 
 	public function findDetectionForPreviewImageByClusterId(int $clusterId, string $userId) : FaceDetection {
 		$qb = $this->db->getQueryBuilder();
-		$qb->select(array_map(fn ($col) => 'd.'.$col, FaceDetection::$columns))
+		$lightColumns = ['id', 'user_id', 'file_id', 'x', 'y', 'height', 'width', 'cluster_id', 'threshold'];
+		$qb->select(array_map(fn ($col) => 'd.'.$col, $lightColumns))
 			->from('recognize_face_detections', 'd')
 			->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
 			->where($qb->expr()->eq('d.cluster_id', $qb->createPositionalParameter($clusterId)))
@@ -348,7 +452,8 @@ final class FaceDetectionMapper extends QBMapper {
 			return $this->findEntity($qb);
 		} catch (DoesNotExistException $e) {
 			$qb = $this->db->getQueryBuilder();
-			$qb->select(array_map(fn ($col) => 'd.'.$col, FaceDetection::$columns))
+			$lightColumns = ['id', 'user_id', 'file_id', 'x', 'y', 'height', 'width', 'cluster_id', 'threshold'];
+		$qb->select(array_map(fn ($col) => 'd.'.$col, $lightColumns))
 				->from('recognize_face_detections', 'd')
 				->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
 				->where($qb->expr()->eq('d.cluster_id', $qb->createPositionalParameter($clusterId)))

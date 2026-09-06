@@ -70,17 +70,27 @@ final class UnassignedFacesHome implements ICollection {
 			}
 			throw new NotFound("$name not found");
 		}
+
+		// Try parsing detection ID from "{detectionId}-{filename}" format
 		[$detectionId,] = explode('-', $name);
+		if ((int)$detectionId > 0) {
+			try {
+				$detection = $this->faceDetectionMapper->find((int)$detectionId);
+				if ($detection->getClusterId() === -1) {
+					return new UnassignedFacePhoto($this->faceDetectionMapper, $detection, $this->rootFolder->getUserFolder($this->user->getUID()), $this->tagManager, $this->previewManager);
+				}
+			} catch (DoesNotExistException $e) {
+				// fall through to filename lookup
+			}
+		}
+
+		// Fallback: Photos app sends real filenames (without detection ID prefix)
 		try {
-			$detection = $this->faceDetectionMapper->find((int)$detectionId);
+			$detection = $this->faceDetectionMapper->findRejectedByUserIdAndFileName($this->user->getUID(), $name);
+			return new UnassignedFacePhoto($this->faceDetectionMapper, $detection, $this->rootFolder->getUserFolder($this->user->getUID()), $this->tagManager, $this->previewManager);
 		} catch (DoesNotExistException $e) {
 			throw new NotFound();
 		}
-		if ($detection->getClusterId() !== -1) {
-			throw new NotFound();
-		}
-
-		return new UnassignedFacePhoto($this->faceDetectionMapper, $detection, $this->rootFolder->getUserFolder($this->user->getUID()), $this->tagManager, $this->previewManager);
 	}
 
 	public function childExists($name): bool {
