@@ -120,7 +120,7 @@ def service_imports():
     """
     sys.path.insert(0, "/usr/share/nextcloud/apps/recognize/python")
     import config, db, nc_api, clustering, pipeline, rules_engine  # noqa: F401
-    from classifiers.base import BaseClassifier  # noqa: F401
+    from classifiers.base import build_providers, create_session  # noqa: F401
     from classifiers.faces import FaceClassifier  # noqa: F401
     from classifiers.imagenet import ImageNetClassifier  # noqa: F401
     from classifiers.landmarks import LandmarkClassifier  # noqa: F401
