@@ -75,10 +75,17 @@ final class PropFindPlugin extends ServerPlugin {
 			};
 
 			$propFind->handle(self::FACE_DETECTIONS_PROPERTYNAME, function () use ($node) {
+				// FaceRoot bulk-loads these when listing a cluster; without that
+				// this runs one query per child of the collection.
+				$detections = $node->getPreloadedDetections();
+				if ($detections === null) {
+					$detections = $this->faceDetectionMapper->findByFileIdWithTitle($node->getFaceDetection()->getFileId());
+				}
+
 				return json_encode(
 					array_map(
 						fn (FaceDetectionWithTitle $face) => $face->toArray(),
-						$this->faceDetectionMapper->findByFileIdWithTitle($node->getFaceDetection()->getFileId())
+						$detections
 					)
 				);
 			});
