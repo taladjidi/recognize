@@ -18,17 +18,12 @@ use OCP\BackgroundJob\IJobList;
 final class SettingsService {
 	/** @var array<string,string>  */
 	private const DEFAULTS = [
-		'tensorflow.cores' => '0',
-		'tensorflow.gpu' => 'false',
-		'tensorflow.purejs' => 'false',
 		'geo.enabled' => 'false',
 		'imagenet.enabled' => 'false',
 		'landmarks.enabled' => 'false',
 		'faces.enabled' => 'false',
 		'musicnn.enabled' => 'false',
 		'movinet.enabled' => 'false',
-		'node_binary' => '',
-		'python_binary' => '',
 		'clusterFaces.status' => 'null',
 		'faces.status' => 'null',
 		'imagenet.status' => 'null',
@@ -46,9 +41,6 @@ final class SettingsService {
 		'landmarks.batchSize' => '100',
 		'movinet.batchSize' => '20',
 		'musicnn.batchSize' => '100',
-		'nice_binary' => '',
-		'nice_value' => '0',
-		'concurrency.enabled' => 'false',
 		'ffmpeg_binary' => '',
 		'imagenet.model' => 'auto',
 	];

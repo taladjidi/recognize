@@ -143,6 +143,32 @@ class DB:
 
     # ── SQL dialect helpers ─────────────────────────────────────────────
 
+    def set_app_value(self, key: str, value: str) -> None:
+        """Upsert a recognize appconfig value.
+
+        Used for the daemon heartbeat the admin page reads. Failures are
+        logged and swallowed: losing a heartbeat write must never take down
+        the inference loop.
+        """
+        t = self._table("appconfig")
+        try:
+            if self.dialect == "mysql":
+                sql = (
+                    f"INSERT INTO {t} (appid, configkey, configvalue) "
+                    f"VALUES ({self._ph()}, {self._ph()}, {self._ph()}) "
+                    f"ON DUPLICATE KEY UPDATE configvalue = VALUES(configvalue)"
+                )
+            else:
+                sql = (
+                    f"INSERT INTO {t} (appid, configkey, configvalue) "
+                    f"VALUES ({self._ph()}, {self._ph()}, {self._ph()}) "
+                    f"ON CONFLICT (appid, configkey) DO UPDATE SET configvalue = EXCLUDED.configvalue"
+                )
+            self._execute(sql, ("recognize", key, value))
+            self._commit()
+        except Exception:
+            log.warning("Could not write appconfig %s", key, exc_info=True)
+
     def get_enabled_models(self) -> set[str] | None:
         """Read the enabled classifiers from Nextcloud's appconfig.
 

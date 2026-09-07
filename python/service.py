@@ -119,6 +119,11 @@ class Service:
         Pass order: faces → imagenet+landmarks → movinet → musicnn
         """
         while self._running:
+            # Heartbeat: the admin page reads daemon.lastSeen to tell whether
+            # the daemon is alive. Written before the maintenance-mode check so
+            # a paused daemon still reports itself as running.
+            self.pipeline.db.set_app_value("daemon.lastSeen", str(int(time.time())))
+
             # Check maintenance mode
             if self.pipeline.db.check_maintenance_mode():
                 log.info("Nextcloud in maintenance mode, waiting...")

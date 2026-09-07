@@ -86,6 +86,27 @@ final class AdminController extends Controller {
 		return new JSONResponse([]);
 	}
 
+	/**
+	 * Health of the Python inference daemon.
+	 *
+	 * This replaces the TensorFlow/Node probes (libtensorflow, wasmtensorflow,
+	 * gputensorflow, nodejs, avx, musl, platform). That runtime was removed
+	 * when classification moved to the daemon, so those checks could only ever
+	 * report failure — and the settings UI was gated behind them.
+	 */
+	public function daemon(): JSONResponse {
+		$lastSeen = (int)$this->config->getAppValueString('daemon.lastSeen', '0');
+		$pending = $this->pending->countByMediaType();
+		return new JSONResponse([
+			'lastSeen' => $lastSeen ?: null,
+			'ageSeconds' => $lastSeen ? (time() - $lastSeen) : null,
+			// The daemon heartbeats every poll; a few minutes of silence means
+			// it is stopped or wedged.
+			'healthy' => $lastSeen > 0 && (time() - $lastSeen) < 600,
+			'pending' => array_sum($pending),
+		]);
+	}
+
 	public function count(): JSONResponse {
 		$count = count($this->tagManager->findClassifiedFiles());
 		return new JSONResponse(['count' => $count]);
@@ -139,77 +160,10 @@ final class AdminController extends Controller {
 		]);
 	}
 
-	public function avx(): JSONResponse {
-		try {
-			$cpuinfo = file_get_contents('/proc/cpuinfo');
-		} catch (\Throwable $e) {
-			return new JSONResponse(['avx' => null]);
-		}
-		return new JSONResponse(['avx' => $cpuinfo !== false && strpos($cpuinfo, 'avx') !== false]);
-	}
 
-	public function platform(): JSONResponse {
-		return new JSONResponse(['platform' => php_uname('m')]);
-	}
 
-	public function musl(): JSONResponse {
-		try {
-			exec('ldd /bin/sh' . ' 2>&1', $output, $returnCode);
-		} catch (\Throwable $e) {
-			return new JSONResponse(['musl' => null]);
-		}
 
-		if ($returnCode !== 0) {
-			return new JSONResponse(['musl' => null]);
-		}
 
-		$ldd = trim(implode("\n", $output));
-		return new JSONResponse(['musl' => strpos($ldd, 'musl') !== false]);
-	}
-
-	public function nice(): JSONResponse {
-		/* use nice binary from settings if available */
-		if ($this->config->getAppValueString('nice_binary', '') !== '') {
-			$nice_path = $this->config->getAppValueString('nice_binary');
-		} else {
-			/* returns the path to the nice binary or false if not found */
-			$nice_path = $this->binaryFinder->findBinaryPath('nice');
-		}
-
-		if ($nice_path !== false) {
-			$this->config->setAppValueString('nice_binary', $nice_path);
-		} else {
-			$this->config->setAppValueString('nice_binary', '');
-			return new JSONResponse(['nice' => false]);
-		}
-
-		try {
-			exec($nice_path . ' true' . ' 2>&1', $output, $returnCode);
-		} catch (\Throwable $e) {
-			return new JSONResponse(['nice' => false]);
-		}
-
-		if ($returnCode !== 0) {
-			return new JSONResponse(['nice' => false]);
-		}
-
-		return new JSONResponse(['nice' => $nice_path]);
-	}
-
-	public function nodejs(): JSONResponse {
-		try {
-			exec($this->settingsService->getSetting('node_binary') . ' --version' . ' 2>&1', $output, $returnCode);
-		} catch (\Throwable $e) {
-			return new JSONResponse(['nodejs' => null]);
-		}
-
-		if ($returnCode !== 0) {
-			return new JSONResponse(['nodejs' => false]);
-		}
-
-		$version = trim(implode("\n", $output));
-		return new JSONResponse(['nodejs' => $version]);
-	}
 
 	public function ffmpeg(): JSONResponse {
 		try {
@@ -248,65 +202,9 @@ final class AdminController extends Controller {
 		return new JSONResponse(['python' => $version]);
 	}
 
-	public function pythontensorflow(): JSONResponse {
-		$pythonBinary = $this->settingsService->getSetting('python_binary');
-		if ($pythonBinary === '') {
-			return new JSONResponse(['pythontensorflow' => false]);
-		}
-		try {
-			exec($pythonBinary . ' ' . __DIR__ . '/../../python/test_tensorflow.py' . ' 2>&1', $output, $returnCode);
-		} catch (\Throwable $e) {
-			return new JSONResponse(['pythontensorflow' => false]);
-		}
 
-		if ($returnCode !== 0) {
-			return new JSONResponse(['pythontensorflow' => false]);
-		}
 
-		return new JSONResponse(['pythontensorflow' => true]);
-	}
 
-	public function libtensorflow(): JSONResponse {
-		try {
-			exec($this->settingsService->getSetting('node_binary') . ' ' . __DIR__ . '/../../src/test_libtensorflow.js' . ' 2>&1', $output, $returnCode);
-		} catch (\Throwable $e) {
-			return new JSONResponse(['libtensorflow' => false]);
-		}
-
-		if ($returnCode !== 0) {
-			return new JSONResponse(['libtensorflow' => false]);
-		}
-
-		return new JSONResponse(['libtensorflow' => true]);
-	}
-
-	public function wasmtensorflow(): JSONResponse {
-		try {
-			exec($this->settingsService->getSetting('node_binary') . ' ' . __DIR__ . '/../../src/test_wasmtensorflow.js' . ' 2>&1', $output, $returnCode);
-		} catch (\Throwable $e) {
-			return new JSONResponse(['wasmtensorflow' => false]);
-		}
-
-		if ($returnCode !== 0) {
-			return new JSONResponse(['wasmtensorflow' => false]);
-		}
-
-		return new JSONResponse(['wasmtensorflow' => true]);
-	}
-
-	public function gputensorflow(): JSONResponse {
-		try {
-			exec($this->settingsService->getSetting('node_binary') . ' ' . __DIR__ . '/../../src/test_gputensorflow.js' . ' 2>&1', $output, $returnCode);
-		} catch (\Throwable $e) {
-			return new JSONResponse(['gputensorflow' => false]);
-		}
-
-		if ($returnCode !== 0) {
-			return new JSONResponse(['gputensorflow' => false]);
-		}
-
-		return new JSONResponse(['gputensorflow' => true]);
-	}
 
 	public function cron(): JSONResponse {
 		try {
