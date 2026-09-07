@@ -111,7 +111,18 @@ final class PropFindPlugin extends ServerPlugin {
 				if ($file === null) {
 					return '';
 				}
-				$permissions = DavUtil::getDavPermissions($file->getFileInfo());
+				try {
+					// Two arguments since Nextcloud 25: the parent decides the
+					// 'N' (renamable) flag via canRename(). Calling this with one
+					// argument raises ArgumentCountError inside Sabre's property
+					// serialisation, which surfaces as an opaque HTTP 500 on the
+					// whole PROPFIND — taking the entire Faces view down.
+					$permissions = DavUtil::getDavPermissions($file, $file->getParent());
+				} catch (\Throwable $e) {
+					// A face detection can outlive access to its file's parent;
+					// an unreadable permission set must not fail the listing.
+					return '';
+				}
 				return str_replace('R', '', $permissions);
 			});
 
