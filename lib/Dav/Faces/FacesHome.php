@@ -76,13 +76,15 @@ final class FacesHome implements ICollection {
 	}
 
 	public function getChild($name) : FaceRoot {
-		if (count($this->children) !== 0) {
-			foreach ($this->getChildren() as $child) {
-				if ($child->getName() === $name) {
-					return $child;
-				}
+		// Serve from the already-built listing when it is there, but never
+		// conclude "not found" from it: getChildren() omits clusters below
+		// MIN_LISTED_CLUSTER_SIZE, so a hidden cluster would become
+		// unreachable the moment a PROPFIND had run in the same request.
+		// Fall through to the lookup below instead.
+		foreach ($this->children as $child) {
+			if ($child->getName() === $name) {
+				return $child;
 			}
-			throw new NotFound();
 		}
 		try {
 			$cluster = $this->faceClusterMapper->findByUserAndTitle($this->user->getUID(), $name);
