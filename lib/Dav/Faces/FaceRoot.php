@@ -268,9 +268,23 @@ final class FaceRoot implements ICollection, IMoveTarget {
 				return json_encode(null);
 			}
 		}
+		// Emit only what the client reads. The Photos app's FaceCoverMixin uses
+		// fileid (to build the preview URL) and detection x/y/width/height (to
+		// frame the crop); toArray() also carried id, userId, fileId, clusterId
+		// and threshold, none of which are consumed.
+		//
+		// Coordinates are rounded to 5 decimals: the cover is a 128px circle at
+		// up to 6x zoom, so the finest distinguishable step is ~1/768, and 14
+		// significant digits cost bytes on every cluster. This property is
+		// emitted once per cluster and there can be thousands.
 		return json_encode([
 			'fileid' => $detection->getFileId(),
-			'detection' => $detection->toArray()
+			'detection' => [
+				'x' => round($detection->getX(), 5),
+				'y' => round($detection->getY(), 5),
+				'width' => round($detection->getWidth(), 5),
+				'height' => round($detection->getHeight(), 5),
+			],
 		], \JSON_THROW_ON_ERROR);
 	}
 }
