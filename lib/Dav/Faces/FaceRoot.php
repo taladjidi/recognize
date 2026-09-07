@@ -7,6 +7,8 @@
 declare(strict_types=1);
 namespace OCA\Recognize\Dav\Faces;
 
+use OC\Files\Search\SearchComparison;
+use OC\Files\Search\SearchQuery;
 use OCA\Recognize\Db\FaceCluster;
 use OCA\Recognize\Db\FaceClusterMapper;
 use OCA\Recognize\Db\FaceDetection;
@@ -14,7 +16,9 @@ use OCA\Recognize\Db\FaceDetectionMapper;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\AppFramework\Db\MultipleObjectsReturnedException;
 use OCP\DB\Exception;
+use OCP\Files\File;
 use OCP\Files\IRootFolder;
+use OCP\Files\Search\ISearchComparison;
 use OCP\IPreview;
 use OCP\ITagManager;
 use OCP\ITags;
@@ -132,6 +136,34 @@ final class FaceRoot implements ICollection, IMoveTarget {
 			$favoritesLoaded = false;
 		}
 
+		// Resolve every file in one go. Nextcloud has no batch id->node method,
+		// and getFirstNodeById() costs exactly one DB query per photo (measured:
+		// 1284 queries / 547 ms for this cluster). The search API accepts
+		// COMPARE_IN on fileid and returns fully hydrated nodes — 2 queries,
+		// 53 ms — so has-preview and permissions still work without extra
+		// lookups. The Files app never hits this because a real folder can be
+		// listed in one call; a face cluster is a virtual collection.
+		$filesById = [];
+		try {
+			foreach (array_chunk($fileIds, 1000) as $chunk) {
+				$query = new SearchQuery(
+					new SearchComparison(ISearchComparison::COMPARE_IN, 'fileid', $chunk),
+					0,
+					0,
+					[],
+					$this->user,
+				);
+				foreach ($userFolder->search($query) as $node) {
+					if ($node instanceof File) {
+						$filesById[$node->getId()] = $node;
+					}
+				}
+			}
+		} catch (\Throwable $e) {
+			// Fall back to per-photo resolution rather than failing the listing.
+			$filesById = [];
+		}
+
 		$detectionsByFile = [];
 		$detectionsLoaded = false;
 		try {
@@ -141,11 +173,12 @@ final class FaceRoot implements ICollection, IMoveTarget {
 			$detectionsLoaded = false;
 		}
 
-		$this->children = array_map(function (FaceDetection $detection) use ($userFolder, $favorites, $favoritesLoaded, $detectionsByFile, $detectionsLoaded) {
+		$this->children = array_map(function (FaceDetection $detection) use ($userFolder, $favorites, $favoritesLoaded, $detectionsByFile, $detectionsLoaded, $filesById) {
 			$photo = new FacePhoto($this->detectionMapper, $detection, $userFolder, $this->tagManager, $this->previewManager);
 			$photo->setPreloadedData(
 				$favoritesLoaded ? ($favorites[$detection->getFileId()] ?? false) : null,
 				$detectionsLoaded ? ($detectionsByFile[$detection->getFileId()] ?? []) : null,
+				$filesById[$detection->getFileId()] ?? null,
 			);
 			return $photo;
 		}, $detections);

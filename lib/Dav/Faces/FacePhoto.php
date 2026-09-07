@@ -47,9 +47,14 @@ class FacePhoto implements IFile {
 	 *
 	 * @param ?list<\OCA\Recognize\Db\FaceDetectionWithTitle> $detections
 	 */
-	public function setPreloadedData(?bool $isFavorite, ?array $detections): void {
+	public function setPreloadedData(?bool $isFavorite, ?array $detections, ?File $file = null): void {
 		$this->preloadedFavorite = $isFavorite;
 		$this->preloadedDetections = $detections;
+		if ($file !== null) {
+			// Resolved in bulk by FaceRoot. Without this every photo runs its
+			// own getFirstNodeById(), which is one DB query each.
+			$this->file = $file;
+		}
 	}
 
 	/** @return ?list<\OCA\Recognize\Db\FaceDetectionWithTitle> */
