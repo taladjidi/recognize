@@ -57,7 +57,9 @@ def test_crop_is_turned_upright_like_the_photo(tmp_path, orientation, expected):
     bx, by = _centroid(full, (0, 0, 255))
     assert got == (int(np.sign(fx - bx)), int(np.sign(fy - by))) == expected
     bcx, bcy = _centroid(crop, (0, 0, 255))
-    assert abs(bcx - CROP_SIZE / 2) < 8 and abs(bcy - CROP_SIZE / 2) < 8  # face stays centred
+    # Face centred horizontally, below centre by the head room: 100 px face, side 1.4 * 100,
+    # centre raised 12 px -> 12 * 256 / 140 = 21.9 px lower in the upright crop.
+    assert abs(bcx - CROP_SIZE / 2) < 8 and abs(bcy - (CROP_SIZE / 2 + 21.9)) < 8
 
 
 def _region_diff(img, box, region):
@@ -73,20 +75,21 @@ def _gradient():
 def test_box_near_edge_is_shifted_inside_and_stays_square():
     img = _gradient()
     box = {"x": 0.95, "y": 0.9, "width": 0.05, "height": 0.1}  # 20 x 30 px at the corner
-    # side 2.0 * 30 = 60, pushed back inside: (340, 240)-(400, 300)
-    assert _region_diff(img, box, (340, 240, 400, 300)) < 3
+    # side 1.4 * 30 = 42 around (390, 285 - 0.12 * 30), pushed back inside: (358, 258)-(400, 300)
+    assert _region_diff(img, box, (358, 258, 400, 300)) < 3
 
 
 def test_box_larger_than_image_is_clamped_to_the_short_side():
     img = _gradient()
-    # side min(2.0 * 400, 400, 300) = 300, centred on x then shifted: (50, 0)-(350, 300)
+    # side min(1.4 * 400, 400, 300) = 300, centred on x, raised then shifted: (50, 0)-(350, 300)
     assert _region_diff(img, {"x": 0, "y": 0, "width": 1, "height": 1}, (50, 0, 350, 300)) < 3
 
 
-def test_expansion_is_twice_the_larger_side_around_the_centre():
+def test_expansion_is_1_4x_the_larger_side_with_head_room():
     img = _gradient()
     box = {"x": 0.4, "y": 0.4, "width": 0.1, "height": 0.2}  # 40 x 60 px, centre (180, 150)
-    assert _region_diff(img, box, (120, 90, 240, 210)) < 3
+    # side 1.4 * 60 = 84 around (180, 150 - 0.12 * 60 = 142.8)
+    assert _region_diff(img, box, (138, 100.8, 222, 184.8)) < 3
 
 
 def test_tiny_box_still_gives_a_valid_crop():
@@ -315,3 +318,28 @@ def test_face_classifier_crops_align_with_faces_on_raw_pixels(tmp_path):
     faces, out = clf.classify_with_crops(path)
     assert seen == [(H, W, 3)]  # detection sees raw (unrotated) pixels
     assert len(out) == len(faces) == 2 and all(_decode(c).shape == (CROP_SIZE, CROP_SIZE, 3) for c in out)
+
+
+@pytest.mark.parametrize("orientation", range(1, 9))
+def test_crop_equals_upright_photo_cropped_with_head_room(orientation):
+    """make_crop on raw pixels == exif-transposing the photo first, then cropping the
+    upright box (EXPAND x, centre raised by UP_SHIFT of the face height). Pins the
+    'up' direction for every EXIF orientation."""
+    raw = _gradient()
+    box = {"x": 0.30, "y": 0.35, "width": 0.20, "height": 0.25}  # 80 x 75 px raw
+    got = _decode(make_crop(raw, box, orientation))
+    mask = Image.new("L", raw.size, 0)
+    mask.paste(255, (int(box["x"] * W), int(box["y"] * H),
+                     int((box["x"] + box["width"]) * W), int((box["y"] + box["height"]) * H)))
+    t = crops._ORIENT.get(orientation)
+    up_img, up_mask = (raw.transpose(t), mask.transpose(t)) if t is not None else (raw, mask)
+    l, tp, r, b = up_mask.getbbox()
+    uw, uh = up_img.size
+    bw, bh = r - l, b - tp
+    side = min(crops.EXPAND * max(bw, bh), uw, uh)
+    cx, cy = l + bw / 2, tp + bh / 2 - crops.UP_SHIFT * bh
+    left = min(max(cx - side / 2, 0), uw - side)
+    top = min(max(cy - side / 2, 0), uh - side)
+    ref = np.asarray(up_img.resize((CROP_SIZE, CROP_SIZE), Image.Resampling.LANCZOS,
+                                   box=(left, top, left + side, top + side))).astype(int)
+    assert np.abs(got - ref).mean() < 3

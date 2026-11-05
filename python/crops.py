@@ -19,7 +19,11 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CROP_ROOT = "/var/lib/nextcloud/recognize-faces"
 CROP_SIZE = 256
-EXPAND = 2.0
+# Framing, chosen on a circle-rendered contact sheet of 12 real covers (2026-11-05):
+# 2.0x pulled neighbours into large-face covers, 1.4x with the centre raised by 12% of
+# the face height fills the round cover with the face and keeps the hair.
+EXPAND = 1.4
+UP_SHIFT = 0.12
 QUALITY = 82
 CROP_NAME_RE = re.compile(r"^([0-9]+)\.jpg$")
 
@@ -34,6 +38,8 @@ _ORIENT = {
     7: Image.Transpose.TRANSVERSE,
     8: Image.Transpose.ROTATE_90,
 }
+# Direction of upright 'up' in raw pixel space, per EXIF orientation (box is in raw coordinates).
+_UP = {1: (0, -1), 2: (0, -1), 3: (0, 1), 4: (0, 1), 5: (-1, 0), 6: (-1, 0), 7: (1, 0), 8: (1, 0)}
 
 _enospc_logged = False
 
@@ -44,7 +50,7 @@ def crop_side(img_w, img_h, box):
 
 
 def make_crop(img, box, orientation=1):
-    """JPEG bytes of the square around box (EXPAND x its larger side, kept inside img).
+    """JPEG bytes of the square around box (EXPAND x its larger side, raised by UP_SHIFT, kept inside img).
 
     img is the raw (not EXIF-rotated) RGB image the box was detected on.
     """
@@ -52,6 +58,11 @@ def make_crop(img, box, orientation=1):
     side = crop_side(w, h, box)
     cx = (box["x"] + box["width"] / 2) * w
     cy = (box["y"] + box["height"] / 2) * h
+    # Head room: raise the centre (in upright terms) so the hair, not the neck, gets the space.
+    dx, dy = _UP.get(orientation, (0, -1))
+    upright_face_h = box["width"] * w if dx else box["height"] * h
+    cx += dx * UP_SHIFT * upright_face_h
+    cy += dy * UP_SHIFT * upright_face_h
     # Clamp by shifting the square inside the image, so it stays square (no distortion).
     left = min(max(cx - side / 2, 0.0), w - side)
     top = min(max(cy - side / 2, 0.0), h - side)
