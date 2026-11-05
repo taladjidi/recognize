@@ -111,6 +111,36 @@ def test_atomic_write_modes_and_no_temp_left(tmp_path):
     assert os.listdir(root / "alice") == ["7.jpg"]
 
 
+@pytest.mark.parametrize("umask", [0o022, 0o077])
+def test_user_dir_keeps_setgid_group_of_the_root(tmp_path, umask):
+    """deploy.sh makes the root apache:nginx 2750; apache is not in group nginx, so any chmod
+    it makes on the user dir drops S_ISGID (Linux: non-member chmod clears it silently) and
+    files then land group apache -> nginx 403. Modelled here by a chmod that clears S_ISGID."""
+    import stat
+    root = tmp_path / "crops"
+    root.mkdir()
+    os.chmod(root, 0o2750)
+    real_chmod = os.chmod
+
+    def non_member_chmod(path, mode, *a, **kw):
+        real_chmod(path, mode & ~stat.S_ISGID, *a, **kw)
+
+    old = os.umask(umask)
+    try:
+        with patch("crops.os.chmod", non_member_chmod):
+            assert write_crop(str(root), "alice", 7, b"x")
+    finally:
+        os.umask(old)
+    d = os.stat(root / "alice")
+    assert d.st_gid == os.stat(root).st_gid
+    if umask == 0o022:  # systemd's default service umask
+        assert d.st_mode & 0o7777 == 0o2750
+    else:
+        assert d.st_mode & 0o777 == 0o750  # odd umask: readable, setgid lost (logged)
+    f = os.stat(root / "alice" / "7.jpg")
+    assert f.st_gid == os.stat(root).st_gid and f.st_mode & 0o777 == 0o640
+
+
 def test_failed_replace_keeps_old_crop_and_cleans_temp(tmp_path):
     root = tmp_path / "crops"
     root.mkdir()

@@ -16,8 +16,8 @@ namespace OCA\Recognize\Service;
  * No dependencies, so tools/check_token.php can load it without Nextcloud.
  */
 final class FacesToken {
-	/** The verifier rejects exp > now + 3600 (+60 s skew). */
-	public const TTL = 3600;
+	/** python/api_server.py TOKEN_MAX_TTL: it rejects exp > now + 300 (+60 s skew). */
+	public const TTL = 300;
 
 	public static function mint(string $secret, string $uid, int $exp): string {
 		$payload = json_encode(['v' => 1, 'uid' => $uid, 'exp' => $exp], JSON_THROW_ON_ERROR);

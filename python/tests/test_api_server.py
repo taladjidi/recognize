@@ -3,13 +3,20 @@
 import base64
 import hashlib
 import hmac
+import http.client
 import json
+import logging
 import os
+import re
 import shutil
+import socket
+import stat
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -28,7 +35,7 @@ def b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def mint(uid="alice", exp=NOW + 3600, secret=SECRET, payload=None) -> str:
+def mint(uid="alice", exp=NOW + 300, secret=SECRET, payload=None) -> str:
     raw = payload if payload is not None else json.dumps({"v": 1, "uid": uid, "exp": exp}).encode()
     return f"Bearer {b64(raw)}.{b64(hmac.new(secret.encode(), raw, hashlib.sha256).digest())}"
 
@@ -44,8 +51,8 @@ class TestToken:
         assert verify_token(mint(exp=NOW - 1), SECRET, now=NOW) is None
 
     def test_too_far_in_future(self):
-        assert verify_token(mint(exp=NOW + 3660), SECRET, now=NOW) == "alice"  # 60 s skew allowed
-        assert verify_token(mint(exp=NOW + 3661), SECRET, now=NOW) is None
+        assert verify_token(mint(exp=NOW + 360), SECRET, now=NOW) == "alice"  # 300 s + 60 s skew
+        assert verify_token(mint(exp=NOW + 361), SECRET, now=NOW) is None
 
     def test_wrong_secret(self):
         assert verify_token(mint(secret="other"), SECRET, now=NOW) is None
@@ -54,7 +61,7 @@ class TestToken:
     def test_tampered_payload(self):
         good = mint()
         _, sig = good.split(".")
-        forged = b64(json.dumps({"v": 1, "uid": "bob", "exp": NOW + 3600}).encode())
+        forged = b64(json.dumps({"v": 1, "uid": "bob", "exp": NOW + 300}).encode())
         assert verify_token(f"Bearer {forged}.{sig}", SECRET, now=NOW) is None
 
     def test_tampered_signature(self):
@@ -89,12 +96,12 @@ class TestToken:
                                  capture_output=True, text=True, check=True)
             return "Bearer " + out.stdout.strip()
 
-        token = php("s3cr3t", "élise/o'k", NOW + 3600)
+        token = php("s3cr3t", "élise/o'k", NOW + 300)
         assert verify_token(token, "s3cr3t", now=NOW) == "élise/o'k"
-        assert verify_token(token, "s3cr3t", now=NOW + 3600) is None
+        assert verify_token(token, "s3cr3t", now=NOW + 300) is None
         assert verify_token(token, "wrong", now=NOW) is None
         payload, sig = token[len("Bearer "):].split(".")
-        other = php("s3cr3t", "mallory", NOW + 3600).split(".")[0]
+        other = php("s3cr3t", "mallory", NOW + 300).split(".")[0]
         assert verify_token(f"{other}.{sig}", "s3cr3t", now=NOW) is None
 
 
@@ -146,7 +153,8 @@ def config(request, tmp_path):
 def db(config):
     d = DB(config)
     text = "TEXT" if d.dialect == "sqlite3" else "VARCHAR(4000) COLLATE utf8mb4_bin"
-    for table in ("storages", "mimetypes", "filecache", "recognize_face_detections", "recognize_face_clusters"):
+    for table in ("storages", "mimetypes", "filecache", "recognize_face_detections", "recognize_face_clusters",
+                  "users", "preferences"):
         d._execute(f"DROP TABLE IF EXISTS oc_{table}")
     d.create_face_detections_table()
     d.create_face_clusters_table()
@@ -155,11 +163,17 @@ def db(config):
         f"CREATE TABLE oc_mimetypes (id INTEGER PRIMARY KEY, mimetype {text})",
         f"CREATE TABLE oc_filecache (fileid INTEGER PRIMARY KEY, storage INTEGER, path {text}, name {text},"
         f" mimetype INTEGER, etag {text}, mtime INTEGER, size BIGINT)",
+        f"CREATE TABLE oc_users (uid {text}, displayname {text})",
+        f"CREATE TABLE oc_preferences (userid {text}, appid {text}, configkey {text}, configvalue {text})",
     ):
         d._execute(sql)
     rows = {
         "oc_storages": [(1, "home::alice"), (2, "home::bob"), (3, "object::user:carol")],
         "oc_mimetypes": [(1, "image/jpeg")],
+        "oc_users": [("alice", "Alice"), ("bob", "Bob"), ("carol", "Carol"), ("dave", "Dave")],
+        # dave is disabled; alice's other prefs (and another app's "enabled") do not disable her
+        "oc_preferences": [("dave", "core", "enabled", "false"), ("alice", "core", "enabled", "true"),
+                           ("alice", "files", "enabled", "false"), ("bob", "core", "lang", "false")],
         "oc_filecache": [
             (10, 1, "files/Photos/a.jpg", "a.jpg", 1, "e10", 100, 1000),
             (11, 1, "files/b.jpg", "b.jpg", 1, "e11", 200, 1100),
@@ -246,10 +260,9 @@ def server(config, db):
 
 
 def get(base, path, uid="alice", token=None):
-    import time
     headers = {}
     if uid is not None:
-        headers["Authorization"] = token or mint(uid, exp=int(time.time()) + 3000)
+        headers["Authorization"] = token or mint(uid, exp=int(time.time()) + 250)
     try:
         with urllib.request.urlopen(urllib.request.Request(base + path, headers=headers)) as r:
             return r.status, r.headers, json.load(r)
@@ -259,7 +272,7 @@ def get(base, path, uid="alice", token=None):
 
 class TestHttp:
     def test_health_needs_no_token(self, server):
-        assert get(server, "/v1/health", uid=None)[::2] == (200, {"status": "ok"})
+        assert get(server, "/v1/health", uid=None)[::2] == (200, {"ok": True})
 
     def test_no_or_bad_token_is_401_without_detail(self, server):
         assert get(server, "/v1/clusters", uid=None)[::2] == (401, {})
@@ -296,6 +309,81 @@ class TestHttp:
         assert get(server, "/v1/nope")[0] == 404
 
 
+class TestUsers:
+    def test_unknown_or_disabled_user_is_401(self, server):
+        assert get(server, "/v1/clusters", uid="bob")[0] == 200
+        assert get(server, "/v1/clusters", uid="mallory")[::2] == (401, {})  # validly signed, no such user
+        assert get(server, "/v1/clusters", uid="dave")[::2] == (401, {})  # disabled
+
+    def test_user_check_is_cached_60s(self, config, db):
+        api = api_server.Api(config)
+        clock = [1000.0]
+        with patch("api_server.time.monotonic", lambda: clock[0]):
+            assert api.user_ok("alice")
+            db._execute("INSERT INTO oc_preferences VALUES ('alice', 'core', 'enabled', 'false')")
+            db._execute("DELETE FROM oc_preferences WHERE userid = 'alice' AND configvalue = 'true'")
+            db.commit()
+            clock[0] += 59
+            assert api.user_ok("alice")  # cached
+            clock[0] += 2
+            assert not api.user_ok("alice")  # re-read after 60 s: now disabled
+
+
+class TestLoad:
+    def test_health_never_touches_the_db(self, config):
+        with patch("api_server.DB", side_effect=AssertionError("health opened a DB connection")):
+            assert api_server.Api(config).handle("/v1/health", {}, None) == (200, {"ok": True})
+
+    def test_503_when_db_slots_are_taken(self, config, db, monkeypatch):
+        monkeypatch.setattr(api_server, "DB_WAIT", 0.05)
+        api = api_server.Api(config)
+        token = mint(exp=int(time.time()) + 250)
+        assert api.handle("/v1/clusters", {}, token)[0] == 200
+        for _ in range(api_server.DB_SLOTS):
+            assert api._db_slots.acquire(blocking=False)
+        assert not api._db_slots.acquire(blocking=False)  # bounded at DB_SLOTS
+        assert api.handle("/v1/clusters", {}, token)[0] == 503
+        assert api.handle("/v1/health", {}, None)[0] == 200
+        api._db_slots.release()
+        assert api.handle("/v1/clusters", {}, token)[0] == 200
+
+    def test_connection_flood_is_capped(self, config, db, monkeypatch):
+        """Idle connections hold handler slots; past the cap new ones are dropped, not threaded."""
+        monkeypatch.setattr(api_server, "MAX_HANDLERS", 2)
+        monkeypatch.setattr(api_server, "HANDLER_WAIT", 0.1)
+        srv = make_server(config, port=0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        idle = [socket.create_connection(srv.server_address[:2]) for _ in range(2)]
+        try:
+            time.sleep(0.2)  # both accepted and parked in a handler
+            with pytest.raises((urllib.error.URLError, ConnectionError, http.client.HTTPException)):
+                get(base, "/v1/health", uid=None)
+            assert threading.active_count() < 10
+        finally:
+            for s in idle:
+                s.close()
+        time.sleep(0.2)
+        assert get(base, "/v1/health", uid=None)[0] == 200
+        srv.shutdown()
+        srv.server_close()
+
+    def test_handler_timeout(self):
+        assert api_server.Handler.timeout == 30
+
+
+def test_log_has_path_not_query(server, caplog):
+    with caplog.at_level(logging.INFO, logger="recognize.api"):
+        get(server, "/v1/search?q=Secret%20Name")
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "/v1/search" in text and "Secret" not in text and "q=" not in text
+
+
+def test_php_ttl_matches_verifier():
+    src = open(os.path.join(REPO, "lib", "Service", "FacesToken.php")).read()
+    assert re.search(r"const TTL = (\d+);", src).group(1) == str(api_server.TOKEN_MAX_TTL) == "300"
+
+
 def test_pool_reconnects_after_dropped_connection(config, db):
     api = api_server.Api(config)
     assert ids(api._with_db(lambda d: list_clusters(d, "alice", CROP))) == [1, 3]
@@ -318,3 +406,64 @@ def test_generated_nginx_and_unit():
     unit = setup_config.generate_service_file({}, "/nc", "/venv/bin/python", setup_config.API_SERVICE_TEMPLATE)
     assert "ExecStart=/venv/bin/python api_server.py " in unit and "Restart=on-failure" in unit
     assert "NoNewPrivileges=true" in unit and "__" not in unit
+
+
+def test_crop_location_keeps_security_headers_and_python_dir_denied():
+    import setup_config
+    conf = setup_config.generate_nginx_conf({"crop_link_secret": "S3"})
+    crop = conf[conf.index("location ^~ /recognize-faces/"):]
+    crop = crop[:crop.index("\n}")]
+    # add_header in a location drops every server-level one: these are copied from nextcloud.conf.
+    for header in ('add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;',
+                   "add_header Referrer-Policy no-referrer always;",
+                   'add_header X-Robots-Tag "noindex, nofollow";',
+                   "add_header X-Content-Type-Options nosniff;",
+                   'add_header Cache-Control "private, max-age=21600";'):
+        assert header in crop
+    assert "location ^~ /apps/recognize/python/ { deny all; }" in conf
+
+
+def test_secret_goes_to_php_on_stdin_never_in_argv(monkeypatch):
+    import setup_config
+    calls = []
+    monkeypatch.setattr(setup_config.subprocess, "run", lambda cmd, **kw: calls.append((cmd, kw)))
+    for root in (False, True):
+        monkeypatch.setattr(setup_config.os, "getuid", lambda: 0 if root else 1000)
+        assert setup_config.store_secret_in_nextcloud("/nc", "TOPSECRET-1", "api_token_secret")
+    for (cmd, kw), root in zip(calls, (False, True)):
+        assert not any("TOPSECRET" in a for a in cmd)
+        assert kw["input"] == "TOPSECRET-1" and kw["check"] is True
+        php = cmd[cmd.index("php"):]
+        assert php[1] == "-r" and php[3:] == ["api_token_secret"]
+        assert "require '/nc/lib/base.php';" in php[2] and "stream_get_contents(STDIN)" in php[2]
+        assert "setValueString('recognize', $argv[1], $value, sensitive: true)" in php[2]
+        assert (cmd[0] == "sudo") == (root and setup_config._detect_web_user() is not None)
+    monkeypatch.undo()  # real subprocess.run for the lint
+    if shutil.which("php"):
+        lint = subprocess.run(["php", "-l"], input="<?php " + calls[0][0][-2], capture_output=True, text=True)
+        assert lint.returncode == 0, lint.stdout + lint.stderr
+
+
+def test_setup_keeps_custom_crop_root_and_tightens_existing_secret_files(tmp_path, monkeypatch):
+    import setup_config
+    out = {k: str(tmp_path / n) for k, n in (("OUTPUT_CONFIG", "nc_config.json"), ("OUTPUT_SERVICE", "r.service"),
+                                            ("OUTPUT_API_SERVICE", "a.service"), ("OUTPUT_NGINX", "n.conf"))}
+    for k, v in out.items():
+        monkeypatch.setattr(setup_config, k, v)
+    with open(out["OUTPUT_CONFIG"], "w") as f:
+        json.dump({"face_crop_root": "/srv/custom", "api_token_secret": "keep-a", "crop_link_secret": "keep-c"}, f)
+    with open(out["OUTPUT_NGINX"], "w") as f:
+        f.write("old")
+    os.chmod(out["OUTPUT_CONFIG"], 0o644)
+    os.chmod(out["OUTPUT_NGINX"], 0o644)
+    monkeypatch.setattr(setup_config, "read_nextcloud_config", lambda root: {
+        "dbtype": "mysql", "dbhost": "h", "dbname": "n", "dbuser": "u", "dbpassword": "p", "datadirectory": "/d"})
+    monkeypatch.setattr(setup_config, "store_secret_in_nextcloud", lambda *a, **kw: True)
+    monkeypatch.setattr(setup_config.sys, "argv", ["setup_config.py", "--nextcloud-root", "/nc"])
+    setup_config.main()
+    cfg = json.load(open(out["OUTPUT_CONFIG"]))
+    assert cfg["face_crop_root"] == "/srv/custom"
+    assert (cfg["api_token_secret"], cfg["crop_link_secret"]) == ("keep-a", "keep-c")
+    assert stat.S_IMODE(os.stat(out["OUTPUT_CONFIG"]).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(out["OUTPUT_NGINX"]).st_mode) == 0o600
+    assert "alias /srv/custom/;" in open(out["OUTPUT_NGINX"]).read()

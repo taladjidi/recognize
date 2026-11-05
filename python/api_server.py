@@ -18,6 +18,7 @@ import logging
 import queue
 import re
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
@@ -28,13 +29,18 @@ from db import DB
 log = logging.getLogger("recognize.api")
 
 DEFAULT_PORT = 8291
-TOKEN_MAX_TTL = 3600
+TOKEN_MAX_TTL = 300  # lib/Service/FacesToken.php TTL
 CLOCK_SKEW = 60
 CROP_PREFIX = "/recognize-faces"
 CROP_TTL = 6 * 3600
 MAX_Q = 100
 MAX_LIMIT = 1000
 POOL_IDLE = 8
+DB_SLOTS = 8  # concurrent DB connections; more requests wait DB_WAIT s, then 503
+DB_WAIT = 2.0
+MAX_HANDLERS = 32  # concurrent connections; more wait HANDLER_WAIT s in the listen backlog, then are dropped
+HANDLER_WAIT = 5.0
+USER_CACHE_TTL = 60
 _B64URL = re.compile(r"[A-Za-z0-9_-]+")
 _CLUSTER_PATH = re.compile(r"/v1/clusters/(\d{1,18})")
 
@@ -179,14 +185,28 @@ def _int(qs: dict, name: str, default: int, lo: int, hi: int) -> int:
     return value
 
 
+class Busy(Exception):
+    pass
+
+
 class Api:
     def __init__(self, config: dict):
         self.config = config
         self.token_secret = config.get("api_token_secret", "")
         self.crop_secret = config.get("crop_link_secret", "")
         self._idle = queue.SimpleQueue()
+        self._db_slots = threading.BoundedSemaphore(DB_SLOTS)
+        self._users = {}  # uid -> (ok, monotonic expiry); only validly signed uids get here
 
     def _with_db(self, fn):
+        if not self._db_slots.acquire(timeout=DB_WAIT):
+            raise Busy
+        try:
+            return self._with_conn(fn)
+        finally:
+            self._db_slots.release()
+
+    def _with_conn(self, fn):
         try:
             db = self._idle.get_nowait()
         except queue.Empty:
@@ -211,14 +231,34 @@ class Api:
                 else:
                     db.close()
 
+    def user_ok(self, uid: str) -> bool:
+        """uid exists in oc_users and is not disabled; cached USER_CACHE_TTL s."""
+        now = time.monotonic()
+        hit = self._users.get(uid)
+        if hit and hit[1] > now:
+            return hit[0]
+
+        def check(db):
+            p = db._ph()
+            if not db._execute(f"SELECT 1 FROM {db._table('users')} WHERE uid = {p}", (uid,)).fetchall():
+                return False
+            return not db._execute(
+                f"SELECT 1 FROM {db._table('preferences')} WHERE userid = {p} AND appid = 'core' "
+                f"AND configkey = 'enabled' AND configvalue = 'false'", (uid,)).fetchall()
+
+        ok = self._with_db(check)
+        self._users[uid] = (ok, now + USER_CACHE_TTL)
+        return ok
+
     def handle(self, path: str, qs: dict, auth: str | None) -> tuple[int, object]:
         if path == "/v1/health":
-            self._with_db(lambda db: db._execute("SELECT 1").fetchall())
-            return 200, {"status": "ok"}
+            return 200, {"ok": True}  # static: unauthenticated, so it must not cost a DB connection
         uid = verify_token(auth, self.token_secret)
         if uid is None:
             return 401, {}
         try:
+            if not self.user_ok(uid):
+                return 401, {}
             if path == "/v1/clusters":
                 min_count = _int(qs, "min", 1, 1, 10**9)
                 return 200, self._with_db(lambda db: list_clusters(db, uid, self.crop_secret, min_count))
@@ -236,6 +276,8 @@ class Api:
                 return 200, self._with_db(lambda db: list_clusters(db, uid, self.crop_secret, 1, q))
         except ValueError:
             return 400, {"error": "bad parameter"}
+        except Busy:
+            return 503, {"error": "busy"}
         return 404, {"error": "not found"}
 
 
@@ -247,6 +289,7 @@ def _json_default(o):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "recognize-api"
+    timeout = 30  # socket timeout: an idle or slow client frees its handler slot
 
     def do_GET(self):
         url = urlsplit(self.path)
@@ -265,15 +308,43 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def log_message(self, fmt, *args):
-        # The request line only: the token travels in a header and is never logged.
-        log.info(fmt, *args)
+        # Paths only: the query string carries search terms (person names); the token is a header.
+        log.info("%s", _QUERY.sub("", fmt % args))
+
+
+_QUERY = re.compile(r"\?[^\s\"']*")
+
+
+class Server(ThreadingHTTPServer):
+    """At most MAX_HANDLERS handler threads; past that, connections wait in the listen backlog."""
+    daemon_threads = True
+    request_queue_size = 64
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(MAX_HANDLERS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(timeout=HANDLER_WAIT):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def make_server(config: dict, host: str = "127.0.0.1", port: int | None = None) -> ThreadingHTTPServer:
     if port is None:
         port = int(config.get("api_port") or DEFAULT_PORT)
-    server = ThreadingHTTPServer((host, port), Handler)
-    server.daemon_threads = True
+    server = Server((host, port), Handler)
     server.api = Api(config)
     return server
 

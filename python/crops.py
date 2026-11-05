@@ -10,6 +10,7 @@ import io
 import logging
 import os
 import re
+import stat
 import tempfile
 
 from PIL import Image
@@ -101,8 +102,15 @@ def write_crop(root, user_id, detection_id, data):
     tmp = None
     try:
         if not os.path.isdir(d):
-            os.mkdir(d, 0o750)  # root itself must exist (deploy.sh): never created here
-            os.chmod(d, 0o750)
+            # Root itself must exist (deploy.sh, apache:nginx 2750): never created here. mkdir
+            # inherits its setgid group, so files land group nginx. No chmod unless the umask
+            # took bits: apache is not in group nginx, so its chmod would clear S_ISGID.
+            os.mkdir(d, 0o750)
+            mode = os.stat(d).st_mode
+            if mode & 0o777 != 0o750:
+                os.chmod(d, 0o750 | (mode & stat.S_ISGID))
+                if mode & stat.S_ISGID and not os.stat(d).st_mode & stat.S_ISGID:
+                    log.warning("umask took bits of %s and fixing them cleared setgid: nginx may get 403", d)
         # shortcut: no fsync; a crop torn by a power cut is 0 bytes and the backfill redoes it.
         fd, tmp = tempfile.mkstemp(dir=d, prefix=".", suffix=".tmp")
         with os.fdopen(fd, "wb") as f:

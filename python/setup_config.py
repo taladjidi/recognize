@@ -18,6 +18,7 @@ import grp
 import json
 import os
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -115,27 +116,31 @@ def _detect_web_user():
     return None
 
 
-def store_secret_in_nextcloud(nc_root, secret, key="internal_secret", sensitive=False):
-    """Store a secret in Nextcloud's appconfig via occ.
+def secret_store_cmd(nc_root, key):
+    """php command that stores STDIN as the sensitive string appconfig recognize/<key>.
 
-    Tries running as the web server user first (required when running as root),
-    falls back to direct invocation.
+    Not `occ config:app:set --value`: argv is world-readable in /proc/<pid>/cmdline.
     """
-    occ = os.path.join(nc_root, "occ")
+    base = os.path.join(nc_root, "lib", "base.php")
+    code = (f"require {base!r}; $value = stream_get_contents(STDIN); "
+            "\\OCP\\Server::get(\\OCP\\IAppConfig::class)"
+            "->setValueString('recognize', $argv[1], $value, sensitive: true);")
+    cmd = ["php", "-r", code, key]
     web_user = _detect_web_user()
-
-    cmd = ["php", occ, "config:app:set", "recognize", key, "--value", secret]
-    if sensitive:
-        cmd += ["--type", "string", "--sensitive", "--no-interaction"]
-    # If running as root, occ must run as the web server user
+    # If running as root, Nextcloud must run as the web server user
     if os.getuid() == 0 and web_user:
         cmd = ["sudo", "-u", web_user] + cmd
+    return cmd
 
+
+def store_secret_in_nextcloud(nc_root, secret, key="internal_secret"):
+    """Store a secret in Nextcloud's appconfig (sensitive, so encrypted at rest)."""
+    cmd = secret_store_cmd(nc_root, key)
     try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=True)
+        subprocess.run(cmd, input=secret, capture_output=True, text=True, timeout=30, check=True)
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"WARNING: Could not store secret via occ: {e}", file=sys.stderr)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"WARNING: Could not store {key} in appconfig: {e} {getattr(e, 'stderr', '') or ''}", file=sys.stderr)
         return False
 
 
@@ -371,12 +376,11 @@ def main():
         "nextcloud_url": nc_php_config.get("overwrite.cli.url", f"http://localhost/nextcloud"),
         "internal_secret": secret,
         "config_php": os.path.join(nc_root, "config", "config.php"),
-        # Face crops (<root>/<uid>/<detection id>.jpg); deploy.sh creates it, apache-owned 0750.
-        "face_crop_root": "/var/lib/nextcloud/recognize-faces",
     }
 
-    # 4. Write nc_config.json (0640 — readable by service user, not world)
-    fd = os.open(OUTPUT_CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+    # 4. Write nc_config.json (0600: DB password; the mode arg only applies on create)
+    fd = os.open(OUTPUT_CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(nc_config, f, indent=2)
         f.write("\n")
@@ -386,23 +390,15 @@ def main():
     print(f"  Data dir: {nc_config['datadirectory']}")
     print(f"  NC URL: {nc_config['nextcloud_url']}")
 
-    # 5. Store secret in Nextcloud appconfig (requires root or web-server user)
-    print("\nStoring internal secret in Nextcloud appconfig...")
-    print("  (requires root — runs: php occ config:app:set)")
-    if store_secret_in_nextcloud(nc_root, secret):
-        print("  Secret stored successfully")
-    else:
-        print("  WARNING: Could not store secret automatically.")
-        print("  Run manually as root:")
-        print(f"    sudo -u apache php {nc_root}/occ config:app:set recognize internal_secret --value {secret}")
-
-    print("\nStoring Faces API token secret in Nextcloud appconfig (sensitive)...")
-    if store_secret_in_nextcloud(nc_root, nc_config["api_token_secret"], "api_token_secret", sensitive=True):
-        print("  Secret stored successfully")
-    else:
-        print("  WARNING: Could not store it. Run manually as root:")
-        print(f"    sudo -u apache php {nc_root}/occ config:app:set recognize api_token_secret "
-              f"--type string --sensitive --no-interaction --value <api_token_secret from {OUTPUT_CONFIG}>")
+    # 5. Store the secrets in Nextcloud appconfig (requires root or web-server user)
+    for key in ("internal_secret", "api_token_secret"):
+        print(f"\nStoring {key} in Nextcloud appconfig (sensitive)...")
+        if store_secret_in_nextcloud(nc_root, nc_config[key], key):
+            print("  Secret stored successfully")
+        else:
+            print(f"  WARNING: Could not store it. Run as root, feeding the {key} value")
+            print(f"  from {OUTPUT_CONFIG} on stdin (never as an argument):")
+            print(f"    {shlex.join(secret_store_cmd(nc_root, key))}")
 
     # 6. Generate systemd service file
     print("\nGenerating systemd service file...")
@@ -430,6 +426,7 @@ def main():
 
     # The snippet holds crop_link_secret: 0600 here, deploy.sh installs it root:nginx 0640.
     fd = os.open(OUTPUT_NGINX, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(generate_nginx_conf(nc_config))
     print(f"  nginx snippet written to {OUTPUT_NGINX}")
