@@ -56,10 +56,23 @@ final class PropFindPlugin extends ServerPlugin {
 		$this->server = $server;
 
 		$this->server->on('propFind', $this->propFind(...));
+		// Priority 1: the Photos app answers nbItems for EVERY collection with
+		// count($node->getChildren()), and PropFind::handle keeps the first
+		// answer. Registered after it we never ran, so each FaceRoot built all
+		// its photos just to be counted (~4 s for the list). Run before it.
+		$this->server->on('propFind', $this->propFindCounts(...), 1);
 		$this->server->on('beforeMove', $this->beforeMove(...));
 		$this->server->on('beforeMethod:*', $this->beforeMethod(...), 1);
 	}
 
+
+	public function propFindCounts(PropFind $propFind, INode $node): void {
+		if ($node instanceof FaceRoot) {
+			$propFind->handle(self::NBITEMS_PROPERTYNAME, fn () => $node->getDetectionCount());
+		} elseif ($node instanceof UnassignedFacesHome) {
+			$propFind->handle(self::NBITEMS_PROPERTYNAME, fn () => $node->getChildCount());
+		}
+	}
 
 	public function propFind(PropFind $propFind, INode $node): void {
 		if ($node instanceof FacePhoto) {
@@ -135,12 +148,6 @@ final class PropFindPlugin extends ServerPlugin {
 
 			// Note: file metadata (EXIF etc.) registration skipped for face photos
 			// to avoid eager file lookups. Metadata is available via the file's own DAV node.
-		}
-
-		if ($node instanceof FaceRoot) {
-			$propFind->handle(self::NBITEMS_PROPERTYNAME, fn () => $node->getDetectionCount());
-		} elseif ($node instanceof UnassignedFacesHome) {
-			$propFind->handle(self::NBITEMS_PROPERTYNAME, fn () => count($node->getChildren()));
 		}
 
 		if ($node instanceof FaceRoot) {

@@ -41,6 +41,27 @@ function measure(string $label, callable $fn, $db): void {
 $children = [];
 measure('getChildren', function () use ($home, &$children) { $children = $home->getChildren(); return count($children) . ' clusters'; }, $db);
 
+// nbItems through a real Sabre event chain with the Photos plugin registered FIRST
+// (as on the server), so a listener-order regression shows up as ~1 query per
+// cluster instead of ~0. Expect: queries ~0 after the fix.
+$server = new \Sabre\DAV\Server(new \Sabre\DAV\SimpleCollection('root'));
+try {
+	$photos = $s->get(\OCA\Photos\Sabre\PropFindPlugin::class);
+	$photos->initialize($server);
+} catch (\Throwable $e) {
+	echo "  (Photos plugin not loadable: {$e->getMessage()})\n";
+}
+$plugin->initialize($server);
+measure('nbItems (Sabre chain)', function () use ($children, $server) {
+	$found = 0;
+	foreach ($children as $child) {
+		$pf = new \Sabre\DAV\PropFind('recognize/x', ['{http://nextcloud.org/ns}nbItems'], 0);
+		$server->emit('propFind', [$pf, $child]);
+		$found += count($pf->getResultForMultiStatus()[200] ?? []);
+	}
+	return "$found with a value";
+}, $db);
+
 foreach ([
 	'nbItems' => '{http://nextcloud.org/ns}nbItems',
 	'face-preview-image' => '{http://nextcloud.org/ns}face-preview-image',

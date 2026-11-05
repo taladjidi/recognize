@@ -103,6 +103,13 @@ final class UnassignedFacesHome implements ICollection {
 		}
 	}
 
+	/** One count query instead of building every child (nbItems). */
+	public function getChildCount(): int {
+		return count($this->children) !== 0
+			? count($this->children)
+			: $this->faceDetectionMapper->countRejectedByUserId($this->user->getUID());
+	}
+
 	/**
 	 * @return list<UnassignedFacePhoto>
 	 * @throws \OCP\Files\NotPermittedException

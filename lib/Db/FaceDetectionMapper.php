@@ -211,6 +211,21 @@ final class FaceDetectionMapper extends QBMapper {
 		return $this->findEntity($qb);
 	}
 
+	/** Rejected (unassigned) detections whose file still sits in the user's files. */
+	public function countRejectedByUserId(string $userId) : int {
+		$qb = $this->db->getQueryBuilder();
+		$qb->select($qb->func()->count('d.id'))
+			->from('recognize_face_detections', 'd')
+			->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
+			->where($qb->expr()->eq('d.cluster_id', $qb->createPositionalParameter(-1)))
+			->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)))
+			->andWhere($qb->expr()->like('fc.path', $qb->createPositionalParameter('files/%')));
+		$result = $qb->executeQuery();
+		$count = $result->fetch(\PDO::FETCH_COLUMN);
+		$result->closeCursor();
+		return (int) $count;
+	}
+
 	public function countByClusterId(int $clusterId, string $userId) : int {
 		$qb = $this->db->getQueryBuilder();
 		$qb->select($qb->func()->count('d.id'))
