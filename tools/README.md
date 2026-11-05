@@ -9,6 +9,12 @@ One-time, create an app password (sudo; the file stays 0600 in your home):
 
     mkdir -p ~/.config/nc-bench && (umask 077; sudo -u apache php /usr/share/nextcloud/occ user:auth-tokens:add --name=headless-bench tangui | tail -1 > ~/.config/nc-bench/tangui)
 
+Also needed: the recognize DAV plugin refuses Basic-auth requests without an
+`X-Recognize-Api-Key` (the browser gets one from the page state). It is valid
+24 h, so regenerate when the bench starts answering 403:
+
+    (umask 077; sudo -u apache php tools/gen_bench_apikey.php > ~/.config/nc-bench/recognize-api-key)
+
 Client side (results go to `bench-results/<UTC>-<scenario>.json`, gitignored):
 
     tools/bench_faces.py --scenario all --runs 3

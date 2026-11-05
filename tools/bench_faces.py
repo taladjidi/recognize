@@ -42,10 +42,11 @@ def propfind_body(extra):  # DavRequest.ts getPropFind
 
 
 class Client:
-    def __init__(self, base, user, pw):
+    def __init__(self, base, user, pw, apikey=None):
         u = urllib.parse.urlparse(base)
         self.host, self.port, self.tls = u.hostname, u.port, u.scheme == "https"
         self.auth = "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
+        self.apikey = apikey  # DavClient.ts:12 sends X-Recognize-Api-Key on every request
         self.local = threading.local()
 
     def _conn(self):
@@ -60,6 +61,8 @@ class Client:
         """Returns (status, bytes, seconds). Only PROPFIND and GET are allowed."""
         assert method in ("PROPFIND", "GET")
         h = {"Authorization": self.auth, "OCS-APIRequest": "true", **(headers or {})}
+        if self.apikey:
+            h["X-Recognize-Api-Key"] = self.apikey
         t = time.perf_counter()
         for attempt in (0, 1):
             try:
@@ -207,7 +210,12 @@ def main():
         pw = open(tf).read().strip()
     except OSError:
         sys.exit(f"no app password at {tf} (see tools/README.md, Benchmarking)")
-    cl = Client(a.base, a.user, pw)
+    kf = os.path.expanduser(f"~/.config/nc-bench/recognize-api-key")
+    try:
+        key = open(kf).read().strip()
+    except OSError:
+        key = None  # without it recognize DAV answers 403 under Basic auth; see tools/README.md
+    cl = Client(a.base, a.user, pw, key)
     old = json.load(open(a.compare)) if a.compare else {}
     for name, fn in (("overview", overview), ("cluster", cluster)):
         if a.scenario not in (name, "all"):
