@@ -200,12 +200,21 @@ def svc(tmp_path):
     s = Service(str(cfg), models_dir=str(tmp_path), gpu=False)
     (tmp_path / "crops").mkdir()
     s.pipeline.db.create_face_detections_table()
+    # The cover phase ranks faces of files that exist in the owner's home (like the API).
+    s.pipeline.db._execute("CREATE TABLE oc_storages (numeric_id INTEGER PRIMARY KEY, id TEXT UNIQUE)")
+    s.pipeline.db._execute("CREATE TABLE oc_filecache (fileid INTEGER PRIMARY KEY, storage INTEGER, path TEXT, "
+                           "name TEXT, mimetype INTEGER, size INTEGER, mtime INTEGER, etag TEXT)")
     s.pipeline._enabled = {"faces"}
     yield s
     s.stop()
 
 
 def _det(db, file_id, user, box=FACE):
+    """A face on file_id, registered as a file in user's home (filecache/storages)."""
+    db._execute("INSERT OR IGNORE INTO oc_storages (id) VALUES (?)", (f"home::{user}",))
+    sid = db._execute("SELECT numeric_id FROM oc_storages WHERE id = ?", (f"home::{user}",)).fetchone()[0]
+    db._execute("INSERT OR IGNORE INTO oc_filecache (fileid, storage, path, name) VALUES (?, ?, ?, ?)",
+                (file_id, sid, f"files/{file_id}.jpg", f"{file_id}.jpg"))
     db.insert_face_detection(file_id, user, {**box, "vector": [0.0] * 4})
     return db._execute("SELECT MAX(id) FROM oc_recognize_face_detections").fetchone()[0]
 

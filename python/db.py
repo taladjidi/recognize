@@ -30,6 +30,12 @@ AUDIO_MIMES = (
 )
 
 
+# Cover candidates per cluster the API checks for a crop on disk, best-ranked first. The
+# backfill's cover phase crops the best one; if that photo cannot be cropped, the full pass
+# crops the others and the API falls back to them.
+COVER_CANDIDATES = 5
+
+
 def cover_order(a: str = "") -> str:
     """ORDER BY terms ranking cover candidates: boxes with half a box of margin on every side first,
     boxes under 5% of the image last, largest first within each; ties by id. One rule for the API
@@ -575,9 +581,19 @@ class DB:
         covers_only: just each cluster's best cover candidate (see cover_order).
         """
         t = self._table("recognize_face_detections")
+        # Rank only faces whose photo still exists in the owner's files (the API's own filter):
+        # ranking deleted files too left big clusters without any servable cover.
+        uid = "d.user_id"
+        cat = (lambda a, b: f"CONCAT({a}, {b})") if self.dialect == "mysql" else (lambda a, b: f"({a} || {b})")
+        home, obj = cat("'home::'", uid), cat("'object::user:'", uid)
         covers = (
-            f"AND id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY cluster_id "
-            f"ORDER BY {cover_order()}) AS rn FROM {t} WHERE cluster_id > 0) c WHERE rn = 1) "
+            f"AND id IN (SELECT id FROM (SELECT d.id, ROW_NUMBER() OVER (PARTITION BY d.cluster_id "
+            f"ORDER BY {cover_order('d.')}) AS rn FROM {t} d "
+            f"JOIN {self._table('filecache')} fc ON fc.fileid = d.file_id "
+            f"JOIN {self._table('storages')} s ON s.numeric_id = fc.storage "
+            f"WHERE d.cluster_id > 0 AND fc.path LIKE 'files/%' "
+            f"AND s.id IN ({home}, {obj})) c "
+            f"WHERE rn = 1) "
             if covers_only else ""
         )
         cur = self._execute(

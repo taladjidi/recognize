@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 import config as nc_config
 from crops import DEFAULT_CROP_ROOT
-from db import DB, cover_order
+from db import COVER_CANDIDATES, DB, cover_order
 
 log = logging.getLogger("recognize.api")
 
@@ -112,7 +112,6 @@ def escape_like(q: str) -> str:
     return q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
 
 
-COVER_CANDIDATES = 5  # largest boxes per cluster examined for a crop on disk
 
 
 def _crop_or_none(uid, did, secret, crop_root):

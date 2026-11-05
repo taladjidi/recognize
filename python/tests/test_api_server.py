@@ -238,7 +238,19 @@ class TestQueries:
         api = [c for c in list_clusters(db, "alice", CROP, crop_root=str(root)) if c["id"] == 9][0]["cover"]
         assert api.startswith(f"/recognize-faces/alice/{first + want - 1}.jpg?")
         backfill = [r["id"] for r in db.detections_after(first - 1, 100, covers_only=True)]
-        assert backfill == [first + want - 1]
+        assert first + want - 1 in backfill  # the API's cover is among the backfill's candidates
+
+    def test_backfill_covers_skip_faces_whose_file_is_gone(self, db):
+        # Live bug 2026-11-05: the best-ranked face of a 906-photo cluster sat on a deleted
+        # file, so the backfill cropped only that one, the API (which ranks existing files
+        # only) found no crop among its candidates, and the cluster had no cover.
+        db._execute("INSERT INTO oc_recognize_face_clusters VALUES (9, 'Gone', 'alice')")
+        for det, fid, w in ((200, 99999, 0.4), (201, 10, 0.2)):  # 99999: no filecache row
+            db._execute(f"INSERT INTO oc_recognize_face_detections (id, file_id, user_id, x, y, height, width, "
+                        f"cluster_id) VALUES ({db._ph(8)})", (det, fid, "alice", 0.3, 0.3, w, w, 9))
+        db.commit()
+        backfill = [r["id"] for r in db.detections_after(199, 100, covers_only=True)]
+        assert 201 in backfill and 200 not in backfill
 
     def test_crop_urls_only_for_crops_on_disk(self, db, tmp_path):
         root = tmp_path / "crops"
