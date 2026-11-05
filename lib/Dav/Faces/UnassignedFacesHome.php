@@ -76,7 +76,8 @@ final class UnassignedFacesHome implements ICollection {
 		if ((int)$detectionId > 0) {
 			try {
 				$detection = $this->faceDetectionMapper->find((int)$detectionId);
-				if ($detection->getClusterId() === -1) {
+				// Ids are sequential: without the user check any user could read or MOVE another user's detection.
+				if ($detection->getClusterId() === -1 && $detection->getUserId() === $this->user->getUID()) {
 					return new UnassignedFacePhoto($this->faceDetectionMapper, $detection, $this->rootFolder->getUserFolder($this->user->getUID()), $this->tagManager, $this->previewManager);
 				}
 			} catch (DoesNotExistException $e) {

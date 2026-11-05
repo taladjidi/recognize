@@ -320,7 +320,7 @@ final class FaceDetectionMapper extends QBMapper {
 	 * @param list<int> $fileIds
 	 * @return array<int, list<\OCA\Recognize\Db\FaceDetectionWithTitle>> keyed by file id
 	 */
-	public function findByFileIdsWithTitle(array $fileIds) : array {
+	public function findByFileIdsWithTitle(array $fileIds, string $userId) : array {
 		if ($fileIds === []) {
 			return [];
 		}
@@ -337,6 +337,7 @@ final class FaceDetectionMapper extends QBMapper {
 			$qb->select($lightWithTitle)
 				->from('recognize_face_detections', 'd')
 				->where($qb->expr()->in('d.file_id', $qb->createNamedParameter($chunk, IQueryBuilder::PARAM_INT_ARRAY)))
+				->andWhere($qb->expr()->eq('d.user_id', $qb->createNamedParameter($userId)))
 				->leftJoin('d', 'recognize_face_clusters', 'c', $qb->expr()->eq('d.cluster_id', 'c.id'));
 			/** @var list<\OCA\Recognize\Db\FaceDetectionWithTitle> $entities */
 			$entities = $this->findEntities($qb);
@@ -348,7 +349,10 @@ final class FaceDetectionMapper extends QBMapper {
 		return $byFile;
 	}
 
-	public function findByFileIdWithTitle(int $fileId) : array {
+	/**
+	 * @return list<\OCA\Recognize\Db\FaceDetectionWithTitle>
+	 */
+	public function findByFileIdWithTitle(int $fileId, string $userId) : array {
 		$qb = $this->db->getQueryBuilder();
 		$lightWithTitle = array_merge(
 			array_map(fn ($col) => 'd.'.$col, self::LIGHT_COLUMNS),
@@ -356,7 +360,8 @@ final class FaceDetectionMapper extends QBMapper {
 		);
 		$qb->select($lightWithTitle)
 			->from('recognize_face_detections', 'd')
-			->where($qb->expr()->eq('file_id', $qb->createPositionalParameter($fileId, IQueryBuilder::PARAM_INT)))
+			->where($qb->expr()->eq('d.file_id', $qb->createPositionalParameter($fileId, IQueryBuilder::PARAM_INT)))
+			->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)))
 			->leftJoin('d', 'recognize_face_clusters', 'c', $qb->expr()->eq('d.cluster_id', 'c.id'));
 		/** @var list<\OCA\Recognize\Db\FaceDetectionWithTitle> $entities */
 		$entities = $this->findEntities($qb);

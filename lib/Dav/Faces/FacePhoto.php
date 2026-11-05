@@ -74,7 +74,8 @@ class FacePhoto implements IFile {
 
 	#[Override]
 	public function delete(): void {
-		$detections = $this->detectionMapper->findByClusterId($this->faceDetection->getClusterId());
+		$clusterId = $this->faceDetection->getClusterId();
+		$detections = $clusterId === null ? [] : $this->detectionMapper->findByClusterId($clusterId);
 		if (count($detections) > 1) {
 			// Calculate centroid of all detections in the cluster
 			$dim = 512;

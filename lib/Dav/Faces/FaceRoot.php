@@ -71,6 +71,10 @@ final class FaceRoot implements ICollection, IMoveTarget {
 	 * @inheritDoc
 	 */
 	public function setName($name): void {
+		// FacesHome::getChild() falls back to an id lookup, so a numeric title would shadow another cluster's id.
+		if (preg_match('/^[0-9]+$/', basename($name)) === 1) {
+			throw new Forbidden('Not allowed to use numbers as names');
+		}
 		try {
 			$this->clusterMapper->findByUserAndTitle($this->user->getUID(), basename($name));
 			throw new Forbidden('Not allowed to create duplicate names');
@@ -167,7 +171,7 @@ final class FaceRoot implements ICollection, IMoveTarget {
 		$detectionsByFile = [];
 		$detectionsLoaded = false;
 		try {
-			$detectionsByFile = $this->detectionMapper->findByFileIdsWithTitle($fileIds);
+			$detectionsByFile = $this->detectionMapper->findByFileIdsWithTitle($fileIds, $this->user->getUID());
 			$detectionsLoaded = true;
 		} catch (\Throwable $e) {
 			$detectionsLoaded = false;
@@ -230,6 +234,9 @@ final class FaceRoot implements ICollection, IMoveTarget {
 
 	public function moveInto($targetName, $sourcePath, INode $sourceNode) {
 		if ($sourceNode instanceof FacePhoto) {
+			if ($sourceNode->getFaceDetection()->getUserId() !== $this->user->getUID()) {
+				throw new Forbidden('You can only move your own face detections');
+			}
 			$sourceNode->getFaceDetection()->setClusterId($this->cluster->getId());
 			$this->detectionMapper->update($sourceNode->getFaceDetection());
 			return true;

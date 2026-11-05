@@ -79,7 +79,7 @@ final class PropFindPlugin extends ServerPlugin {
 				// this runs one query per child of the collection.
 				$detections = $node->getPreloadedDetections();
 				if ($detections === null) {
-					$detections = $this->faceDetectionMapper->findByFileIdWithTitle($node->getFaceDetection()->getFileId());
+					$detections = $this->faceDetectionMapper->findByFileIdWithTitle($node->getFaceDetection()->getFileId(), $node->getFaceDetection()->getUserId());
 				}
 
 				return json_encode(
@@ -149,10 +149,15 @@ final class PropFindPlugin extends ServerPlugin {
 
 		if ($node instanceof File) {
 			$propFind->handle(self::FACE_DETECTIONS_PROPERTYNAME, function () use ($node) {
+				// Only the viewer's own detections: a sharee must not see the owner's faces or the names given to them.
+				$user = $this->userSession->getUser();
+				if ($user === null) {
+					return json_encode([]);
+				}
 				return json_encode(
 					array_map(
 						fn (FaceDetectionWithTitle $face) => $face->toArray(),
-						$this->faceDetectionMapper->findByFileIdWithTitle($node->getId()),
+						$this->faceDetectionMapper->findByFileIdWithTitle($node->getId(), $user->getUID()),
 					)
 				);
 			});
