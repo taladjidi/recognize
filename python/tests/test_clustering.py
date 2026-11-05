@@ -267,10 +267,61 @@ class TestClusterAllUsersState:
 
         first = cluster_all_users(db, user_ids=["alice"], state=state)
         assert "alice" in first
+        # The first run assigned rows, which changes the set: one settling run
         second = cluster_all_users(db, user_ids=["alice"], state=state)
-        assert "alice" not in second, "unchanged user must be skipped"
+        assert "alice" in second
+        third = cluster_all_users(db, user_ids=["alice"], state=state)
+        assert "alice" not in third, "unchanged user must be skipped"
 
         _insert_faces(db, "alice", [_make_embedding(center)], file_id_start=9000)
-        third = cluster_all_users(db, user_ids=["alice"], state=state)
-        assert "alice" in third, "new unclustered detection must trigger a run"
-        assert "error" not in third["alice"]
+        fourth = cluster_all_users(db, user_ids=["alice"], state=state)
+        assert "alice" in fourth, "new unclustered detection must trigger a run"
+        assert "error" not in fourth["alice"]
+
+
+class TestSkipRaceAndLazyCluster:
+    def test_change_during_run_is_not_skipped(self, db, monkeypatch):
+        import clustering as clustering_mod
+
+        np.random.seed(42)
+        center = np.random.randn(512).astype(np.float32)
+        center /= np.linalg.norm(center)
+        ids = _insert_faces(db, "alice", [_make_embedding(center) for _ in range(10)], 1000)
+        cluster_user_faces(db, "alice")
+        t = db._table("recognize_face_detections")
+
+        real = clustering_mod.cluster_user_faces
+        calls = []
+
+        def run_then_unassign(db_, user_id):
+            out = real(db_, user_id)
+            if not calls:  # a removal landing mid-run, on the first run only
+                db_._execute(f"UPDATE {t} SET cluster_id = NULL WHERE id = {db_._ph()}", (ids[0],))
+                db_._commit()
+            calls.append(user_id)
+            return out
+
+        monkeypatch.setattr(clustering_mod, "cluster_user_faces", run_then_unassign)
+        state = {}
+        assert "alice" in cluster_all_users(db, user_ids=["alice"], state=state)
+        assert "alice" in cluster_all_users(db, user_ids=["alice"], state=state), \
+            "change made during the previous run must not be skipped"
+        # The run that re-assigned the row changed the set again: one settling run
+        assert "alice" in cluster_all_users(db, user_ids=["alice"], state=state)
+        assert "alice" not in cluster_all_users(db, user_ids=["alice"], state=state), \
+            "settled user must be skipped"
+
+
+class TestLazyClusterCreation:
+    def test_all_rejected_group_creates_no_cluster(self, db):
+        np.random.seed(7)
+        center = np.random.randn(512).astype(np.float32)
+        center /= np.linalg.norm(center)
+        _insert_faces(db, "alice", [_make_embedding(center) for _ in range(10)], 1000)
+        t = db._table("recognize_face_detections")
+        db._execute(f"UPDATE {t} SET threshold = 0.001 WHERE user_id = {db._ph()}", ("alice",))
+        db._commit()
+
+        stats = cluster_user_faces(db, "alice")
+        assert stats["n_assigned"] == 0
+        assert db.get_face_clusters_for_user("alice") == []

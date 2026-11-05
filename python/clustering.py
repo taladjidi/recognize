@@ -253,13 +253,8 @@ def cluster_user_faces(db, user_id):
                 continue
         # else: no votes → new cluster
 
-        if target_cluster_id is None:
-            # Create a new cluster in the DB
-            target_cluster_id = db.create_face_cluster(user_id)
-            n_new_clusters += 1
-            ref = None  # per-detection: centroid of the group minus the detection
-        else:
-            ref = ref_centroids.get(target_cluster_id)
+        # New clusters are created lazily, on the first detection actually assigned
+        ref = ref_centroids.get(target_cluster_id)
 
         # Assign unclustered detections, respecting thresholds
         for i in unclustered_indices:
@@ -270,6 +265,7 @@ def cluster_user_faces(db, user_id):
             # centroid, which contains the face itself.
             threshold = det.get("threshold", 0.0) or 0.0
             if threshold > 0.0:
+                # shortcut: reference centroid uses <=80 sampled members, so a removed face can occasionally return; upgrade: store the cluster it was removed from (PHP + schema)
                 det_ref = ref
                 if det_ref is None:
                     others = [all_detections[j]["face_vector"] for j in member_indices if j != i]
@@ -280,6 +276,9 @@ def cluster_user_faces(db, user_id):
                 if dist >= threshold:
                     continue
 
+            if target_cluster_id is None:
+                target_cluster_id = db.create_face_cluster(user_id)
+                n_new_clusters += 1
             db.assign_detection_to_cluster(det["id"], target_cluster_id)
             n_assigned += 1
 
@@ -318,13 +317,15 @@ def cluster_all_users(db, user_ids=None, state=None, **kwargs):
     results = {}
     for user_id in user_ids:
         try:
-            if state is not None and state.get(user_id) == db.get_unclustered_signature(user_id):
+            sig = db.get_unclustered_signature(user_id)
+            if state is not None and state.get(user_id) == sig:
                 log.debug("User %s: no unclustered changes, skipping", user_id)
                 continue
             stats = cluster_user_faces(db, user_id)
             results[user_id] = stats
             if state is not None:
-                state[user_id] = db.get_unclustered_signature(user_id)
+                # Pre-run signature: a change made during the run is seen next cycle
+                state[user_id] = sig
         except Exception as e:
             log.error(
                 "Clustering failed for user %s: %s\n%s",
