@@ -414,3 +414,21 @@ def test_update_guard_tolerates_threshold_round_trip(env):
     row["threshold"] = 0.123456789012  # what a less precise round trip could give back
     face = {**_box(0.4, 0.4), "vector": [0.0] * 4}
     assert db.update_face_detection_box(row, face) == 1
+
+
+def test_gpu_mode_reexecs_with_the_venv_cuda_libs(monkeypatch):
+    """onnxruntime dlopens libcudnn by name and the loader reads LD_LIBRARY_PATH only at
+    process start: the tool must re-exec itself with the venv's nvidia lib dirs (live
+    failure 2026-11-05: 'dlopen failed for libcudnn.so')."""
+    import config
+    calls = []
+    monkeypatch.setattr(config, "get_nvidia_lib_path", lambda: "/venv/nvidia/cudnn/lib")
+    monkeypatch.setattr(rd.os, "execve", lambda exe, argv, env: calls.append(env))
+    monkeypatch.delenv("RECOGNIZE_LIBS_SET", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/local/cuda/lib64")
+    rd._ensure_gpu_libs()
+    assert calls and calls[0]["LD_LIBRARY_PATH"].split(":") == ["/venv/nvidia/cudnn/lib", "/usr/local/cuda/lib64"]
+    calls.clear()
+    monkeypatch.setenv("RECOGNIZE_LIBS_SET", "1")  # already re-executed: no loop
+    rd._ensure_gpu_libs()
+    assert calls == []

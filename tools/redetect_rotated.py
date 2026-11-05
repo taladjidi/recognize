@@ -250,6 +250,22 @@ def _line(s):
     return " ".join(f"{k}={len(v) if isinstance(v, list) else v}" for k, v in s.items())
 
 
+def _ensure_gpu_libs():
+    """Re-exec once with the venv's nvidia lib dirs on LD_LIBRARY_PATH.
+
+    onnxruntime dlopens libcudnn by name and the loader reads LD_LIBRARY_PATH only at
+    process start. The daemon gets away with setting it late because its GPU workers are
+    spawned processes; this tool runs the model in-process, so it must re-exec.
+    """
+    from config import get_nvidia_lib_path
+    path = get_nvidia_lib_path()
+    if not path or os.environ.get("RECOGNIZE_LIBS_SET") == "1":
+        return
+    old = os.environ.get("LD_LIBRARY_PATH")
+    env = dict(os.environ, LD_LIBRARY_PATH=f"{path}:{old}" if old else path, RECOGNIZE_LIBS_SET="1")
+    os.execve(sys.executable, [sys.executable, *sys.argv], env)
+
+
 def main() -> int:
     args = sys.argv[1:]
     dry_run = "--dry-run" in args
@@ -267,6 +283,8 @@ def main() -> int:
     if len(args) != 1 or (limit is not None and limit < 1):
         print(__doc__)
         return 2
+    if not faceless:
+        _ensure_gpu_libs()  # before anything imports onnxruntime
     from service import Service
     from classifiers.faces import FaceClassifier
     svc = Service(args[0], gpu=False)
