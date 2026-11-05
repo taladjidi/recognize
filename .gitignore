@@ -25,3 +25,4 @@ deploy.sh
 # Local instance secrets — contains plaintext DB password
 python/nc_config.json
 python/recognize.service
+bench-results/
