@@ -27,7 +27,7 @@ final class CleanupTags extends Command {
 	 */
 	protected function configure() {
 		$this->setName('recognize:cleanup-tags')
-			->setDescription('Delete all tags that have no files associated with them anymore');
+			->setDescription('Delete recognize classifier tags that have no files associated with them anymore');
 	}
 
 	/**

@@ -62,23 +62,25 @@ final class StorageCrawlJob extends QueuedJob {
 		$this->jobList->remove(self::class, $argument);
 
 		$lastSeenFileId = null;
-		foreach ($this->storageService->getFilesInMount($storageId, $overrideRoot, $models, $lastFileId, self::BATCH_SIZE, $skipTagId) as $file) {
-			try {
+		$failed = false;
+		try {
+			foreach ($this->storageService->getFilesInMount($storageId, $overrideRoot, $models, $lastFileId, self::BATCH_SIZE, $skipTagId) as $file) {
 				$this->pending->upsert((int)$file['fileid'], $storageId, PendingService::ACTION_CREATED);
 				$lastSeenFileId = (int)$file['fileid'];
-			} catch (Exception $e) {
-				$this->logger->error('Failed to queue file for recognition', ['exception' => $e]);
-				return;
 			}
+		} catch (Exception $e) {
+			// This job's row is already gone: without re-adding it the rest of the storage is never crawled.
+			$this->logger->error('Failed to queue file for recognition, will retry', ['exception' => $e]);
+			$failed = true;
 		}
 
-		if ($lastSeenFileId !== null) {
-			// Schedule next iteration
+		if ($failed || $lastSeenFileId !== null) {
+			// Schedule next iteration (or the retry, from the last file queued)
 			$this->jobList->add(self::class, [
 				'storage_id' => $storageId,
 				'root_id' => $rootId,
 				'override_root' => $overrideRoot,
-				'last_file_id' => $lastSeenFileId,
+				'last_file_id' => $lastSeenFileId ?? $lastFileId,
 				'models' => $models,
 				'skip_tagged' => $skipTagged,
 			]);

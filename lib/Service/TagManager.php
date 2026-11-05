@@ -121,6 +121,22 @@ final class TagManager {
 	 * @throws \JsonException
 	 */
 	public function resetClassifications(): void {
+		$tags = $this->getClassifierTags();
+		$tags[] = $this->getProcessedTag();
+		$tagIds = array_map(static fn (ISystemTag $tag) => $tag->getId(), $tags);
+		$fileIds = $this->findClassifiedFiles();
+		foreach ($fileIds as $id) {
+			$this->objectMapper->unassignTags($id, 'files', $tagIds);
+		}
+	}
+
+	/**
+	 * Existing system tags named like an image classifier label (src/things.json).
+	 *
+	 * @return list<ISystemTag>
+	 * @throws \JsonException
+	 */
+	private function getClassifierTags(): array {
 		$json = file_get_contents(__DIR__.'/../../src/things.json');
 		/** @var string[] $things */
 		$things = json_decode($json, true, 512, JSON_THROW_ON_ERROR | JSON_OBJECT_AS_ARRAY);
@@ -132,20 +148,18 @@ final class TagManager {
 				// noop
 			}
 		}
-		$tags[] = $this->getProcessedTag();
-		$tagIds = array_map(static fn (ISystemTag $tag) => $tag->getId(), $tags);
-		$fileIds = $this->findClassifiedFiles();
-		foreach ($fileIds as $id) {
-			$this->objectMapper->unassignTags($id, 'files', $tagIds);
-		}
+		return $tags;
 	}
 
 	/**
-	 * @return void
+	 * Delete recognize's empty tags, never the users' or other apps' own.
+	 *
+	 * shortcut: only the image labels in things.json; empty landmark, music and video tags stay. Upgrade by listing those label files too.
+	 *
+	 * @throws \JsonException
 	 */
 	public function removeEmptyTags(): void {
-		$tags = $this->tagManager->getAllTags();
-		foreach ($tags as $tag) {
+		foreach ($this->getClassifierTags() as $tag) {
 			$files = $this->objectMapper->getObjectIdsForTags($tag->getId(), 'files', 1);
 			if (empty($files)) {
 				$this->tagManager->deleteTags($tag->getId());
