@@ -160,6 +160,7 @@ def cluster_user_faces(db, user_id):
     existing_clusters = db.get_face_clusters_for_user(user_id)
     sampled_detections = []
     max_votes_by_cluster = {}  # cluster_id → sample count (for vote normalization)
+    ref_centroids = {}  # cluster_id → centroid of its sampled members (threshold reference)
 
     n_clusters = len(existing_clusters)
     sample_size = _get_reference_sample_size(n_clusters)
@@ -169,20 +170,23 @@ def cluster_user_faces(db, user_id):
         sampled = db.get_cluster_sample(cluster_id, sample_size)
         sampled_detections.extend(sampled)
         max_votes_by_cluster[cluster_id] = len(sampled)
+        if sampled:
+            ref_centroids[cluster_id] = _calculate_centroid(
+                [s["face_vector"] for s in sampled],
+            )
 
-    # Step 2: Get unclustered detections (fresh + rejected)
+    # Step 2: Get unclustered detections. Rejected rows (threshold > 0) are
+    # included here only while cluster_id IS NULL, i.e. after a user removal.
     fresh_detections = db.get_unclustered_detections(
         user_id, min_size=MIN_DETECTION_SIZE,
     )
-    rejected_detections = db.get_rejected_detections(
-        user_id, min_size=MIN_DETECTION_SIZE,
-    )
-    unclustered_detections = fresh_detections + rejected_detections
+    unclustered_detections = fresh_detections
     all_detections = unclustered_detections + sampled_detections
 
     n_total = len(all_detections)
     n_unclustered = len(unclustered_detections)
     n_fresh = len(fresh_detections)
+    n_with_threshold = sum(1 for d in fresh_detections if (d.get("threshold") or 0) > 0)
 
     if n_total < MIN_DATASET_SIZE or n_fresh == 0:
         log.debug(
@@ -195,8 +199,8 @@ def cluster_user_faces(db, user_id):
         }
 
     log.info(
-        "User %s: clustering %d detections (%d fresh, %d rejected, %d sampled from %d clusters)",
-        user_id, n_total, n_fresh, len(rejected_detections),
+        "User %s: clustering %d detections (%d fresh, %d with threshold, %d sampled from %d clusters)",
+        user_id, n_total, n_fresh, n_with_threshold,
         len(sampled_detections), n_clusters,
     )
 
@@ -224,10 +228,6 @@ def cluster_user_faces(db, user_id):
 
         if not unclustered_indices:
             continue  # Nothing new to assign
-
-        # Calculate cluster centroid from all members
-        cluster_vectors = [all_detections[i]["face_vector"] for i in member_indices]
-        centroid = _calculate_centroid(cluster_vectors)
 
         # Voting: sampled (already-clustered) detections vote for their cluster ID
         votes = {}
@@ -257,15 +257,26 @@ def cluster_user_faces(db, user_id):
             # Create a new cluster in the DB
             target_cluster_id = db.create_face_cluster(user_id)
             n_new_clusters += 1
+            ref = None  # per-detection: centroid of the group minus the detection
+        else:
+            ref = ref_centroids.get(target_cluster_id)
 
         # Assign unclustered detections, respecting thresholds
         for i in unclustered_indices:
             det = all_detections[i]
 
-            # Threshold check: user removed this face from a cluster before
+            # Threshold check: user removed this face from a cluster before.
+            # Compare against the target's own reference centroid, not the group
+            # centroid, which contains the face itself.
             threshold = det.get("threshold", 0.0) or 0.0
             if threshold > 0.0:
-                dist = _euclidean_distance(centroid, det["face_vector"])
+                det_ref = ref
+                if det_ref is None:
+                    others = [all_detections[j]["face_vector"] for j in member_indices if j != i]
+                    if not others:
+                        continue
+                    det_ref = _calculate_centroid(others)
+                dist = _euclidean_distance(det_ref, det["face_vector"])
                 if dist >= threshold:
                     continue
 
@@ -291,13 +302,15 @@ def cluster_user_faces(db, user_id):
     }
 
 
-def cluster_all_users(db, user_ids=None, **kwargs):
+def cluster_all_users(db, user_ids=None, state=None, **kwargs):
     """Cluster faces for multiple users.
 
     Args:
         db: DB instance.
-        user_ids: List of user IDs to cluster. If None, discovers all users
-                  with face detections from the DB.
+        user_ids: List of user IDs to cluster.
+        state: Optional dict user_id -> unclustered signature from the last
+               successful run. Users whose signature is unchanged are skipped
+               and left out of the result. Updated in place.
 
     Returns:
         Dict mapping user_id to cluster stats.
@@ -305,8 +318,13 @@ def cluster_all_users(db, user_ids=None, **kwargs):
     results = {}
     for user_id in user_ids:
         try:
+            if state is not None and state.get(user_id) == db.get_unclustered_signature(user_id):
+                log.debug("User %s: no unclustered changes, skipping", user_id)
+                continue
             stats = cluster_user_faces(db, user_id)
             results[user_id] = stats
+            if state is not None:
+                state[user_id] = db.get_unclustered_signature(user_id)
         except Exception as e:
             log.error(
                 "Clustering failed for user %s: %s\n%s",

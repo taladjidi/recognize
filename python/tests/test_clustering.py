@@ -3,7 +3,12 @@
 import numpy as np
 import pytest
 
-from clustering import cluster_user_faces, cluster_all_users
+from clustering import (
+    _calculate_centroid,
+    _euclidean_distance,
+    cluster_all_users,
+    cluster_user_faces,
+)
 from db import DB
 
 
@@ -204,3 +209,68 @@ class TestClusterAllUsers:
         assert results["alice"]["n_faces"] > 0
         assert "nobody" in results
         assert results["nobody"]["n_faces"] == 0
+
+
+class TestClusterRegressions:
+    def test_assigned_rejected_row_not_reassigned(self, db):
+        """A clustered row carrying threshold > 0 must not be re-assigned or counted."""
+        np.random.seed(42)
+        center = np.random.randn(512).astype(np.float32)
+        center /= np.linalg.norm(center)
+        embs = [_make_embedding(center, noise_scale=0.02) for _ in range(10)]
+        ids = _insert_faces(db, "alice", embs, file_id_start=1000)
+        cluster_user_faces(db, "alice")
+
+        t = db._table("recognize_face_detections")
+        # Permissive threshold: the threshold check alone would let it through
+        db._execute(f"UPDATE {t} SET threshold = 1.5 WHERE id = {db._ph()}", (ids[0],))
+        db._commit()
+        # One genuinely fresh face, so clustering actually runs
+        _insert_faces(db, "alice", [_make_embedding(center, noise_scale=0.02)], file_id_start=5000)
+
+        stats = cluster_user_faces(db, "alice")
+        assert stats["n_assigned"] == 1, "only the fresh face may be assigned"
+
+    def test_php_removed_face_not_put_back(self, db):
+        """Face removed PHP-style (threshold = distance to old centroid incl. itself)."""
+        np.random.seed(42)
+        center = np.random.randn(512).astype(np.float32)
+        center /= np.linalg.norm(center)
+        embs = [_make_embedding(center, noise_scale=0.02) for _ in range(10)]
+        ids = _insert_faces(db, "alice", embs, file_id_start=1000)
+        cluster_user_faces(db, "alice")
+
+        old_centroid = _calculate_centroid(embs)
+        removed_threshold = _euclidean_distance(old_centroid, embs[0])
+        t = db._table("recognize_face_detections")
+        db._execute(
+            f"UPDATE {t} SET cluster_id = NULL, threshold = {db._ph()} WHERE id = {db._ph()}",
+            (removed_threshold, ids[0]),
+        )
+        db._commit()
+        # Fresh faces near the removed one pull the new group's centroid towards it
+        near = [_make_embedding(embs[0], noise_scale=0.02) for _ in range(5)]
+        _insert_faces(db, "alice", near, file_id_start=3000)
+
+        cluster_user_faces(db, "alice")
+        face = [f for f in db.get_face_detections_for_user("alice") if f["id"] == ids[0]]
+        assert face[0]["cluster_id"] is None, "removed face must not return to its old cluster"
+
+
+class TestClusterAllUsersState:
+    def test_unchanged_user_is_skipped(self, db):
+        np.random.seed(42)
+        center = np.random.randn(512).astype(np.float32)
+        center /= np.linalg.norm(center)
+        _insert_faces(db, "alice", [_make_embedding(center) for _ in range(10)], 1000)
+        state = {}
+
+        first = cluster_all_users(db, user_ids=["alice"], state=state)
+        assert "alice" in first
+        second = cluster_all_users(db, user_ids=["alice"], state=state)
+        assert "alice" not in second, "unchanged user must be skipped"
+
+        _insert_faces(db, "alice", [_make_embedding(center)], file_id_start=9000)
+        third = cluster_all_users(db, user_ids=["alice"], state=state)
+        assert "alice" in third, "new unclustered detection must trigger a run"
+        assert "error" not in third["alice"]

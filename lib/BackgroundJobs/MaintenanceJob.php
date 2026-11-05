@@ -31,15 +31,7 @@ final class MaintenanceJob extends TimedJob {
 	 * @param array{storageId: int, rootId: int} $argument
 	 */
 	protected function run($argument): void {
-		// Trigger clustering in case it's stuck
-		try {
-			$users = $this->faceDetectionMapper->getUsersForUnclustered();
-		} catch (Exception $e) {
-			$this->logger->error($e->getMessage(), ['exception' => $e]);
-			return;
-		}
-		foreach ($users as $userId) {
-			$this->jobList->add(ClusterFacesJob::class, ['userId' => $userId]);
-		}
+		// Clustering is done by the Python daemon; nothing to queue here.
+		return;
 	}
 }

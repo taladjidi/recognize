@@ -449,20 +449,16 @@ class DB:
                 row["face_vector"] = json.loads(row["face_vector"])
         return rows
 
-    def get_rejected_detections(self, user_id: str, min_size: float = 0.0) -> list[dict]:
-        """Get detections previously rejected from clustering (threshold > 0)."""
+    def get_unclustered_signature(self, user_id: str) -> tuple[int, int, int]:
+        """(count, max id, sum of ids) of unclustered rows; changes when any are added or removed."""
         t = self._table("recognize_face_detections")
         cur = self._execute(
-            f"SELECT id, file_id, face_vector, cluster_id, threshold "
-            f"FROM {t} WHERE user_id = {self._ph()} AND threshold > 0 "
-            f"AND height >= {self._ph()} AND width >= {self._ph()}",
-            (user_id, min_size, min_size),
+            f"SELECT COUNT(*), MAX(id), SUM(id) FROM {t} "
+            f"WHERE user_id = {self._ph()} AND cluster_id IS NULL",
+            (user_id,),
         )
-        rows = self._fetchall_dicts(cur)
-        for row in rows:
-            if isinstance(row["face_vector"], str):
-                row["face_vector"] = json.loads(row["face_vector"])
-        return rows
+        row = cur.fetchone()
+        return tuple(int(v or 0) for v in row[:3])
 
     def create_face_cluster(self, user_id: str, title: str = "") -> int:
         """Create a new face cluster row and return its ID."""

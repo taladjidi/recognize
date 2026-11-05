@@ -72,6 +72,7 @@ class Service:
         self._running = False
         self._poll_interval = POLL_MIN_INTERVAL
         self._last_cluster_time = 0.0
+        self._cluster_state = {}  # user_id -> unclustered signature of last run
 
     def start(self):
         """Start the service main loop."""
@@ -291,7 +292,9 @@ class Service:
                 return
 
             log.info("Running face clustering for %d users", len(user_ids))
-            results = cluster_all_users(self.pipeline.db, user_ids=user_ids)
+            results = cluster_all_users(
+                self.pipeline.db, user_ids=user_ids, state=self._cluster_state,
+            )
 
             for user_id, stats in results.items():
                 if "error" in stats:
