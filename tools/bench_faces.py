@@ -169,9 +169,9 @@ def cluster(cl, a):
     return out
 
 
-# FacesApi.ts:13 PAGE and FetchFacesMixin.ts:86 fetchClusters() (min defaults to 1)
+# FacesApi.ts PAGE and MIN_LISTED_CLUSTER_SIZE (the frontend lists clusters of >= 5 photos); --min overrides
 PY_PAGE = 500
-PY_MIN = 1
+PY_MIN = 5
 
 
 def py_token(cl):
@@ -188,8 +188,8 @@ def py_get(cl, tok, path, params=None):
     return cl.req("GET", "/recognize-api/v1" + path + q, headers={"Authorization": f"Bearer {tok}"})
 
 
-def py_clusters(cl, tok):
-    s, d, t = py_get(cl, tok, "/clusters", {"min": PY_MIN})  # FacesApi.ts:87
+def py_clusters(cl, tok, a):
+    s, d, t = py_get(cl, tok, "/clusters", {"min": a.min})  # FacesApi.ts MIN_LISTED_CLUSTER_SIZE
     if s != 200:
         sys.exit(f"clusters failed: HTTP {s}")
     clusters = sorted(json.loads(d), key=lambda c: -c["count"])  # FacesView.vue:82 orderedFaces
@@ -203,7 +203,7 @@ def path_of(url):
 
 def py_overview(cl, a):
     tok, tok_ms = py_token(cl)
-    clusters, m = py_clusters(cl, tok)
+    clusters, m = py_clusters(cl, tok, a)
     m = {"token_ms": tok_ms, **m}
     covers = [c["cover"] for c in clusters if c["cover"]]
     m["covers_null"] = len(clusters) - len(covers)
@@ -233,7 +233,7 @@ def py_cluster_files(cl, tok, cid):
 
 def py_cluster(cl, a):
     tok, tok_ms = py_token(cl)
-    clusters, _ = py_clusters(cl, tok)
+    clusters, _ = py_clusters(cl, tok, a)
     out = {"token_ms": tok_ms}
     for label, c in (("largest", clusters[0]), ("median", clusters[len(clusters) // 2])):
         files, r = py_cluster_files(cl, tok, c["id"])
@@ -280,6 +280,7 @@ def main():
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--cover-size", type=int, default=COVER_SIZE)
     ap.add_argument("--thumb-size", type=int, default=THUMB_SIZE)
+    ap.add_argument("--min", type=int, default=PY_MIN, help="python API only: min cluster size (frontend uses 5)")
     ap.add_argument("--max-covers", type=int, default=0)
     ap.add_argument("--compare", help="older result JSON to diff against")
     ap.add_argument("--base", default="https://aladjidi.xyz")
