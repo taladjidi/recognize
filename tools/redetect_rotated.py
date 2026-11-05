@@ -5,7 +5,7 @@ EXIF orientation other than 1 faces were found sideways: misplaced boxes, poor
 embeddings. This re-runs detection on the upright image and, per file:
 
 - matches fresh faces to the existing detections by IoU in raw coordinates
-  (greedy best IoU >= 0.3; a clustered row also needs a mutual unique best match)
+  (greedy best IoU >= 0.3; a clustered or user-removed row also needs a mutual unique best match)
   and UPDATEs each match in place (box + vector only: id, cluster_id, threshold
   and user_id stay, so names and manual edits survive);
 - a removed face's threshold (PHP: old vector's distance to the cluster) shrinks by
@@ -84,7 +84,8 @@ def match(old, new):
     for v, i, j in pairs:
         if v < MIN_IOU:
             break
-        if (old[i].get("cluster_id") or 0) > 0 and not (
+        # Named rows and user-removed rows (threshold > 0) both need a mutual unique best match.
+        if not _unassigned(old[i]) and not (
                 _unique_best(m[i]) == j and _unique_best([r[j] for r in m]) == i):
             continue
         if i not in used_o and j not in used_n:
@@ -101,7 +102,8 @@ def _same(row, face):
 
 
 def _unassigned(row):
-    return (row["cluster_id"] is None or row["cluster_id"] <= 0) and not (row["threshold"] or 0) > 0
+    cid = row.get("cluster_id")
+    return (cid is None or cid <= 0) and not (row.get("threshold") or 0) > 0
 
 
 def candidates(db):

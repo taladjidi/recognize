@@ -536,7 +536,8 @@ class DB:
         cur = self._execute(
             f"UPDATE {t} SET x = {p}, y = {p}, width = {p}, height = {p}, face_vector = {p}, threshold = {p} "
             f"WHERE id = {p} AND (cluster_id = {p} OR (cluster_id IS NULL AND {p} IS NULL)) "
-            f"AND (threshold = {p} OR (threshold IS NULL AND {p} IS NULL))",
+            # Tolerance, not equality: a DOUBLE may come back with fewer digits than stored.
+            f"AND (ABS(threshold - {p}) < 1e-9 OR (threshold IS NULL AND {p} IS NULL))",
             (face["x"], face["y"], face["width"], face["height"], json.dumps(face["vector"]),
              row["threshold"] if threshold is None else threshold, row["id"],
              row["cluster_id"], row["cluster_id"], row["threshold"], row["threshold"]),

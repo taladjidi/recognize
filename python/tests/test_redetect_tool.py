@@ -389,3 +389,28 @@ def test_requeue_faceless_dry_run_writes_nothing(queue):
     assert _pending(db) == {}
     assert db._execute("SELECT COUNT(*) FROM oc_appconfig").fetchone()[0] == 0
     assert rd.requeue_faceless(db, dry_run=True)["requeued"] == 2
+
+
+def test_removed_row_needs_a_mutual_best_match_too(env):
+    """Same group photo, but the big sideways box is a face the user REMOVED from a person
+    (threshold > 0, no cluster): it must not take a neighbour's face either (Opus re-review)."""
+    db, _, root = env
+    p = _photo(env, 10, "a.jpg", 6)
+    removed = _old(db, 10, _box(0.10, 0.10, 0.40, 0.40), threshold=1.5)
+    other = _old(db, 10, _box(0.11, 0.10, 0.25, 0.25))
+    fresh = [_box(0.10, 0.10, 0.25, 0.25), _box(0.27, 0.27, 0.23, 0.23)]
+    before = _rows(db)[removed]
+    s = rd.run(db, Detector({p: fresh}), root)
+    assert _rows(db)[removed] == before
+    assert p in s["needs_review"]
+
+
+def test_update_guard_tolerates_threshold_round_trip(env):
+    """MariaDB may return a DOUBLE with fewer digits than it stores; the race guard must not
+    treat that as a concurrent edit (it would skip every removed face forever)."""
+    db, _, _ = env
+    rid = _old(db, 10, _box(0.5, 0.5), threshold=0.123456789012345)
+    row = dict(_rows(db)[rid], id=rid)
+    row["threshold"] = 0.123456789012  # what a less precise round trip could give back
+    face = {**_box(0.4, 0.4), "vector": [0.0] * 4}
+    assert db.update_face_detection_box(row, face) == 1
