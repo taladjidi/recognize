@@ -20,7 +20,8 @@ remove a face) stay on the existing DAV endpoints for now.
 - At detection time the face worker already holds the decoded image. For each face it
   writes a 256x256 JPEG (quality ~82) of the box expanded 1.6x around its centre,
   clamped to the image, then rotated to display orientation by the photo's EXIF
-  orientation (detection runs on raw pixels; the stored box stays in raw coordinates).
+  orientation (detection runs on the EXIF-upright image since 2026-11-05; the stored box is
+  converted back to raw coordinates, so crops and the API are unchanged).
 - Path: `<crop_root>/<user_id>/<detection_id>.jpg`, `crop_root` =
   `/var/lib/nextcloud/recognize-faces` (outside the data dir so Nextcloud never scans it;
   default SELinux label there is httpd_sys_rw_content_t). Written to a temp file in the same
@@ -74,5 +75,13 @@ DAV baselines in `bench-results/`.
 
 ## Out of scope for now
 
-Grid thumbnails of a cluster's photos (Nextcloud previews, ~85 ms each), the EXIF fix in
-detection itself (needs re-detection and name-preserving re-clustering), writes.
+Grid thumbnails of a cluster's photos (Nextcloud previews, ~85 ms each), writes.
+
+## EXIF-rotated photos (2026-11-05)
+
+Detection used to run on raw pixels, so faces in photos with EXIF orientation 2-8 were found
+sideways (misplaced boxes, poor embeddings). `FaceClassifier.detect` now detects on the upright
+image and maps each box back with `crops.box_to_raw`. Existing detections are fixed by
+`tools/redetect_rotated.py` (in place by IoU: ids, clusters, names and thresholds kept; see its
+docstring). Clustering only ever assigns `cluster_id IS NULL` rows, so the new vectors never move
+a named face (`test_redetected_vectors_never_move_clustered_rows`).

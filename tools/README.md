@@ -37,3 +37,11 @@ Run 1 is reported apart (cold-ish); the median is over runs 2..N. HTTP/1.1 with
 Server side (which part is the database), run as the web user:
 
     sudo -u apache php tools/probe_faces_timing.php tangui [clusterId]
+
+## Re-detecting EXIF-rotated photos
+
+`redetect_rotated.py` re-runs face detection on photos with an EXIF rotation, updating
+detections in place so names and manual edits stay (details in its docstring). Dry run first:
+
+    sudo -u apache /usr/share/nextcloud/apps/recognize/python/.venv/bin/python \
+        tools/redetect_rotated.py /usr/share/nextcloud/apps/recognize/python/nc_config.json --dry-run --limit 50

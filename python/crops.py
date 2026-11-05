@@ -28,7 +28,7 @@ QUALITY = 82
 CROP_NAME_RE = re.compile(r"^([0-9]+)\.jpg$")
 
 # EXIF orientation -> the transpose that shows the image upright (as ImageOps.exif_transpose).
-# Applied to the crop: detection and the stored box are in raw pixel coordinates.
+# Detection runs on the upright image; the stored box and the crop source are raw pixels.
 _ORIENT = {
     2: Image.Transpose.FLIP_LEFT_RIGHT,
     3: Image.Transpose.ROTATE_180,
@@ -41,7 +41,27 @@ _ORIENT = {
 # Direction of upright 'up' in raw pixel space, per EXIF orientation (box is in raw coordinates).
 _UP = {1: (0, -1), 2: (0, -1), 3: (0, 1), 4: (0, 1), 5: (-1, 0), 6: (-1, 0), 7: (1, 0), 8: (1, 0)}
 
+# Upright relative point (u, v) -> raw relative point, per EXIF orientation (inverse of _ORIENT).
+_TO_RAW = {
+    2: lambda u, v: (1 - u, v),
+    3: lambda u, v: (1 - u, 1 - v),
+    4: lambda u, v: (u, 1 - v),
+    5: lambda u, v: (v, u),
+    6: lambda u, v: (v, 1 - u),
+    7: lambda u, v: (1 - v, 1 - u),
+    8: lambda u, v: (1 - v, u),
+}
+
 _enospc_logged = False
+
+
+def box_to_raw(box, orientation):
+    """{x, y, width, height} relative to the upright image -> the same box relative to the raw image."""
+    f = _TO_RAW.get(orientation)
+    if f is None:
+        return {k: box[k] for k in ("x", "y", "width", "height")}
+    (ax, ay), (bx, by) = f(box["x"], box["y"]), f(box["x"] + box["width"], box["y"] + box["height"])
+    return {"x": min(ax, bx), "y": min(ay, by), "width": abs(bx - ax), "height": abs(by - ay)}
 
 
 def crop_side(img_w, img_h, box):

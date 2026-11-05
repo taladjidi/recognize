@@ -473,6 +473,42 @@ class DB:
         self._execute(f"DELETE FROM {t} WHERE file_id = {self._ph()}", (file_id,))
         self._commit()
 
+    def face_detection_file_ids(self) -> list[int]:
+        """Distinct file ids that have face detections."""
+        t = self._table("recognize_face_detections")
+        return [r[0] for r in self._execute(f"SELECT DISTINCT file_id FROM {t}").fetchall()]
+
+    def get_face_detections_for_file(self, file_id: int) -> list[dict]:
+        t = self._table("recognize_face_detections")
+        cur = self._execute(
+            f"SELECT id, file_id, user_id, x, y, width, height, face_vector, cluster_id, threshold "
+            f"FROM {t} WHERE file_id = {self._ph()} ORDER BY id", (file_id,)
+        )
+        rows = self._fetchall_dicts(cur)
+        for row in rows:
+            if isinstance(row["face_vector"], str):
+                row["face_vector"] = json.loads(row["face_vector"])
+        return rows
+
+    def update_face_detection_box(self, detection_id: int, face: dict):
+        """New box + vector for a detection; id, cluster_id, threshold, user_id untouched. Caller commits."""
+        t = self._table("recognize_face_detections")
+        self._execute(
+            f"UPDATE {t} SET x = {self._ph()}, y = {self._ph()}, width = {self._ph()}, height = {self._ph()}, "
+            f"face_vector = {self._ph()} WHERE id = {self._ph()}",
+            (face["x"], face["y"], face["width"], face["height"], json.dumps(face["vector"]), detection_id),
+        )
+
+    def delete_detection_if_unassigned(self, detection_id: int) -> int:
+        """Delete a detection only while it has no cluster and no user threshold. Caller commits."""
+        t = self._table("recognize_face_detections")
+        # Re-checked in SQL: the daemon may cluster the row between our read and this delete.
+        cur = self._execute(
+            f"DELETE FROM {t} WHERE id = {self._ph()} AND (cluster_id IS NULL OR cluster_id <= 0) "
+            f"AND (threshold IS NULL OR threshold <= 0)", (detection_id,)
+        )
+        return cur.rowcount
+
     def get_face_detections_for_user(self, user_id: str) -> list[dict]:
         """Get all face detections for a user (for clustering)."""
         t = self._table("recognize_face_detections")

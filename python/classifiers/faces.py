@@ -1,7 +1,8 @@
 """Face detection and recognition using InsightFace (ONNX).
 
 Uses InsightFace's buffalo_l model pack (det + recognition + landmark_3d_68).
-Produces 512-dim normalized face embeddings with bounding boxes in relative coords.
+Produces 512-dim normalized face embeddings with bounding boxes in relative coords
+(detected on the EXIF-upright image, returned relative to the raw image).
 
 Output per image: list of face dicts with keys:
   angle: {roll, yaw}
@@ -16,7 +17,7 @@ import sys
 
 import numpy as np
 import onnxruntime as ort
-from PIL import Image
+from PIL import Image, ImageOps
 
 log = logging.getLogger(__name__)
 
@@ -178,17 +179,16 @@ class FaceClassifier:
         log.info("Face classifier initialized")
 
     def preprocess(self, img_path):
-        """Load image as BGR numpy array (InsightFace format).
+        """Load the upright (EXIF-transposed) image as BGR numpy array (InsightFace format).
 
-        Args:
-            img_path: Path to image file.
+        infer_one() on it gives upright boxes; classify() returns raw ones.
 
         Returns:
             numpy array [H, W, 3] uint8 BGR.
         """
-        img = Image.open(img_path).convert("RGB")
-        arr = np.array(img)
-        return arr[:, :, ::-1]  # RGB -> BGR
+        with Image.open(img_path) as im:
+            img = ImageOps.exif_transpose(im).convert("RGB")
+        return np.array(img)[:, :, ::-1]  # RGB -> BGR
 
     def infer_one(self, img_bgr):
         """Run face detection on a single BGR image.
@@ -203,24 +203,35 @@ class FaceClassifier:
         faces = self.app.get(img_bgr)
         return [f for f in (_extract_face(face, width, height) for face in faces) if f]
 
+    def detect(self, img, orientation):
+        """Faces of the raw RGB image, detected upright (EXIF orientation applied).
+
+        The returned boxes are relative to the raw image, as stored and served.
+        """
+        from crops import _ORIENT, box_to_raw
+        t = _ORIENT.get(orientation)
+        up = img.transpose(t) if t is not None else img
+        faces = self.infer_one(np.array(up)[:, :, ::-1])
+        return [{**f, **box_to_raw(f, orientation)} for f in faces]
+
     def classify(self, img_path):
-        """Convenience: preprocess + detect faces in a single image.
+        """Detect faces in a single image; boxes relative to the raw image.
 
         Returns:
             List of face dicts.
         """
-        img_bgr = self.preprocess(img_path)
-        return self.infer_one(img_bgr)
+        from crops import open_raw
+        return self.detect(*open_raw(img_path))
 
     def classify_with_crops(self, img_path):
         """(faces, crops): crops[i] is the JPEG of faces[i], or None if it failed.
 
-        Same pixels as classify() (raw, not EXIF-rotated), so the stored boxes stay
-        in raw coordinates; only the crop is turned upright.
+        Detection runs on the upright image; the boxes are converted back to raw
+        coordinates (as stored), and make_crop turns the crop upright from raw pixels.
         """
         from crops import make_crop, open_raw
         img, orientation = open_raw(img_path)
-        faces = self.infer_one(np.array(img)[:, :, ::-1])
+        faces = self.detect(img, orientation)
         crops = []
         for face in faces:
             try:

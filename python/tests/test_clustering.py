@@ -231,6 +231,31 @@ class TestClusterRegressions:
         stats = cluster_user_faces(db, "alice")
         assert stats["n_assigned"] == 1, "only the fresh face may be assigned"
 
+    def test_redetected_vectors_never_move_clustered_rows(self, db):
+        """tools/redetect_rotated.py rewrites vectors of clustered rows in place: even when a
+        new vector sits on another person's cluster, the row keeps its cluster (and its name)."""
+        np.random.seed(7)
+        ca, cb = (v / np.linalg.norm(v) for v in np.random.randn(2, 512).astype(np.float32))
+        ids_a = _insert_faces(db, "alice", [_make_embedding(ca) for _ in range(10)], file_id_start=1000)
+        ids_b = _insert_faces(db, "alice", [_make_embedding(cb) for _ in range(10)], file_id_start=2000)
+        cluster_user_faces(db, "alice")
+        before = {d["id"]: d["cluster_id"] for d in db.get_face_detections_for_user("alice")}
+        assert before[ids_a[0]] != before[ids_b[0]]
+        t = db._table("recognize_face_clusters")
+        db._execute(f"UPDATE {t} SET title = 'Tom' WHERE id = {db._ph()}", (before[ids_a[0]],))
+        for i in ids_a[:4]:
+            db.update_face_detection_box(i, {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4,
+                                             "vector": _make_embedding(cb).tolist()})
+        db.commit()
+        new = _insert_faces(db, "alice", [_make_embedding(cb) for _ in range(5)], file_id_start=3000)
+
+        cluster_user_faces(db, "alice")
+        after = {d["id"]: d["cluster_id"] for d in db.get_face_detections_for_user("alice")}
+        assert {i: after[i] for i in before} == before
+        assert all(after[i] == before[ids_b[0]] for i in new)
+        titles = {c["id"]: c["title"] for c in db.get_face_clusters_for_user("alice")}
+        assert titles[before[ids_a[0]]] == "Tom"
+
     def test_php_removed_face_not_put_back(self, db):
         """Face removed PHP-style (threshold = distance to old centroid incl. itself)."""
         np.random.seed(42)

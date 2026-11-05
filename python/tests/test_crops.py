@@ -315,18 +315,65 @@ def test_crop_size_of_a_face(tmp_path):
     assert crops.QUALITY == 82
 
 
-def test_face_classifier_crops_align_with_faces_on_raw_pixels(tmp_path):
+RAW_RECT = (50, 40, 130, 100)  # l, t, r, b in raw pixels: asymmetric, so every flip/turn shows
+
+
+def _rect_photo(path, orientation):
+    """Lossless raw W x H photo with one white rectangle at RAW_RECT and an EXIF orientation."""
+    img = Image.new("RGB", (W, H))
+    img.paste((255, 255, 255), RAW_RECT)
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    img.save(path, "PNG", exif=exif)
+
+
+def _raw_rel():
+    l, t, r, b = RAW_RECT
+    return {"x": l / W, "y": t / H, "width": (r - l) / W, "height": (b - t) / H}
+
+
+@pytest.mark.parametrize("orientation", range(1, 9))
+def test_box_to_raw_inverts_pillow_exif_transpose(tmp_path, orientation):
+    """A box found on Pillow's own upright image maps back exactly onto the raw rectangle."""
+    path = str(tmp_path / f"o{orientation}.png")
+    _rect_photo(path, orientation)
+    up = ImageOps.exif_transpose(Image.open(path)).convert("L")
+    l, t, r, b = up.getbbox()
+    uw, uh = up.size
+    upright = {"x": l / uw, "y": t / uh, "width": (r - l) / uw, "height": (b - t) / uh}
+    got = crops.box_to_raw(upright, orientation)
+    assert got == pytest.approx(_raw_rel(), abs=1e-12)
+
+
+def _mark_detector(bgr):
+    """Stub detector: the white rectangle's box, relative to the pixels it is given."""
+    ys, xs = np.nonzero(bgr.sum(axis=2) > 600)
+    h, w = bgr.shape[:2]
+    return [{"x": xs.min() / w, "y": ys.min() / h, "width": (xs.max() + 1 - xs.min()) / w,
+             "height": (ys.max() + 1 - ys.min()) / h, "vector": [1.0], "score": 0.9}]
+
+
+@pytest.mark.parametrize("orientation", range(1, 9))
+def test_face_classifier_detects_upright_and_returns_raw_boxes(tmp_path, orientation):
     import sys
     sys.modules.setdefault("onnxruntime", MagicMock())
     from classifiers.faces import FaceClassifier
-    path = str(tmp_path / "o6.jpg")
-    _marked_jpeg(path, 6)
+    path = str(tmp_path / f"o{orientation}.png")
+    _rect_photo(path, orientation)
     clf = FaceClassifier.__new__(FaceClassifier)  # no model: infer_one is stubbed
     seen = []
-    clf.infer_one = lambda bgr: seen.append(bgr.shape) or [dict(FACE), dict(FACE)]
+    clf.infer_one = lambda bgr: seen.append(bgr.copy()) or _mark_detector(bgr)
     faces, out = clf.classify_with_crops(path)
-    assert seen == [(H, W, 3)]  # detection sees raw (unrotated) pixels
-    assert len(out) == len(faces) == 2 and all(_decode(c).shape == (CROP_SIZE, CROP_SIZE, 3) for c in out)
+    up = np.asarray(ImageOps.exif_transpose(Image.open(path)).convert("RGB"))[:, :, ::-1]
+    assert len(seen) == 1 and np.array_equal(seen[0], up)  # detection sees the upright image
+    assert {k: faces[0][k] for k in ("x", "y", "width", "height")} == pytest.approx(_raw_rel(), abs=1e-12)
+    assert faces[0]["vector"] == [1.0] and _decode(out[0]).shape == (CROP_SIZE, CROP_SIZE, 3)
+    # The crop of the returned raw box is the upright rectangle, centred (make_crop's contract).
+    c = _decode(out[0])
+    assert c[CROP_SIZE // 2, CROP_SIZE // 2].min() > 200
+    clf2 = FaceClassifier.__new__(FaceClassifier)
+    clf2.infer_one = _mark_detector
+    assert clf2.classify(path)[0]["x"] == pytest.approx(_raw_rel()["x"])
 
 
 @pytest.mark.parametrize("orientation", range(1, 9))
