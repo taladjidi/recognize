@@ -5,7 +5,7 @@ Nextcloud picks the preview provider from the extension, so a Photoshop PSD name
 a JPEG named .HEIC never gets a preview (found 2026-11-05: 66 PSD-as-JPG, 7 JPEG-as-HEIC
 in the Faces clusters). Input: the "failed:" lines of tools/warm_previews.py.
 
-  - PSD named .jpg/.jpeg: the original is first COPYed server-side to
+  - PSD or SGI named .jpg/.jpeg: the original is first COPYed server-side to
     /Archives/mislabelled-originals/<path>.psd (+ a .nomedia marker, so Recognize and
     Photos ignore the backups), its size checked, then the file is flattened to RGB, saved
     as JPEG q95 (ICC profile kept) and PUT over the same path: same file id.
@@ -29,6 +29,8 @@ import urllib.request
 from PIL import Image
 
 BACKUP_ROOT = "Archives/mislabelled-originals"
+# Formats Pillow reads that were found saved under a .JPG name, and the backup extension.
+CONVERTIBLE = {"PSD": ".psd", "SGI": ".sgi"}
 
 
 class Dav:
@@ -92,15 +94,15 @@ def main() -> int:
     dav = Dav(a.base, a.user, pw)
     paths = sorted({m.group(1) for line in open(a.warm_log)
                     if (m := re.search(r"failed: .*\((.+)\)\s*$", line))})
-    counts = {"psd->jpeg": 0, "jpeg-heic->jpg": 0, "left alone": 0, "errors": 0}
+    counts = {"converted": 0, "jpeg-heic->jpg": 0, "left alone": 0, "errors": 0}
     marker_done = set()
     for p in paths:
         ext = os.path.splitext(p)[1].lower()
         fmt = true_format(dav, p)
         try:
-            if fmt == "PSD" and ext in (".jpg", ".jpeg"):
-                backup = f"{BACKUP_ROOT}/{os.path.splitext(p)[0]}.psd"
-                print(f"psd->jpeg  {p}\n           backup {backup}")
+            if fmt in CONVERTIBLE and ext in (".jpg", ".jpeg"):
+                backup = f"{BACKUP_ROOT}/{os.path.splitext(p)[0]}{CONVERTIBLE[fmt]}"
+                print(f"{fmt.lower()}->jpeg {p}\n           backup {backup}")
                 if a.apply:
                     bdir = os.path.dirname(backup)
                     dav.mkcol_p(bdir)
@@ -120,7 +122,7 @@ def main() -> int:
                     dav.req("PUT", p, data=out.getvalue(), headers={"Content-Type": "image/jpeg"})
                     if true_format(dav, p) != "JPEG":
                         raise RuntimeError("uploaded file does not read back as JPEG")
-                counts["psd->jpeg"] += 1
+                counts["converted"] += 1
             elif fmt == "JPEG" and ext in (".heic", ".heif"):
                 target = os.path.splitext(p)[0] + ".jpg"
                 print(f"rename     {p}\n        -> {target}")
