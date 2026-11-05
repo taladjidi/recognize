@@ -99,13 +99,9 @@ The app does not send any sensitive data to cloud providers or similar services.
 	</background-jobs>
 
 	<repair-steps>
-		<post-migration>
-		</post-migration>
 		<live-migration>
 			<step>OCA\Recognize\Migration\RemoveDuplicateFaceDetections</step>
 		</live-migration>
-		<install>
-		</install>
 	</repair-steps>
 
 	<commands>
