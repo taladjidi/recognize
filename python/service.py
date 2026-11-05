@@ -17,6 +17,7 @@ import multiprocessing as mp
 import os
 import signal
 import sys
+import threading
 import time
 
 log = logging.getLogger("recognize")
@@ -34,7 +35,7 @@ CLUSTER_INTERVAL = 300       # Re-cluster every 5 minutes
 # Face crops: idle-time backfill + orphan cleanup
 CROP_BATCH = 200             # detections examined per idle tick
 CROP_TICK_SECONDS = 2.0      # wall-clock budget per idle tick, so new work waits at most this
-CROP_BUSY_BATCH = 25         # detections examined after each classifier pass, so backfill moves under load
+CROP_THREAD_PAUSE = 0.5      # the crop thread rests this long between ticks (bounds its CPU share)
 CROP_RESCAN_INTERVAL = 3600  # after a full backfill pass and cleanup round, rest this long
 CROP_LOG_EVERY = 500         # INFO line every N crops created by the backfill
 
@@ -92,11 +93,14 @@ class Service:
         self._crop_done = {"backfill": False, "cleanup": False}
         self._crop_rest_until = 0.0
         self._crop_root_warned = False
+        self._crop_thread = None
 
     def start(self):
         """Start the service main loop."""
         self._running = True
         self._setup_signals()
+        self._crop_thread = threading.Thread(target=self._crop_loop, name="crops", daemon=True)
+        self._crop_thread.start()
 
         log.info("Service starting (models_dir=%s)", self.models_dir)
 
@@ -111,6 +115,9 @@ class Service:
         """Clean shutdown."""
         self._running = False
         log.info("Service stopping")
+        self.pipeline.stopping.set()
+        if self._crop_thread:
+            self._crop_thread.join(timeout=5)
         self.pipeline.close()
         log.info("Service stopped")
 
@@ -167,11 +174,8 @@ class Service:
                     self._poll_interval * POLL_BACKOFF_FACTOR,
                     POLL_MAX_INTERVAL,
                 )
-                self._crop_maintenance()
             else:
                 self._poll_interval = POLL_MIN_INTERVAL
-            if had_work and self._running:
-                self._crop_maintenance(busy=True)
 
             # Periodic face clustering
             now = time.monotonic()
@@ -379,13 +383,39 @@ class Service:
             if data:
                 write_crop(self.crop_root, owner, det_id, data)
 
-    def _crop_maintenance(self, busy=False):
-        """Idle tick: a bounded slice of crop backfill, then one user dir of orphan cleanup.
+    def _crop_loop(self):
+        """Crop thread: CPU work (decode/crop/write) concurrent with the GPU passes.
 
-        busy: a small backfill slice after a classifier pass (no cleanup).
+        Own DB connection (connections are not shared across threads). Never raises.
+        """
+        from db import DB
+        stop = self.pipeline.stopping
+        db = None
+        while not stop.is_set():
+            try:
+                if db is None:
+                    db = DB(self.config)
+                db.ping()
+                self._crop_maintenance(db=db)
+            except Exception as e:
+                log.error("Face crop thread: %s", e)
+                try:
+                    db and db.close()
+                except Exception:
+                    pass
+                db = None
+            stop.wait(CROP_THREAD_PAUSE)
+        try:
+            db and db.close()
+        except Exception:
+            pass
+
+    def _crop_maintenance(self, db=None):
+        """One tick: a bounded slice of crop backfill, then one user dir of orphan cleanup.
 
         Never raises: crops are derived data and must not stop classification.
         """
+        db = db or self.pipeline.db
         now = time.monotonic()
         if now < self._crop_rest_until or "faces" not in self.pipeline._enabled:
             return
@@ -397,24 +427,22 @@ class Service:
         try:
             deadline = now + CROP_TICK_SECONDS
             if not self._crop_done["backfill"]:
-                self._crop_done["backfill"] = self._backfill_crops(deadline, CROP_BUSY_BATCH if busy else CROP_BATCH)
-            if busy:
-                return
+                self._crop_done["backfill"] = self._backfill_crops(deadline, CROP_BATCH, db)
             if not self._crop_done["cleanup"] and time.monotonic() < deadline:
-                self._crop_done["cleanup"] = self._cleanup_crops_one_user()
+                self._crop_done["cleanup"] = self._cleanup_crops_one_user(db)
             if all(self._crop_done.values()):
                 self._crop_done = {"backfill": False, "cleanup": False}
                 self._crop_rest_until = time.monotonic() + CROP_RESCAN_INTERVAL
         except Exception as e:
             log.error("Face crop maintenance failed: %s", e)
 
-    def _backfill_crops(self, deadline, batch=CROP_BATCH):
+    def _backfill_crops(self, deadline, batch=CROP_BATCH, db=None):
         """Create missing crops for up to `batch` detections; True when a full pass ended.
 
         A pass first covers only each cluster's largest box, then everything.
         """
         from crops import has_crop, make_crop, open_raw, write_crop
-        db = self.pipeline.db
+        db = db or self.pipeline.db
         rows = db.detections_after(self._crop_cursor, batch, covers_only=not self._crop_covers_done)
         if not rows and not self._crop_covers_done:
             self._crop_covers_done, self._crop_cursor = True, 0
@@ -433,7 +461,7 @@ class Service:
         missing = {fid: rs for fid, rs in missing.items() if rs}
         paths = db.resolve_file_paths(list(missing)) if missing else {}
         for fid, rs in by_file.items():
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= deadline or self.pipeline.stopping.is_set():
                 return False  # cursor stays before this file: resumed next tick
             info = paths.get(fid)
             if fid in missing and info:
@@ -451,7 +479,7 @@ class Service:
             self._crop_cursor = max(r["id"] for r in rs)
         return False
 
-    def _cleanup_crops_one_user(self):
+    def _cleanup_crops_one_user(self, db=None):
         """Delete orphan crops in one user dir; True when every user dir was visited this round."""
         from crops import crop_ids, safe_user_dir
         if not self._crop_users:
@@ -463,7 +491,7 @@ class Service:
         user_dir = safe_user_dir(self.crop_root, user)
         if user_dir is not None:
             files = crop_ids(user_dir)
-            alive = self.pipeline.db.existing_detection_ids(user, sorted(files)) if files else set()
+            alive = (db or self.pipeline.db).existing_detection_ids(user, sorted(files)) if files else set()
             removed = 0
             for det_id, name in files.items():
                 if det_id not in alive:

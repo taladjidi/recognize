@@ -19,22 +19,44 @@ def test_backfill_does_covers_first(svc, tmp_path):  # noqa: F811
     db._execute("UPDATE oc_recognize_face_detections SET cluster_id = 1 WHERE id IN (?, ?)", (small, big))
     paths = {10: {"path": photo, "mimetype": "image/jpeg", "storage": 1, "owner": "alice"}}
     with patch.object(db, "resolve_file_paths", side_effect=lambda ids: {i: paths[i] for i in ids if i in paths}), \
-            patch("service.CROP_BUSY_BATCH", 1):
-        svc._crop_maintenance(busy=True)
+            patch("service.CROP_BATCH", 1):
+        svc._crop_maintenance()
     assert os.listdir(tmp_path / "crops" / "alice") == [f"{big}.jpg"]  # the cluster's largest, not id order
 
 
-def test_busy_slice_runs_after_a_classifier_pass(svc):  # noqa: F811
-    seen = []
-    with patch.object(svc, "_run_classifier_passes", return_value=True), \
-            patch.object(svc, "_crop_maintenance", side_effect=lambda busy=False: seen.append(busy)), \
-            patch.object(svc.pipeline.db, "check_maintenance_mode", return_value=False), \
-            patch.object(svc.pipeline.db, "set_app_value"), \
-            patch.object(svc, "_refresh_enabled"), patch.object(svc, "_consume_deleted"), \
-            patch("service.Service._sleep", side_effect=lambda s: setattr(svc, "_running", False)):
-        svc._running = True
-        svc._main_loop()
-    assert seen == [True]
+def test_crop_thread_progresses_during_a_pass_and_stops_promptly(svc, tmp_path):  # noqa: F811
+    db = svc.pipeline.db
+    photo = str(tmp_path / "p.jpg")
+    _marked_jpeg(photo, 1)
+    ids = [_det(db, 10, "alice", {**FACE, "x": 0.1 * i}) for i in range(3)]
+    db._commit()
+    paths = {10: {"path": photo, "mimetype": "image/jpeg", "storage": 1, "owner": "alice"}}
+    root = tmp_path / "crops" / "alice"
+    t = threading.Thread(target=svc._crop_loop)
+    with patch("db.DB.resolve_file_paths", side_effect=lambda self_, ids_: {i: paths[i] for i in ids_ if i in paths},
+               autospec=True), patch("service.CROP_THREAD_PAUSE", 0.05):
+        t.start()
+        t0 = time.monotonic()
+        time.sleep(0.2)  # stands in for a long classifier pass on the main thread
+        while time.monotonic() - t0 < 10 and not (root.is_dir() and len(os.listdir(root)) == 3):
+            time.sleep(0.05)
+        assert sorted(os.listdir(root)) == sorted(f"{i}.jpg" for i in ids)
+        t1 = time.monotonic()
+        svc.pipeline.stopping.set()
+        t.join(5)
+    assert not t.is_alive() and time.monotonic() - t1 < 2
+
+
+def test_crop_thread_survives_exceptions(svc):  # noqa: F811
+    with patch.object(svc, "_crop_maintenance", side_effect=RuntimeError("boom")), \
+            patch("service.CROP_THREAD_PAUSE", 0.01):
+        t = threading.Thread(target=svc._crop_loop)
+        t.start()
+        time.sleep(0.2)
+        assert t.is_alive()
+        svc.pipeline.stopping.set()
+        t.join(2)
+    assert not t.is_alive()
 
 
 def _sleeper(pipe):
