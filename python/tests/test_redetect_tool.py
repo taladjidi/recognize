@@ -195,3 +195,97 @@ def test_greedy_match_prefers_best_iou_and_respects_minimum():
     new = [_box(0.51, 0.5), _box(0.01, 0.0), _box(0.9, 0.9, 0.05, 0.05)]
     assert sorted(rd.match(old, new)) == [(0, 1), (1, 0)]
     assert rd.iou(_box(0, 0), _box(0.5, 0.5)) == 0
+
+
+def test_clustered_row_needs_a_mutual_best_match(env):
+    """Group photo: a named sideways box covers two faces. Its best face is someone else's
+    better match, so greedy alone would hand it the second face (another person). It is
+    left alone instead and that face is inserted unclustered."""
+    db, _, root = env
+    p = _photo(env, 10, "a.jpg", 6)
+    named = _old(db, 10, _box(0.10, 0.10, 0.40, 0.40), cluster_id=5)
+    other = _old(db, 10, _box(0.11, 0.10, 0.25, 0.25))
+    fresh = [_box(0.10, 0.10, 0.25, 0.25), _box(0.27, 0.27, 0.23, 0.23)]
+    nb = _rows(db)[named]
+    assert rd.iou(nb, fresh[0]) > rd.iou(nb, fresh[1]) >= rd.MIN_IOU  # greedy would pair named with fresh[1]
+    s = rd.run(db, Detector({p: fresh}), root)
+    rows = _rows(db)
+    assert rows[named] == nb
+    assert rows[other]["x"] == pytest.approx(0.10)
+    (new_id,) = set(rows) - {named, other}
+    assert rows[new_id]["cluster_id"] is None and rows[new_id]["x"] == pytest.approx(0.27)
+    assert (s["matched"], s["inserted"], s["kept"]) == (1, 1, 1)
+
+
+def test_clustered_tie_is_not_a_match():
+    named = {**_box(0.5, 0.5, 0.25, 0.25), "cluster_id": 3}
+    left, right = _box(0.375, 0.5, 0.25, 0.25), _box(0.625, 0.5, 0.25, 0.25)  # exactly equal IoU
+    assert rd.iou(named, left) == rd.iou(named, right) >= rd.MIN_IOU
+    assert rd.match([named], [left, right]) == []
+    assert len(rd.match([{**named, "cluster_id": None}], [left, right])) == 1
+
+
+@pytest.fixture
+def queue(env):
+    db, _, _ = env
+    db.create_pending_table()
+    db._execute("CREATE TABLE oc_appconfig (appid TEXT, configkey TEXT, configvalue TEXT, "
+                "PRIMARY KEY (appid, configkey))")
+    db._execute("INSERT INTO oc_storages VALUES (2, 'local::/mnt/x/')")
+    db._commit()
+    return env
+
+
+def _pending(db):
+    return {r[0]: (r[1], r[2]) for r in db._execute(
+        "SELECT file_id, storage_id, action FROM oc_recognize_pending").fetchall()}
+
+
+def _clear_pending(db):
+    db._execute("DELETE FROM oc_recognize_pending")
+    db._commit()
+
+
+def test_requeue_faceless_rotated_owner_images_only(queue):
+    db, _, _ = queue
+    _photo(queue, 1, "b.jpg", 6)          # rotated, no faces: requeued
+    _photo(queue, 2, "a.jpg", 3)          # rotated, no faces: requeued
+    _photo(queue, 3, "c.jpg", 1)          # upright: scanned, not requeued
+    _photo(queue, 4, "d.jpg", 8)          # rotated, has a detection
+    _old(db, 4, _box(0.1, 0.1))
+    _photo(queue, 5, "e.jpg", 6, mime=2)  # not an image mimetype
+    _photo(queue, 6, "f.jpg", 5)          # already pending (a delete): untouched
+    db.upsert_pending(6, 1, 2)
+    _photo(queue, 7, "g.jpg", 6)          # in the trash, not the owner's files/
+    db._execute("UPDATE oc_filecache SET path = 'files_trashbin/files/g.jpg' WHERE fileid = 7")
+    _photo(queue, 8, "h.jpg", 6)          # not a user storage
+    db._execute("UPDATE oc_filecache SET storage = 2 WHERE fileid = 8")
+    db._commit()
+    s = rd.requeue_faceless(db)
+    assert _pending(db) == {1: (1, 0), 2: (1, 0), 6: (1, 2)}  # 0 = PendingService::ACTION_CREATED
+    assert (s["scanned"], s["rotated"], s["requeued"]) == (3, 2, 2)
+
+
+def test_requeue_faceless_limit_resumes_and_a_finished_pass_requeues_nothing(queue):
+    db, _, _ = queue
+    for i, name in ((1, "c.jpg"), (2, "a.jpg"), (3, "b.jpg")):
+        _photo(queue, i, name, 6)
+    assert rd.requeue_faceless(db, limit=1)["requeued"] == 1
+    assert set(_pending(db)) == {2}  # path order: a.jpg first
+    _clear_pending(db)  # the daemon ran it and found no face: still faceless
+    assert rd.requeue_faceless(db)["requeued"] == 2  # resumes after a.jpg
+    assert set(_pending(db)) == {1, 3}
+    _clear_pending(db)
+    _photo(queue, 4, "z.jpg", 6)  # uploaded later: the fixed daemon already did it
+    assert rd.requeue_faceless(db)["requeued"] == 0  # pass complete
+    assert _pending(db) == {}
+
+
+def test_requeue_faceless_dry_run_writes_nothing(queue):
+    db, _, _ = queue
+    _photo(queue, 1, "a.jpg", 6)
+    _photo(queue, 2, "b.jpg", 6)
+    assert rd.requeue_faceless(db, dry_run=True, limit=1)["requeued"] == 1
+    assert _pending(db) == {}
+    assert db._execute("SELECT COUNT(*) FROM oc_appconfig").fetchone()[0] == 0
+    assert rd.requeue_faceless(db, dry_run=True)["requeued"] == 2

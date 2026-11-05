@@ -45,3 +45,6 @@ detections in place so names and manual edits stay (details in its docstring). D
 
     sudo -u apache /usr/share/nextcloud/apps/recognize/python/.venv/bin/python \
         tools/redetect_rotated.py /usr/share/nextcloud/apps/recognize/python/nc_config.json --dry-run --limit 50
+
+Add `--requeue-faceless` to instead queue rotated photos that have no detection at all
+(the old code often found no face in them) for the daemon; no model needed.

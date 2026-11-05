@@ -473,6 +473,33 @@ class DB:
         self._execute(f"DELETE FROM {t} WHERE file_id = {self._ph()}", (file_id,))
         self._commit()
 
+    def faceless_image_files(self) -> list[dict]:
+        """Owners' image files (files/, home:: or object::user:) with no face detection and no
+        pending row: {fileid, storage, path} with path absolute, or None when not on local disk."""
+        fc, s, m = self._table("filecache"), self._table("storages"), self._table("mimetypes")
+        det, pend = self._table("recognize_face_detections"), self._table("recognize_pending")
+        cur = self._execute(
+            f"SELECT fc.fileid, fc.storage, fc.path, s.id AS storage_id_str FROM {fc} fc "
+            f"JOIN {s} s ON fc.storage = s.numeric_id JOIN {m} m ON fc.mimetype = m.id "
+            f"WHERE m.mimetype IN ({self._ph(len(IMAGE_MIMES))}) AND fc.path LIKE 'files/%' AND fc.size > 0 "
+            f"AND (s.id LIKE 'home::%' OR s.id LIKE 'object::user:%') "
+            f"AND NOT EXISTS (SELECT 1 FROM {det} d WHERE d.file_id = fc.fileid) "
+            f"AND NOT EXISTS (SELECT 1 FROM {pend} p WHERE p.file_id = fc.fileid)",
+            IMAGE_MIMES,
+        )
+        rows = self._fetchall_dicts(cur)
+        for r in rows:
+            r["path"] = self._resolve_storage_path(r.pop("storage_id_str"), r["path"], self._config["datadirectory"])
+        return rows
+
+    def get_app_value(self, key: str) -> str | None:
+        t = self._table("appconfig")
+        row = self._execute(
+            f"SELECT configvalue FROM {t} WHERE appid = {self._ph()} AND configkey = {self._ph()}",
+            ("recognize", key),
+        ).fetchone()
+        return None if row is None else row[0]
+
     def face_detection_file_ids(self) -> list[int]:
         """Distinct file ids that have face detections."""
         t = self._table("recognize_face_detections")
