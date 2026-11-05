@@ -78,7 +78,7 @@ class TestAdaptivePolling:
             if call_count >= 2:
                 svc._running = False
 
-        with patch("service.time.sleep", side_effect=fake_sleep):
+        with patch("service.Service._sleep", side_effect=fake_sleep):
             svc._main_loop()
 
         assert svc._poll_interval > initial
@@ -116,7 +116,7 @@ class TestMaintenanceMode:
             assert seconds == POLL_MAX_INTERVAL
             svc._running = False
 
-        with patch("service.time.sleep", side_effect=fake_sleep):
+        with patch("service.Service._sleep", side_effect=fake_sleep):
             svc._main_loop()
 
         assert call_count == 1
@@ -233,7 +233,7 @@ class TestImagePassSubmits:
         api = self._api_failing(svc, 400)
         res = {10: {"tags": []}, 20: {"tags": []}}
         with patch.object(svc.pipeline, "process_images_tags", return_value=res), \
-             patch("service.time.sleep"):
+             patch("service.Service._sleep"):
             svc._run_classifier_passes()
         assert api.submit_results.call_count == 2
         assert _left(svc) == []
@@ -249,7 +249,7 @@ class TestImagePassSubmits:
         api = self._api_failing(svc, 503)
         res = {10: {"tags": []}, 20: {"tags": []}}
         with patch.object(svc.pipeline, "process_images_tags", return_value=res), \
-             patch("service.time.sleep") as sleep:
+             patch("service.Service._sleep") as sleep:
             assert svc._run_classifier_passes() is False
         assert api.submit_results.call_count == 1
         rows = svc.pipeline.db.fetch_pending(limit=9)
@@ -266,7 +266,7 @@ class TestImagePassSubmits:
         svc.pipeline.nc_api = api
         res = {10: {"tags": []}, 20: {"tags": []}}
         with patch.object(svc.pipeline, "process_images_tags", return_value=res), \
-             patch("service.time.sleep") as sleep:
+             patch("service.Service._sleep") as sleep:
             assert svc._run_classifier_passes() is False
         assert api.submit_results.call_count == 1  # stopped after the first 401
         assert _left(svc) == [10, 20]
@@ -356,7 +356,7 @@ class TestPendingHousekeeping:
         svc._running = True
         with patch.object(svc.pipeline.db, "check_maintenance_mode", return_value=True), \
              patch.object(svc, "_consume_deleted") as consume, \
-             patch("service.time.sleep", side_effect=lambda s: setattr(svc, "_running", False)):
+             patch("service.Service._sleep", side_effect=lambda s: setattr(svc, "_running", False)):
             svc._main_loop()
         consume.assert_not_called()
         svc.stop()
@@ -388,7 +388,7 @@ class TestPendingHousekeeping:
         svc._running = True
         with patch.object(svc.pipeline.db, "ping") as ping, \
              patch.object(svc.pipeline.db, "check_maintenance_mode", return_value=True), \
-             patch("service.time.sleep", side_effect=lambda s: setattr(svc, "_running", False)):
+             patch("service.Service._sleep", side_effect=lambda s: setattr(svc, "_running", False)):
             svc._main_loop()
         ping.assert_called()
         svc.stop()

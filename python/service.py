@@ -149,13 +149,13 @@ class Service:
                 # Maintenance first: nothing may be deleted while Nextcloud is down.
                 if self.pipeline.db.check_maintenance_mode():
                     log.info("Nextcloud in maintenance mode, waiting...")
-                    time.sleep(POLL_MAX_INTERVAL)
+                    self._sleep(POLL_MAX_INTERVAL)
                     continue
                 self._refresh_enabled()
                 self._consume_deleted()
             except Exception as e:
                 log.error("Database unavailable: %s", e)
-                time.sleep(POLL_MAX_INTERVAL)
+                self._sleep(POLL_MAX_INTERVAL)
                 continue
 
             had_work = self._run_classifier_passes()
@@ -180,7 +180,7 @@ class Service:
 
             # Sleep with interruptibility
             if self._running:
-                time.sleep(self._poll_interval)
+                self._sleep(self._poll_interval)
 
     def _refresh_enabled(self):
         """Re-read the admin page's model toggles (cheap query) so changes apply live."""
@@ -325,7 +325,7 @@ class Service:
         """
         images, videos, audios = self._fetch_and_resolve(limit=BATCH_SIZE)
         if images is None:
-            time.sleep(POLL_MAX_INTERVAL)
+            self._sleep(POLL_MAX_INTERVAL)
             return False
 
         if not images and not videos and not audios:
@@ -474,8 +474,12 @@ class Service:
                 log.info("Face crops: removed %d orphans for %s", removed, user)
         return not self._crop_users
 
+    def _sleep(self, seconds):
+        """Wait, but wake at once on SIGTERM: POLL_MAX_INTERVAL equals systemd's stop timeout."""
+        self.pipeline.stopping.wait(seconds)
+
     def _back_off(self):
-        time.sleep(POLL_MAX_INTERVAL)
+        self._sleep(POLL_MAX_INTERVAL)
         return False
 
     def _run_clustering(self):

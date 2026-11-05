@@ -31,7 +31,7 @@ def test_busy_slice_runs_after_a_classifier_pass(svc):  # noqa: F811
             patch.object(svc.pipeline.db, "check_maintenance_mode", return_value=False), \
             patch.object(svc.pipeline.db, "set_app_value"), \
             patch.object(svc, "_refresh_enabled"), patch.object(svc, "_consume_deleted"), \
-            patch("service.time.sleep", side_effect=lambda s: setattr(svc, "_running", False)):
+            patch("service.Service._sleep", side_effect=lambda s: setattr(svc, "_running", False)):
         svc._running = True
         svc._main_loop()
     assert seen == [True]
@@ -53,3 +53,16 @@ def test_sigterm_interrupts_a_running_worker_and_keeps_pending_rows(svc):  # noq
     assert svc._run_classifier_passes() is False  # stopping: no worker run, nothing submitted or deleted
     svc.pipeline.db.delete_pending_items.assert_not_called()
     svc.pipeline._submit_result.assert_not_called()
+
+
+def test_idle_sleep_wakes_on_sigterm(tmp_path):
+    """An idle 30 s back-off must not hold the stop: systemd's stop timeout is 30 s."""
+    import threading, time as _t
+    from service import Service
+    svc = Service.__new__(Service)
+    svc._running = True
+    svc.pipeline = type("P", (), {"stopping": threading.Event()})()
+    threading.Timer(0.3, svc.pipeline.stopping.set).start()
+    t0 = _t.monotonic()
+    svc._sleep(30)
+    assert _t.monotonic() - t0 < 2
