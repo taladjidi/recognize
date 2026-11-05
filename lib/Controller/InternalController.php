@@ -14,12 +14,8 @@ use OCA\Recognize\Db\FaceDetectionMapper;
 use OCA\Recognize\Service\TagManager;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
-use OCP\AppFramework\Http\DataResponse;
 use OCP\AppFramework\Http\JSONResponse;
-use OCP\AppFramework\Http\StreamResponse;
 use OCP\AppFramework\Services\IAppConfig;
-use OCP\Files\IRootFolder;
-use OCP\Files\NotFoundException;
 use OCP\IDBConnection;
 use OCP\IRequest;
 use Psr\Log\LoggerInterface;
@@ -29,7 +25,6 @@ use Psr\Log\LoggerInterface;
  *
  * Endpoints:
  *   POST /api/internal/results  — Write tags and/or face detections for a file
- *   GET  /api/internal/file/{id} — Stream file content (for S3/encrypted storage)
  *
  * Authentication: X-Recognize-Secret header, validated against appconfig.
  */
@@ -39,13 +34,15 @@ final class InternalController extends Controller {
 		IRequest $request,
 		private TagManager $tagManager,
 		private FaceDetectionMapper $faceDetectionMapper,
-		private IRootFolder $rootFolder,
 		private IAppConfig $appConfig,
 		private LoggerInterface $logger,
 		private IDBConnection $db,
 	) {
 		parent::__construct($appName, $request);
 	}
+
+	public const VECTOR_DIM = 512;
+	private const BBOX_EPSILON = 1e-6;
 
 	/**
 	 * @NoCSRFRequired
@@ -63,25 +60,18 @@ final class InternalController extends Controller {
 			return new JSONResponse(['error' => 'Missing file_id'], Http::STATUS_BAD_REQUEST);
 		}
 
-		// Write tags via ISystemTagManager (fires events, updates etags).
-		// Always, even with no labels: assignTags also adds the processed tag,
-		// and a file that never gets it is re-queued by CatchUpJob every day.
 		$tags = $body['tags'] ?? [];
-		if (is_array($tags)) {
-			try {
-				$this->tagManager->assignTags($fileId, $tags);
-			} catch (\Throwable $e) {
-				$this->logger->error('Failed to assign tags for file ' . $fileId, ['exception' => $e]);
-				return new JSONResponse(
-					['error' => 'Tag assignment failed: ' . $e->getMessage()],
-					Http::STATUS_INTERNAL_SERVER_ERROR
-				);
-			}
+		$faces = $body['faces'] ?? [];
+		$error = self::validateResults($tags, $faces);
+		if ($error !== null) {
+			return new JSONResponse(['error' => $error], Http::STATUS_BAD_REQUEST);
 		}
+		/** @var list<string> $tags */
+		/** @var list<array{x: float|int, y: float|int, width: float|int, height: float|int, vector: list<float|int>}> $faces */
 
-		// Write face detections directly to DB
-		$faces = $body['faces'] ?? null;
-		if (is_array($faces) && count($faces) > 0) {
+		// Faces first, tags last: assignTags() adds the processed tag, and a
+		// processed file is never retried, so its faces must be stored first.
+		if (count($faces) > 0) {
 			try {
 				$this->writeFaces($fileId, $faces);
 			} catch (\Throwable $e) {
@@ -93,52 +83,63 @@ final class InternalController extends Controller {
 			}
 		}
 
+		// Always, even with no labels: a file that never gets the processed tag
+		// is re-queued by CatchUpJob every day.
+		try {
+			$this->tagManager->assignTags($fileId, $tags);
+		} catch (\Throwable $e) {
+			$this->logger->error('Failed to assign tags for file ' . $fileId, ['exception' => $e]);
+			return new JSONResponse(
+				['error' => 'Tag assignment failed: ' . $e->getMessage()],
+				Http::STATUS_INTERNAL_SERVER_ERROR
+			);
+		}
+
 		return new JSONResponse(['status' => 'ok']);
 	}
 
 	/**
-	 * @NoCSRFRequired
-	 * @PublicPage
-	 * @NoAdminRequired
+	 * Check the daemon's payload before anything is written.
+	 *
+	 * @return ?string the error, or null when the payload is valid
 	 */
-	public function file(int $id): Http\Response {
-		if (!$this->validateSecret()) {
-			return new JSONResponse(['error' => 'Unauthorized'], Http::STATUS_UNAUTHORIZED);
+	public static function validateResults(mixed $tags, mixed $faces): ?string {
+		if (!is_array($tags) || !array_is_list($tags)) {
+			return 'tags must be a list';
 		}
-
-		try {
-			$nodes = $this->rootFolder->getById($id);
-			if (empty($nodes)) {
-				return new JSONResponse(['error' => 'File not found'], Http::STATUS_NOT_FOUND);
+		foreach ($tags as $tag) {
+			if (!is_string($tag) || $tag === '') {
+				return 'tags must be non-empty strings';
 			}
-			$node = $nodes[0];
-			if ($node->getType() !== \OCP\Files\FileInfo::TYPE_FILE) {
-				return new JSONResponse(['error' => 'Not a file'], Http::STATUS_BAD_REQUEST);
-			}
-
-			/** @var \OCP\Files\File $node */
-			$response = new DataResponse('');
-			$response->setStatus(Http::STATUS_OK);
-
-			// Use a callback response for streaming
-			$content = $node->getContent();
-			$mimeType = $node->getMimetype();
-
-			$response = new \OCP\AppFramework\Http\DataDownloadResponse(
-				$content,
-				$node->getName(),
-				$mimeType
-			);
-			return $response;
-		} catch (NotFoundException $e) {
-			return new JSONResponse(['error' => 'File not found'], Http::STATUS_NOT_FOUND);
-		} catch (\Throwable $e) {
-			$this->logger->error('Failed to stream file ' . $id, ['exception' => $e]);
-			return new JSONResponse(
-				['error' => 'File read failed'],
-				Http::STATUS_INTERNAL_SERVER_ERROR
-			);
 		}
+		if (!is_array($faces) || !array_is_list($faces)) {
+			return 'faces must be a list';
+		}
+		$isNumber = static fn (mixed $v): bool => (is_int($v) || is_float($v)) && is_finite((float)$v);
+		foreach ($faces as $i => $face) {
+			if (!is_array($face)) {
+				return "face $i is not an object";
+			}
+			$vector = $face['vector'] ?? null;
+			if (!is_array($vector) || !array_is_list($vector) || count($vector) !== self::VECTOR_DIM) {
+				return "face $i: vector must be a list of " . self::VECTOR_DIM . ' numbers';
+			}
+			foreach ($vector as $v) {
+				if (!$isNumber($v)) {
+					return "face $i: vector must contain only finite numbers";
+				}
+			}
+			foreach (['x', 'y', 'width', 'height'] as $key) {
+				$v = $face[$key] ?? null;
+				if (!$isNumber($v) || $v < 0 || $v > 1) {
+					return "face $i: $key must be a number in 0..1";
+				}
+			}
+			if ($face['x'] + $face['width'] > 1 + self::BBOX_EPSILON || $face['y'] + $face['height'] > 1 + self::BBOX_EPSILON) {
+				return "face $i: box extends past the image";
+			}
+		}
+		return null;
 	}
 
 	/**
@@ -149,8 +150,11 @@ final class InternalController extends Controller {
 		if ($stored === '') {
 			// Auto-generate secret on first call
 			$stored = bin2hex(random_bytes(32));
-			$this->appConfig->setAppValueString('internal_secret', $stored);
+			$this->appConfig->setAppValueString('internal_secret', $stored, false, true);
 			$this->logger->info('Generated new internal secret for recognize');
+		} elseif (!$this->appConfig->isSensitive('internal_secret')) {
+			// Stored before it was marked sensitive (or by an older occ call): encrypt it in place, once.
+			$this->appConfig->setAppValueString('internal_secret', $stored, false, true);
 		}
 
 		$header = $this->request->getHeader('X-Recognize-Secret');
@@ -168,6 +172,18 @@ final class InternalController extends Controller {
 	 * @param array $faces Each face: {x, y, width, height, vector, score, user_id}
 	 */
 	private function writeFaces(int $fileId, array $faces): void {
+		// All or nothing: a partial set would be kept forever by the early return below.
+		$this->db->beginTransaction();
+		try {
+			$this->insertFaces($fileId, $faces);
+			$this->db->commit();
+		} catch (\Throwable $e) {
+			$this->db->rollBack();
+			throw $e;
+		}
+	}
+
+	private function insertFaces(int $fileId, array $faces): void {
 		// Resolve file owner from storage ID (works without user session)
 		$userId = '';
 		$qb = $this->db->getQueryBuilder();
@@ -195,11 +211,11 @@ final class InternalController extends Controller {
 			$detection = new FaceDetection();
 			$detection->setFileId($fileId);
 			$detection->setUserId($userId);
-			$detection->setX((float)($face['x'] ?? 0));
-			$detection->setY((float)($face['y'] ?? 0));
-			$detection->setWidth((float)($face['width'] ?? 0));
-			$detection->setHeight((float)($face['height'] ?? 0));
-			$detection->setVector($face['vector'] ?? []);
+			$detection->setX((float)$face['x']);
+			$detection->setY((float)$face['y']);
+			$detection->setWidth((float)$face['width']);
+			$detection->setHeight((float)$face['height']);
+			$detection->setVector(array_map('floatval', $face['vector']));
 			$this->faceDetectionMapper->insert($detection);
 		}
 	}

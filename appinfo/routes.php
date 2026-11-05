@@ -22,7 +22,6 @@ return [
 	'routes' => [
 		// Internal API for Python daemon
 		['name' => 'internal#results', 'url' => '/api/internal/results', 'verb' => 'POST'],
-		['name' => 'internal#file', 'url' => '/api/internal/file/{id}', 'verb' => 'GET'],
 
 		//internal ADMIN API
 		['name' => 'admin#reset', 'url' => '/admin/reset', 'verb' => 'GET'],
