@@ -8,6 +8,7 @@ change with no browser. Stdlib only.
   tools/bench_faces.py --scenario all --runs 3
   tools/bench_faces.py --scenario overview --cover-size 256
   tools/bench_faces.py --scenario overview --compare bench-results/<old>.json
+  tools/bench_faces.py --api python --scenario all --runs 2   # JSON API path, no DAV
 
 Limits: http.client is HTTP/1.1 (one connection per worker, 10 workers); the
 browser multiplexes over one HTTP/2 connection. Compare runs of this tool with
@@ -168,6 +169,85 @@ def cluster(cl, a):
     return out
 
 
+# FacesApi.ts:13 PAGE and FetchFacesMixin.ts:86 fetchClusters() (min defaults to 1)
+PY_PAGE = 500
+PY_MIN = 1
+
+
+def py_token(cl):
+    # FacesApi.ts:63 getToken, Basic auth as in the bench; the browser uses its session instead
+    s, d, t = cl.req("GET", "/apps/recognize/api/v1/faces-token")
+    if s != 200:
+        sys.exit(f"faces-token failed: HTTP {s}")
+    return json.loads(d)["token"], t * 1000
+
+
+def py_get(cl, tok, path, params=None):
+    # FacesApi.ts:76 get(): Bearer token, axios params
+    q = "?" + urllib.parse.urlencode(params) if params else ""
+    return cl.req("GET", "/recognize-api/v1" + path + q, headers={"Authorization": f"Bearer {tok}"})
+
+
+def py_clusters(cl, tok):
+    s, d, t = py_get(cl, tok, "/clusters", {"min": PY_MIN})  # FacesApi.ts:87
+    if s != 200:
+        sys.exit(f"clusters failed: HTTP {s}")
+    clusters = sorted(json.loads(d), key=lambda c: -c["count"])  # FacesView.vue:82 orderedFaces
+    return clusters, {"list_ms": t * 1000, "list_bytes": len(d), "clusters": len(clusters)}
+
+
+def path_of(url):
+    u = urllib.parse.urlsplit(url)
+    return u.path + ("?" + u.query if u.query else "")
+
+
+def py_overview(cl, a):
+    tok, tok_ms = py_token(cl)
+    clusters, m = py_clusters(cl, tok)
+    m = {"token_ms": tok_ms, **m}
+    covers = [c["cover"] for c in clusters if c["cover"]]
+    m["covers_null"] = len(clusters) - len(covers)
+    if a.max_covers:
+        covers = covers[:a.max_covers]
+    m["covers"] = fetch_all(cl, [path_of(urllib.parse.urljoin(a.base, u)) for u in covers])  # signed, same origin
+    return m
+
+
+def py_cluster_files(cl, tok, cid):
+    # FacesApi.ts:96 fetchClusterFiles: pages of 500 until a short page or count reached
+    files, ms, nbytes, codes, offset, count = [], 0.0, 0, [], 0, None
+    while True:
+        s, d, t = py_get(cl, tok, f"/clusters/{cid}", {"offset": offset, "limit": PY_PAGE})
+        ms, nbytes = ms + t * 1000, nbytes + len(d)
+        codes.append(s)
+        if s >= 300:
+            break
+        body = json.loads(d)
+        count = body["count"] if count is None else count
+        files += body["files"]
+        if len(body["files"]) != PY_PAGE or len(files) >= count:
+            break
+        offset = len(files)
+    return files, {"propfind_ms": ms, "bytes": nbytes, "http": max(codes), "pages": len(codes)}
+
+
+def py_cluster(cl, a):
+    tok, tok_ms = py_token(cl)
+    clusters, _ = py_clusters(cl, tok)
+    out = {"token_ms": tok_ms}
+    for label, c in (("largest", clusters[0]), ("median", clusters[len(clusters) // 2])):
+        files, r = py_cluster_files(cl, tok, c["id"])
+        r["nbItems"] = c["count"]
+        if r["http"] < 300:
+            # same grid thumbnails as DAV mode (Nextcloud previews); etag quotes stripped as in cluster()
+            urls = [f"{a.url_prefix}/apps/photos/api/v1/preview/{f['fileid']}?etag="
+                    f"{(f['etag'] or '').replace(chr(34), '').replace('&quot;', '')}"
+                    f"&x={a.thumb_size}&y={a.thumb_size}" for f in files[:GRID_FIRST]]
+            r["thumbs"] = fetch_all(cl, urls)
+        out[label] = r
+    return out
+
+
 def flat(d, p=""):
     for k, v in d.items():
         if isinstance(v, dict) and k != "status":
@@ -194,6 +274,8 @@ def show(name, runs):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--api", choices=["dav", "python"], default="dav",
+                    help="dav: PROPFIND path; python: /recognize-api/v1 JSON path with a faces-token")
     ap.add_argument("--scenario", choices=["overview", "cluster", "all"], default="all")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--cover-size", type=int, default=COVER_SIZE)
@@ -210,21 +292,24 @@ def main():
         pw = open(tf).read().strip()
     except OSError:
         sys.exit(f"no app password at {tf} (see tools/README.md, Benchmarking)")
-    kf = os.path.expanduser(f"~/.config/nc-bench/recognize-api-key")
-    try:
-        key = open(kf).read().strip()
-    except OSError:
-        key = None  # without it recognize DAV answers 403 under Basic auth; see tools/README.md
+    key = None
+    if a.api == "dav":
+        kf = os.path.expanduser(f"~/.config/nc-bench/recognize-api-key")
+        try:
+            key = open(kf).read().strip()
+        except OSError:
+            key = None  # without it recognize DAV answers 403 under Basic auth; see tools/README.md
     cl = Client(a.base, a.user, pw, key)
     old = json.load(open(a.compare)) if a.compare else {}
-    for name, fn in (("overview", overview), ("cluster", cluster)):
+    fns = (overview, cluster) if a.api == "dav" else (py_overview, py_cluster)
+    for name, fn in zip(("overview", "cluster"), fns):
         if a.scenario not in (name, "all"):
             continue
         runs = [fn(cl, a) for _ in range(a.runs)]
         med = show(name, runs)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         os.makedirs("bench-results", exist_ok=True)
-        path = f"bench-results/{ts}-{name}.json"
+        path = f"bench-results/{ts}-{name}{'' if a.api == 'dav' else '-' + a.api}.json"
         json.dump({"scenario": name, "args": vars(a), "runs": runs, "median": med}, open(path, "w"), indent=1)
         print("wrote", path)
         if old.get("scenario") == name:

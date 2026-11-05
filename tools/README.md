@@ -22,6 +22,15 @@ Client side (results go to `bench-results/<UTC>-<scenario>.json`, gitignored):
     tools/bench_faces.py --scenario overview --cover-size 256          # sensitivity check
     tools/bench_faces.py --scenario overview --compare bench-results/<old>.json
 
+`--api python` replays the JSON path the Photos fork uses now (faces-token, then
+`/recognize-api/v1/clusters` with Bearer auth, covers, paged cluster fetch); the
+grid thumbnails are still Nextcloud previews. Results go to `*-python.json`; the
+metric names match the DAV ones, so `--compare` works across modes. Adds `token_ms`
+and `covers_null`. Same Basic-auth app password, no API key needed:
+
+    tools/bench_faces.py --api python --scenario all --runs 2
+    tools/bench_faces.py --api python --scenario overview --compare bench-results/<dav>.json
+
 Run 1 is reported apart (cold-ish); the median is over runs 2..N. HTTP/1.1 with
 10 workers, so compare tool runs with each other, not with browser timings.
 
