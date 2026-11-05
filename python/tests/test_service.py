@@ -105,7 +105,7 @@ class TestMaintenanceMode:
 
         # Set maintenance mode the way Nextcloud does: in config.php
         php = tmp_path / "config.php"
-        php.write_text("<?php $CONFIG = array ('maintenance' => true,);")
+        php.write_text("<?php\n$CONFIG = array (\n  'maintenance' => true,\n);")
         svc.pipeline.db._config["config_php"] = str(php)
 
         call_count = 0
@@ -221,13 +221,41 @@ class TestImagePassSubmits:
         assert _left(svc) == []
         svc.stop()
 
-    def test_submit_failure_keeps_row(self, sqlite_config_file, tmp_path):
+    def _api_failing(self, svc, status):
+        from nc_api import NextcloudAPIError
+        api = MagicMock()
+        api.submit_results.side_effect = NextcloudAPIError(f"HTTP {status}", status)
+        svc.pipeline.nc_api = api
+        return api
+
+    def test_permanent_4xx_deletes_row_and_moves_on(self, sqlite_config_file, tmp_path):
         svc = _svc_with_pending(sqlite_config_file, tmp_path, [10, 20], {"imagenet"})
+        api = self._api_failing(svc, 400)
         res = {10: {"tags": []}, 20: {"tags": []}}
         with patch.object(svc.pipeline, "process_images_tags", return_value=res), \
-             patch.object(svc.pipeline, "_submit_result", side_effect=[False, True]):
+             patch("service.time.sleep"):
             svc._run_classifier_passes()
-        assert _left(svc) == [10]
+        assert api.submit_results.call_count == 2
+        assert _left(svc) == []
+        svc.stop()
+
+    def test_503_defers_rows_and_stops_pass(self, sqlite_config_file, tmp_path):
+        svc = _svc_with_pending(sqlite_config_file, tmp_path, [10, 20], {"imagenet"})
+        before = {r["file_id"]: r["added_at"] for r in svc.pipeline.db.fetch_pending(limit=9)}
+        svc.pipeline.db._execute("UPDATE oc_recognize_pending SET added_at = 5")
+        svc.pipeline.db._commit()
+        for it in svc._fetch_and_resolve.return_value[0]:
+            it["added_at"] = 5
+        api = self._api_failing(svc, 503)
+        res = {10: {"tags": []}, 20: {"tags": []}}
+        with patch.object(svc.pipeline, "process_images_tags", return_value=res), \
+             patch("service.time.sleep") as sleep:
+            assert svc._run_classifier_passes() is False
+        assert api.submit_results.call_count == 1
+        rows = svc.pipeline.db.fetch_pending(limit=9)
+        assert sorted(r["file_id"] for r in rows) == [10, 20]
+        assert all(r["added_at"] > 5 for r in rows)
+        sleep.assert_called_with(POLL_MAX_INTERVAL)
         svc.stop()
 
     def test_auth_error_stops_pass_and_keeps_rows(self, sqlite_config_file, tmp_path):
@@ -262,10 +290,12 @@ class TestPendingHousekeeping:
         assert _left(svc) == [10]
         svc.stop()
 
-    def _filecache(self, db, rows):
-        db._execute("CREATE TABLE oc_filecache (fileid INTEGER PRIMARY KEY)")
+    def _filecache(self, db, rows, storage="home::u"):
+        db._execute("CREATE TABLE oc_storages (numeric_id INTEGER PRIMARY KEY, id TEXT)")
+        db._execute("CREATE TABLE oc_filecache (fileid INTEGER PRIMARY KEY, storage INTEGER)")
+        db._execute("INSERT INTO oc_storages VALUES (1, ?)", (storage,))
         for r in rows:
-            db._execute("INSERT INTO oc_filecache (fileid) VALUES (?)", (r,))
+            db._execute("INSERT INTO oc_filecache (fileid, storage) VALUES (?, 1)", (r,))
         db._commit()
 
     def test_deleted_row_consumed_detections_kept_while_filecache_exists(self, sqlite_config_file, tmp_path):
@@ -283,6 +313,52 @@ class TestPendingHousekeeping:
         left = [r["file_id"] for r in db._fetchall_dicts(
             db._execute("SELECT file_id FROM oc_recognize_face_detections"))]
         assert left == [10]
+        svc.stop()
+
+    def test_unreadable_rows_do_not_starve_good_one(self, sqlite_config_file, tmp_path):
+        svc = Service(sqlite_config_file, models_dir=str(tmp_path), gpu=False)
+        db = svc.pipeline.db
+        db.create_pending_table()
+        self._filecache(db, list(range(1, 252)))
+        for fid in range(1, 252):
+            db.upsert_pending(fid, 1, 0)
+        db._execute("UPDATE oc_recognize_pending SET added_at = file_id")  # file 251 is newest
+        db._commit()
+        good = {251: {"path": "/x", "mimetype": "image/jpeg", "storage": 1}}
+        with patch.object(db, "resolve_file_paths",
+                          side_effect=lambda ids: {i: good[i] for i in ids if i in good}):
+            seen = []
+            for _ in range(2):
+                images, _v, _a = svc._fetch_and_resolve(200)
+                seen += [i["file_id"] for i in images]
+        assert 251 in seen
+        svc.stop()
+
+    def test_unsupported_storage_and_unknown_mimetype_rows_deleted(self, sqlite_config_file, tmp_path):
+        svc = Service(sqlite_config_file, models_dir=str(tmp_path), gpu=False)
+        db = svc.pipeline.db
+        db.create_pending_table()
+        self._filecache(db, [10], storage="object::store:s3")
+        db.upsert_pending(10, 1, 0)
+        with patch.object(db, "resolve_file_paths", return_value={}):
+            svc._fetch_and_resolve(10)
+        assert db.fetch_pending(limit=10) == []
+        db.upsert_pending(11, 1, 0)
+        db._execute("INSERT INTO oc_filecache VALUES (11, 1)")
+        with patch.object(db, "resolve_file_paths",
+                          return_value={11: {"path": "/x", "mimetype": "application/x-foo", "storage": 1}}):
+            svc._fetch_and_resolve(10)
+        assert db.fetch_pending(limit=10) == []
+        svc.stop()
+
+    def test_maintenance_blocks_consuming_deleted(self, sqlite_config_file, tmp_path):
+        svc = Service(sqlite_config_file, models_dir=str(tmp_path), gpu=False)
+        svc._running = True
+        with patch.object(svc.pipeline.db, "check_maintenance_mode", return_value=True), \
+             patch.object(svc, "_consume_deleted") as consume, \
+             patch("service.time.sleep", side_effect=lambda s: setattr(svc, "_running", False)):
+            svc._main_loop()
+        consume.assert_not_called()
         svc.stop()
 
     def test_only_rows_missing_from_filecache_are_orphans(self, sqlite_config_file, tmp_path):

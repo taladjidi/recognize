@@ -108,13 +108,21 @@ def _extract_face(face, width, height):
             "yaw": float(pose[1]) if len(pose) > 1 else 0.0,
         }
 
-    embedding = face.embedding / np.linalg.norm(face.embedding)
+    norm = np.linalg.norm(face.embedding)
+    if not np.isfinite(norm) or norm == 0:
+        log.debug("Skipping face with degenerate embedding (norm=%s)", norm)
+        return None  # would serialise as NaN -> invalid JSON -> HTTP 400
+    embedding = face.embedding / norm
 
     # Clamp bbox to image boundaries (InsightFace can return out-of-bounds coords)
     x1 = max(0.0, float(x1))
     y1 = max(0.0, float(y1))
     x2 = min(float(width), float(x2))
     y2 = min(float(height), float(y2))
+
+    if x2 <= x1 or y2 <= y1:
+        log.debug("Skipping face with empty box after clamping")
+        return None
 
     return {
         "angle": angle,
@@ -193,7 +201,7 @@ class FaceClassifier:
         """
         height, width = img_bgr.shape[:2]
         faces = self.app.get(img_bgr)
-        return [_extract_face(face, width, height) for face in faces]
+        return [f for f in (_extract_face(face, width, height) for face in faces) if f]
 
     def classify(self, img_path):
         """Convenience: preprocess + detect faces in a single image.

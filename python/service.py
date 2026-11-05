@@ -128,16 +128,15 @@ class Service:
 
             try:
                 self.pipeline.db.ping()  # reconnect if MySQL/Postgres dropped us
+                # Maintenance first: nothing may be deleted while Nextcloud is down.
+                if self.pipeline.db.check_maintenance_mode():
+                    log.info("Nextcloud in maintenance mode, waiting...")
+                    time.sleep(POLL_MAX_INTERVAL)
+                    continue
                 self._refresh_enabled()
                 self._consume_deleted()
             except Exception as e:
                 log.error("Database unavailable: %s", e)
-                time.sleep(POLL_MAX_INTERVAL)
-                continue
-
-            # Check maintenance mode
-            if self.pipeline.db.check_maintenance_mode():
-                log.info("Nextcloud in maintenance mode, waiting...")
                 time.sleep(POLL_MAX_INTERVAL)
                 continue
 
@@ -178,7 +177,7 @@ class Service:
         rows = db.fetch_pending(limit=BATCH_SIZE, action_filter=(2,))
         if not rows:
             return
-        alive = db.existing_file_ids([r["file_id"] for r in rows])
+        alive = db.file_storages([r["file_id"] for r in rows])
         for r in rows:
             if r["file_id"] not in alive:
                 db.delete_face_detections(r["file_id"])
@@ -204,26 +203,32 @@ class Service:
         try:
             path_map = self.pipeline.db.resolve_file_paths(file_ids)
             unresolved = [f for f in file_ids if f not in path_map]
-            alive = self.pipeline.db.existing_file_ids(unresolved)
+            alive = self.pipeline.db.file_storages(unresolved)
         except Exception as e:
             log.error("Failed to resolve paths: %s", e)
             return None, None, None
 
         images, videos, audios = [], [], []
-        orphans = []
+        drop, defer = [], []
 
-        # shortcut: unresolvable-but-existing rows (S3/SMB, empty, odd mimetype) stay
-        # pending and are refetched every loop; more than BATCH_SIZE of them would
-        # starve the queue. Upgrade: attempt counter or skip-offset.
+        def warn_once(key, msg, *args):
+            if key not in self._warned_unsupported:
+                self._warned_unsupported.add(key)
+                log.warning(msg, *args)
+
         for r in rows:
             info = path_map.get(r["file_id"])
             if not info:
+                storage = alive.get(r["file_id"])
                 if r["file_id"] not in alive:
-                    orphans.append(r)  # filecache row gone: nothing left to classify
-                elif r["file_id"] not in self._warned_unsupported:
-                    self._warned_unsupported.add(r["file_id"])
-                    log.warning("file_id=%d cannot be read from local storage; leaving it pending",
-                                r["file_id"])
+                    drop.append(r)  # filecache row gone: nothing left to classify
+                elif storage and not storage.startswith(("home::", "local::")):
+                    warn_once(storage, "storage %s cannot be read locally; its files are not classified", storage)
+                    drop.append(r)  # can never be read here
+                else:
+                    # shortcut: empty/missing-on-disk files are retried forever at the back
+                    # of the queue (so they cannot starve it); upgrade: attempt counter.
+                    defer.append(r)
                 continue
 
             item = {"id": r["id"], "file_id": r["file_id"], "added_at": r["added_at"],
@@ -235,10 +240,16 @@ class Service:
                 videos.append(item)
             elif media_type == "audio":
                 audios.append(item)
+            else:
+                warn_once(info["mimetype"], "mimetype %s is not classified; dropping its pending rows",
+                          info["mimetype"])
+                drop.append(r)
 
-        if orphans:
-            log.info("Removing %d orphaned pending entries", len(orphans))
-            self.pipeline.db.delete_pending_items(orphans)
+        if drop:
+            log.info("Removing %d unclassifiable pending entries", len(drop))
+            self.pipeline.db.delete_pending_items(drop)
+        if defer:
+            self.pipeline.db.defer_pending_items(defer)
 
         return images, videos, audios
 
@@ -260,18 +271,24 @@ class Service:
 
         shortcut: a file that failed classification loses its pending row without being
         tagged, so the daily CatchUpJob retries it; a poison file is retried daily forever.
-        Upgrade: attempt counter. A failed submit keeps the row. Returns False when the
-        API rejected our credentials (stop the pass).
+        Upgrade: attempt counter. Returns False when the pass must stop: wrong credentials
+        (rows kept as is) or a transient failure (remaining rows deferred to the back).
+        A permanent 4xx drops the row, like a failed classification.
         """
-        done = []
-        for item in items:
+        done, stopped = [], None
+        for i, item in enumerate(items):
             res = results.get(item["file_id"])
             if res is None or self.pipeline._submit_result(item["file_id"], res):
                 done.append(item)
-            elif self.pipeline.api_blocked:
+            elif self.pipeline.submit_failure == "permanent":
+                done.append(item)
+            else:
+                stopped = self.pipeline.submit_failure
+                if stopped != "blocked":
+                    self.pipeline.db.defer_pending_items(items[i:])
                 break
         self.pipeline.db.delete_pending_items(done)
-        return not self.pipeline.api_blocked
+        return stopped is None
 
     def _run_classifier_passes(self):
         """Run each classifier group as a separate pass over pending files.
@@ -281,7 +298,6 @@ class Service:
 
         Returns True if any work was done.
         """
-        self.pipeline.api_blocked = False
         images, videos, audios = self._fetch_and_resolve(limit=BATCH_SIZE)
         if images is None:
             time.sleep(POLL_MAX_INTERVAL)
@@ -310,7 +326,8 @@ class Service:
                 return self._back_off()
             log.info("Processed %d images (%d pending)", len(images), pending_count)
 
-        # Video / audio: a type whose classifier is disabled yields {} -> not submitted.
+        # Video / audio: a disabled classifier yields no result -> None -> the row is
+        # dropped and the file stays untagged (catch-up retries once it is enabled).
         for items, run, label in ((videos, self.pipeline.process_videos, "videos"),
                                   (audios, self.pipeline.process_audio, "audio files")):
             if not items:

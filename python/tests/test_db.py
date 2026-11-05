@@ -87,6 +87,19 @@ class TestPending:
         db.delete_pending_items([row])
         assert len(db.fetch_pending(limit=10)) == 1
 
+    def test_defer_pending_items_moves_to_back_unless_requeued(self, db):
+        db.upsert_pending(file_id=100, storage_id=1, action=0)
+        row = db.fetch_pending(limit=10)[0]
+        db._execute("UPDATE oc_recognize_pending SET added_at = 5")
+        db._commit()
+        row["added_at"] = 5
+        db.defer_pending_items([row])
+        assert db.fetch_pending(limit=10)[0]["added_at"] > 5
+        db._execute("UPDATE oc_recognize_pending SET added_at = 7")
+        db._commit()
+        db.defer_pending_items([row])  # stale added_at (5) < 7: re-queued meanwhile, untouched
+        assert db.fetch_pending(limit=10)[0]["added_at"] == 7
+
     def test_execute_failure_rolls_back(self, db):
         from unittest.mock import MagicMock
         db._conn = MagicMock()
@@ -98,11 +111,22 @@ class TestPending:
     def test_maintenance_read_from_config_php(self, db, tmp_path):
         php = tmp_path / "config.php"
         db._config["config_php"] = str(php)
-        php.write_text("<?php $CONFIG = array ('maintenance' => false,);")
+        php.write_text("<?php\n$CONFIG = array (\n  'maintenance' => false,\n);")
         assert db.check_maintenance_mode() is False
         db._maint_checked = 0
-        php.write_text("<?php $CONFIG = array ('maintenance' => true,);")
+        php.write_text("<?php\n$CONFIG = array (\n  'maintenance' => true,\n);")
         assert db.check_maintenance_mode() is True
+
+    @pytest.mark.parametrize("text,expected", [
+        ("'maintenance' => TRUE,", True),
+        ("  // 'maintenance' => true,", False),
+        ("'maintenance' => false,", False),
+    ])
+    def test_maintenance_regex(self, db, tmp_path, text, expected):
+        php = tmp_path / "c.php"
+        php.write_text("<?php\n$CONFIG = array (\n  " + text + "\n);")
+        db._config["config_php"] = str(php)
+        assert db.check_maintenance_mode() is expected
 
     def test_delete_empty_list(self, db):
         db.delete_pending([])  # Should not raise

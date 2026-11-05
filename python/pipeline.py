@@ -186,7 +186,9 @@ class Pipeline:
         self.ffmpeg_binary = ffmpeg_binary
         self.nc_api = nc_api
         self._enabled = set()
-        self.api_blocked = False      # set on 401/403/404: config error, stop submitting
+        # Why the last _submit_result failed: "blocked" (401/403/404: wrong secret/URL),
+        # "permanent" (other 4xx: this payload will never be accepted) or "transient".
+        self.submit_failure = None
         self._api_error_logged = False
 
     def enable_classifiers(self, names=None):
@@ -300,11 +302,12 @@ class Pipeline:
     def _submit_result(self, file_id, result):
         """Submit results for a file; True only if Nextcloud accepted them.
 
-        Accepted means the file is now tagged "processed". Sets api_blocked on
-        401/403/404 (wrong secret or URL), so the caller stops and keeps rows.
+        Accepted means the file is now tagged "processed". On failure
+        submit_failure says whether to stop, defer or drop the row.
         """
+        self.submit_failure = None
         if not self.nc_api:
-            self.api_blocked = True
+            self.submit_failure = "blocked"
             log.error("No Nextcloud API configured; cannot submit file_id=%d", file_id)
             return False
         try:
@@ -314,17 +317,25 @@ class Pipeline:
                 faces=result.get("faces") or None,
             )
         except Exception as e:
-            if getattr(e, "status_code", 0) in (401, 403, 404):
-                self.api_blocked = True
+            status = getattr(e, "status_code", 0)
+            if status in (401, 403, 404):
+                self.submit_failure = "blocked"
                 if not self._api_error_logged:
                     log.error("Nextcloud rejected results (%s): check nextcloud_url and "
                               "internal_secret in nc_config.json; keeping pending rows", e)
                     self._api_error_logged = True
+            elif 400 <= status < 500 and status not in (408, 429):
+                self.submit_failure = "permanent"
+                log.warning("Nextcloud refused results for file_id=%d (HTTP %d); "
+                            "dropping it, catch-up will retry", file_id, status)
             else:
+                self.submit_failure = "transient"
                 log.error("Failed to submit results for file_id=%d: %s", file_id, e)
             return False
         if ok:
             self._api_error_logged = False
+        if not ok:
+            self.submit_failure = "transient"
         return bool(ok)
 
     def close(self):

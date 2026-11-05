@@ -296,7 +296,10 @@ class DB:
         self._commit()
 
     def delete_pending_items(self, items: list[dict]):
-        """Delete fetched rows, but not ones re-queued since (added_at moved forward)."""
+        """Delete fetched rows, but not ones re-queued since (added_at moved forward).
+
+        added_at has 1 s resolution: a re-queue in the same second as the fetched
+        value is not detected and the row is deleted (catch-up covers it)."""
         t = self._table("recognize_pending")
         for it in items:
             self._execute(
@@ -306,15 +309,32 @@ class DB:
         if items:
             self._commit()
 
-    def existing_file_ids(self, file_ids: list[int]) -> set[int]:
-        """File ids that still have a filecache row (a trashed file keeps its fileid)."""
+    def defer_pending_items(self, items: list[dict]):
+        """Move fetched rows to the back of the queue (added_at=now) unless re-queued since."""
+        t = self._table("recognize_pending")
+        now = int(time.time())
+        for it in items:
+            self._execute(
+                f"UPDATE {t} SET added_at = {self._ph()} WHERE id = {self._ph()} AND added_at <= {self._ph()}",
+                (now, it["id"], it["added_at"]),
+            )
+        if items:
+            self._commit()
+
+    def file_storages(self, file_ids: list[int]) -> dict[int, str | None]:
+        """{fileid: storage id string} for ids that still have a filecache row.
+
+        A trashed file keeps its fileid, so presence means "not deleted".
+        """
         if not file_ids:
-            return set()
+            return {}
         cur = self._execute(
-            f"SELECT fileid FROM {self._table('filecache')} WHERE fileid IN ({self._ph(len(file_ids))})",
+            f"SELECT fc.fileid, s.id FROM {self._table('filecache')} fc "
+            f"LEFT JOIN {self._table('storages')} s ON fc.storage = s.numeric_id "
+            f"WHERE fc.fileid IN ({self._ph(len(file_ids))})",
             tuple(file_ids),
         )
-        return {r[0] for r in cur.fetchall()}
+        return {r[0]: r[1] for r in cur.fetchall()}
 
     def pending_count(self) -> int:
         """Count pending entries (action 0 or 1)."""
@@ -547,7 +567,7 @@ class DB:
         path = self._config.get("config_php", "/usr/share/nextcloud/config/config.php")
         try:
             with open(path) as f:
-                self._maint = bool(re.search(r"""['"]maintenance['"]\s*=>\s*true""", f.read()))
+                self._maint = bool(re.search(r"""(?im)^\s*['"]maintenance['"]\s*=>\s*true\b""", f.read()))
         except OSError:
             self._maint = False
         self._maint_checked = now
