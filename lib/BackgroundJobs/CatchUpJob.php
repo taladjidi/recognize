@@ -11,6 +11,7 @@ use OCA\Recognize\Service\StorageService;
 use OCP\AppFramework\Utility\ITimeFactory;
 use OCP\BackgroundJob\IJobList;
 use OCP\BackgroundJob\TimedJob;
+use Psr\Log\LoggerInterface;
 
 /**
  * Daily safety net: queue every media file the daemon has not tagged yet.
@@ -26,6 +27,7 @@ final class CatchUpJob extends TimedJob {
 		ITimeFactory $timeFactory,
 		private IJobList $jobList,
 		private StorageService $storageService,
+		private LoggerInterface $logger,
 	) {
 		parent::__construct($timeFactory);
 		$this->setInterval(24 * 60 * 60);
@@ -33,9 +35,14 @@ final class CatchUpJob extends TimedJob {
 	}
 
 	protected function run($argument): void {
-		// A crawl still running (catch-up or a full recrawl) already covers this.
-		foreach ($this->jobList->getJobsIterator(StorageCrawlJob::class, 1, 0) as $_) {
-			return;
+		// Stand down only for an unfinished catch-up: a stuck full recrawl must
+		// not block this forever. Crawl chains hold one row per mount, so few.
+		foreach ($this->jobList->getJobsIterator(StorageCrawlJob::class, null, 0) as $job) {
+			$arg = $job->getArgument();
+			if (is_array($arg) && ($arg['skip_tagged'] ?? false)) {
+				$this->logger->info('Recognize catch-up crawl still running, not starting another');
+				return;
+			}
 		}
 		foreach ($this->storageService->getMounts() as $mount) {
 			$this->jobList->add(StorageCrawlJob::class, [

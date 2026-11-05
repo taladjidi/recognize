@@ -142,3 +142,22 @@ class TestGracefulShutdown:
         # Verify stop cleans up
         svc.stop()
         assert svc._running is False
+
+
+class TestImagePassSubmits:
+    def test_image_without_labels_is_still_submitted(self, sqlite_config_file, tmp_path):
+        """A result marks the file processed; a skipped submit leaves it untagged forever."""
+        svc = Service(sqlite_config_file, models_dir=str(tmp_path), gpu=False)
+        p = svc.pipeline
+        images = [{"id": 1, "file_id": 10}, {"id": 2, "file_id": 20}]
+        with patch.object(svc, "_fetch_and_resolve", return_value=(images, [], [])), \
+             patch.object(p.db, "pending_count", return_value=2), \
+             patch.object(p.db, "delete_pending") as delete_pending, \
+             patch.object(p, "process_images_tags", return_value={20: {"tags": ["Dog"]}}), \
+             patch.object(p, "_submit_result") as submit:
+            p._enabled = {"imagenet"}
+            svc._run_classifier_passes()
+        submitted = {c.args[0]: c.args[1]["tags"] for c in submit.call_args_list}
+        assert submitted == {10: [], 20: ["Dog"]}
+        delete_pending.assert_called_once_with([1, 2])
+        svc.stop()

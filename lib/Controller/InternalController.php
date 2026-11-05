@@ -63,9 +63,11 @@ final class InternalController extends Controller {
 			return new JSONResponse(['error' => 'Missing file_id'], Http::STATUS_BAD_REQUEST);
 		}
 
-		// Write tags via ISystemTagManager (fires events, updates etags)
-		$tags = $body['tags'] ?? null;
-		if (is_array($tags) && count($tags) > 0) {
+		// Write tags via ISystemTagManager (fires events, updates etags).
+		// Always, even with no labels: assignTags also adds the processed tag,
+		// and a file that never gets it is re-queued by CatchUpJob every day.
+		$tags = $body['tags'] ?? [];
+		if (is_array($tags)) {
 			try {
 				$this->tagManager->assignTags($fileId, $tags);
 			} catch (\Throwable $e) {

@@ -90,11 +90,9 @@ final class StorageService {
 	 * @param array $models
 	 * @param int $lastFileId
 	 * @param int $maxResults
-	 * @return \Generator<int,array{fileid:int, image:bool, video:bool, audio:bool},mixed,void>
-	 */
-	/**
 	 * @param int|null $skipTaggedWith systemtag id: leave out files that carry it
 	 *                                 (the "processed" tag, for a catch-up crawl)
+	 * @return \Generator<int,array{fileid:int, image:bool, video:bool, audio:bool},mixed,void>
 	 */
 	public function getFilesInMount(int $storageId, int $rootId, array $models, int $lastFileId = 0, int $maxResults = 100, ?int $skipTaggedWith = null) : \Generator {
 		$qb = new CacheQueryBuilder($this->db->getQueryBuilder(), $this->metadataManager);

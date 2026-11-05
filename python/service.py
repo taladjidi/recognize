@@ -243,9 +243,9 @@ class Service:
             for item in images:
                 fid = item["file_id"]
                 result = tag_results.get(fid, {})
-                tags = result.get("tags", [])
-                if tags:
-                    self.pipeline._submit_result(fid, {"tags": tags, "faces": []})
+                # Submit even with no labels: the result marks the file as
+                # processed, or CatchUpJob would re-queue it every day.
+                self.pipeline._submit_result(fid, {"tags": result.get("tags", []), "faces": []})
                 processed_ids.append(item["id"])
 
             if processed_ids:
