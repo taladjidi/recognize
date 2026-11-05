@@ -186,7 +186,7 @@ def db(config):
         # (id, file_id, user_id, x, y, height, width, cluster_id)
         "oc_recognize_face_detections": [
             (1, 10, "alice", 0.1, 0.1, 0.2, 0.2, 1),
-            (2, 11, "alice", 0.1, 0.1, 0.5, 0.5, 1),  # largest: alice's cover
+            (2, 11, "alice", 0.3, 0.3, 0.3, 0.3, 1),  # largest with margin: alice's cover
             (3, 12, "alice", 0.1, 0.1, 0.9, 0.9, 1),  # in trash: never counted or shown
             (4, 20, "alice", 0.1, 0.1, 0.9, 0.9, 1),  # alice's uid on bob's storage: not alice's file
             (5, 20, "bob", 0.1, 0.1, 0.3, 0.3, 2),
@@ -215,6 +215,30 @@ class TestQueries:
         out = list_clusters(db, "alice", CROP)
         assert [(c["id"], c["title"], c["count"]) for c in out] == [(1, "Alice Mum", 2), (3, "100%_real", 1)]
         assert out[0]["cover"].startswith("/recognize-faces/alice/2.jpg?")
+
+    @pytest.mark.parametrize("boxes,want", [
+        # (x, y, w, h) per detection: a margin face beats a bigger edge-touching close-up
+        ([(0.0, 0.0, 0.9, 0.9), (0.3, 0.3, 0.2, 0.2), (0.1, 0.1, 0.01, 0.01)], 2),
+        # no box has a margin: the largest
+        ([(0.0, 0.0, 0.9, 0.9), (0.0, 0.0, 0.5, 0.5)], 1),
+        # tiny boxes lose to any larger one, even without margin
+        ([(0.4, 0.4, 0.04, 0.04), (0.0, 0.0, 0.5, 0.5)], 2),
+    ])
+    def test_cover_rule_agrees_between_api_and_backfill(self, db, tmp_path, boxes, want):
+        first = 100
+        db._execute("INSERT INTO oc_recognize_face_clusters VALUES (9, 'Rule', 'alice')")
+        for i, (x, y, w, h) in enumerate(boxes):
+            db._execute(f"INSERT INTO oc_recognize_face_detections (id, file_id, user_id, x, y, height, width, "
+                        f"cluster_id) VALUES ({db._ph(8)})", (first + i, 10, "alice", x, y, h, w, 9))
+        db.commit()
+        root = tmp_path / "crops"
+        (root / "alice").mkdir(parents=True)
+        for i in range(len(boxes)):
+            (root / "alice" / f"{first + i}.jpg").write_bytes(b"x")
+        api = [c for c in list_clusters(db, "alice", CROP, crop_root=str(root)) if c["id"] == 9][0]["cover"]
+        assert api.startswith(f"/recognize-faces/alice/{first + want - 1}.jpg?")
+        backfill = [r["id"] for r in db.detections_after(first - 1, 100, covers_only=True)]
+        assert backfill == [first + want - 1]
 
     def test_crop_urls_only_for_crops_on_disk(self, db, tmp_path):
         root = tmp_path / "crops"

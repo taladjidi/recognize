@@ -85,6 +85,7 @@ class Service:
         from crops import DEFAULT_CROP_ROOT
         self.crop_root = self.config.get("face_crop_root") or DEFAULT_CROP_ROOT
         self._crop_cursor = 0          # backfill: last detection id examined
+        self._crop_force = False       # backfill: regenerate crops that exist (tools/backfill_crops.py --force)
         self._crop_created = 0         # backfill: crops created this pass
         self._crop_users = []          # cleanup: user dirs left in this round
         self._crop_covers_done = False  # backfill phase 1: each cluster's largest box first
@@ -427,7 +428,7 @@ class Service:
         by_file = {}
         for r in rows:
             by_file.setdefault(r["file_id"], []).append(r)
-        missing = {fid: [r for r in rs if not has_crop(self.crop_root, r["user_id"], r["id"])]
+        missing = {fid: [r for r in rs if self._crop_force or not has_crop(self.crop_root, r["user_id"], r["id"])]
                    for fid, rs in by_file.items()}
         missing = {fid: rs for fid, rs in missing.items() if rs}
         paths = db.resolve_file_paths(list(missing)) if missing else {}
@@ -439,7 +440,8 @@ class Service:
                 try:
                     img, orientation = open_raw(info["path"], rs)
                     for r in missing[fid]:
-                        if write_crop(self.crop_root, r["user_id"], r["id"], make_crop(img, r, orientation)):
+                        if write_crop(self.crop_root, r["user_id"], r["id"], make_crop(img, r, orientation),
+                                   overwrite=self._crop_force):
                             self._crop_created += 1
                             if self._crop_created % CROP_LOG_EVERY == 0:
                                 log.info("Face crop backfill: %d created (at detection %d)",

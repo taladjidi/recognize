@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CROP_ROOT = "/var/lib/nextcloud/recognize-faces"
 CROP_SIZE = 256
-EXPAND = 1.6
+EXPAND = 2.0
 QUALITY = 82
 CROP_NAME_RE = re.compile(r"^([0-9]+)\.jpg$")
 
@@ -91,8 +91,8 @@ def crop_path(root, user_id, detection_id):
     return os.path.join(d, f"{detection_id}.jpg")
 
 
-def write_crop(root, user_id, detection_id, data):
-    """Atomically write one crop; False (logged) on any failure."""
+def write_crop(root, user_id, detection_id, data, overwrite=False):
+    """Atomically write one crop; False (logged) on any failure or an existing crop (unless overwrite)."""
     global _enospc_logged
     path = crop_path(root, user_id, detection_id)
     if path is None:
@@ -111,6 +111,8 @@ def write_crop(root, user_id, detection_id, data):
                 os.chmod(d, 0o750 | (mode & stat.S_ISGID))
                 if mode & stat.S_ISGID and not os.stat(d).st_mode & stat.S_ISGID:
                     log.warning("umask took bits of %s and fixing them cleared setgid: nginx may get 403", d)
+        if not overwrite and has_crop(root, user_id, detection_id):
+            return False
         # shortcut: no fsync; a crop torn by a power cut is 0 bytes and the backfill redoes it.
         fd, tmp = tempfile.mkstemp(dir=d, prefix=".", suffix=".tmp")
         with os.fdopen(fd, "wb") as f:

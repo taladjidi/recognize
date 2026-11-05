@@ -3,6 +3,7 @@
 import errno
 import io
 import os
+import time
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -72,14 +73,20 @@ def _gradient():
 def test_box_near_edge_is_shifted_inside_and_stays_square():
     img = _gradient()
     box = {"x": 0.95, "y": 0.9, "width": 0.05, "height": 0.1}  # 20 x 30 px at the corner
-    # side 1.6 * 30 = 48, pushed back inside: (352, 252)-(400, 300)
-    assert _region_diff(img, box, (352, 252, 400, 300)) < 3
+    # side 2.0 * 30 = 60, pushed back inside: (340, 240)-(400, 300)
+    assert _region_diff(img, box, (340, 240, 400, 300)) < 3
 
 
 def test_box_larger_than_image_is_clamped_to_the_short_side():
     img = _gradient()
-    # side min(1.6 * 400, 400, 300) = 300, centred on x then shifted: (50, 0)-(350, 300)
+    # side min(2.0 * 400, 400, 300) = 300, centred on x then shifted: (50, 0)-(350, 300)
     assert _region_diff(img, {"x": 0, "y": 0, "width": 1, "height": 1}, (50, 0, 350, 300)) < 3
+
+
+def test_expansion_is_twice_the_larger_side_around_the_centre():
+    img = _gradient()
+    box = {"x": 0.4, "y": 0.4, "width": 0.1, "height": 0.2}  # 40 x 60 px, centre (180, 150)
+    assert _region_diff(img, box, (120, 90, 240, 210)) < 3
 
 
 def test_tiny_box_still_gives_a_valid_crop():
@@ -103,7 +110,9 @@ def test_atomic_write_modes_and_no_temp_left(tmp_path):
     root = tmp_path / "crops"
     root.mkdir()
     assert write_crop(str(root), "alice", 7, b"one")
-    assert write_crop(str(root), "alice", 7, b"two")
+    assert not write_crop(str(root), "alice", 7, b"two")  # no overwrite by default
+    assert (root / "alice" / "7.jpg").read_bytes() == b"one"
+    assert write_crop(str(root), "alice", 7, b"two", overwrite=True)
     p = root / "alice" / "7.jpg"
     assert p.read_bytes() == b"two"
     assert os.stat(p).st_mode & 0o777 == 0o640
@@ -196,6 +205,24 @@ def svc(tmp_path):
 def _det(db, file_id, user, box=FACE):
     db.insert_face_detection(file_id, user, {**box, "vector": [0.0] * 4})
     return db._execute("SELECT MAX(id) FROM oc_recognize_face_detections").fetchone()[0]
+
+
+def test_force_backfill_regenerates_existing_crops_default_keeps_them(svc, tmp_path):
+    photo = str(tmp_path / "p.jpg")
+    Image.fromarray(np.zeros((H, W, 3), np.uint8)).save(photo)
+    did = _det(svc.pipeline.db, 10, "alice")
+    (tmp_path / "crops" / "alice").mkdir()
+    crop = tmp_path / "crops" / "alice" / f"{did}.jpg"
+    crop.write_bytes(b"old")
+    paths = {10: {"path": photo, "mimetype": "image/jpeg", "storage": 1, "owner": "alice"}}
+    with patch.object(svc.pipeline.db, "resolve_file_paths", side_effect=lambda ids: {i: paths[i] for i in ids}):
+        svc._backfill_crops(time.monotonic() + 60)  # covers phase (no cluster: nothing), then all
+        svc._backfill_crops(time.monotonic() + 60)
+        assert crop.read_bytes() == b"old"
+        svc._crop_force, svc._crop_covers_done, svc._crop_cursor = True, False, 0
+        for _ in range(3):
+            svc._backfill_crops(time.monotonic() + 60)
+    assert _decode(crop.read_bytes()).shape == (CROP_SIZE, CROP_SIZE, 3)
 
 
 def test_submit_writes_crops_under_returned_ids(svc, tmp_path):

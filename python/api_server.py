@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 import config as nc_config
 from crops import DEFAULT_CROP_ROOT
-from db import DB
+from db import DB, cover_order
 
 log = logging.getLogger("recognize.api")
 
@@ -131,14 +131,14 @@ def _crop_or_none(uid, did, secret, crop_root):
 
 def list_clusters(db: DB, uid: str, crop_secret: str, min_count: int = 1, title: str | None = None,
                   crop_root: str | None = None) -> list[dict]:
-    """[{id, title, count, cover}] by count desc; cover is the largest box that has a crop, else None."""
+    """[{id, title, count, cover}] by count desc; cover is the best-ranked box (db.cover_order) that has a crop, else None."""
     p = db._ph()
     title_sql = f"AND LOWER(c.title) LIKE {p} ESCAPE '!' " if title is not None else ""
     sql = (
         f"SELECT t.cluster_id AS cid, c.title, t.cnt, t.id AS did FROM ("
         f"  SELECT d.id, d.cluster_id,"
         f"    COUNT(*) OVER (PARTITION BY d.cluster_id) AS cnt,"
-        f"    ROW_NUMBER() OVER (PARTITION BY d.cluster_id ORDER BY d.width * d.height DESC, d.id) AS rn"
+        f"    ROW_NUMBER() OVER (PARTITION BY d.cluster_id ORDER BY {cover_order('d.')}) AS rn"
         f"  FROM {db._table('recognize_face_detections')} d {_owned(db)} AND d.cluster_id > 0"
         f") t JOIN {db._table('recognize_face_clusters')} c ON c.id = t.cluster_id "
         f"WHERE t.rn <= {COVER_CANDIDATES} AND t.cnt >= {p} AND c.user_id = {p} {title_sql}"

@@ -30,6 +30,15 @@ AUDIO_MIMES = (
 )
 
 
+def cover_order(a: str = "") -> str:
+    """ORDER BY terms ranking cover candidates: boxes with half a box of margin on every side first,
+    boxes under 5% of the image last, largest first within each; ties by id. One rule for the API
+    and the crop backfill. a: table alias prefix such as "d.". """
+    x, y, w, h = (f"{a}{c}" for c in ("x", "y", "width", "height"))
+    return (f"CASE WHEN {w} < 0.05 OR {h} < 0.05 THEN 2 WHEN {x} - 0.5 * {w} >= 0 AND {x} + 1.5 * {w} <= 1 "
+            f"AND {y} - 0.5 * {h} >= 0 AND {y} + 1.5 * {h} <= 1 THEN 0 ELSE 1 END, {w} * {h} DESC, {a}id")
+
+
 class DB:
     """Database connection wrapper with multi-dialect support.
 
@@ -563,12 +572,12 @@ class DB:
     def detections_after(self, after_id: int, limit: int, covers_only: bool = False) -> list[dict]:
         """Detections with an owner and id > after_id, by id (crop backfill cursor).
 
-        covers_only: just each cluster's largest box (the API's cover candidate).
+        covers_only: just each cluster's best cover candidate (see cover_order).
         """
         t = self._table("recognize_face_detections")
         covers = (
             f"AND id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY cluster_id "
-            f"ORDER BY width * height DESC, id) AS rn FROM {t} WHERE cluster_id > 0) c WHERE rn = 1) "
+            f"ORDER BY {cover_order()}) AS rn FROM {t} WHERE cluster_id > 0) c WHERE rn = 1) "
             if covers_only else ""
         )
         cur = self._execute(

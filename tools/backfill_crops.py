@@ -5,10 +5,11 @@ read-path deploy ~19k existing detections would take most of a day to get
 crops. Crop making is CPU work (reduced JPEG decode) while classification is
 GPU-bound, so this runs the daemon's own backfill (Service._backfill_crops:
 cluster covers first, then everything) in large slices until a pass is done.
-Writes are atomic (temp file + rename), so racing the daemon is harmless.
+--force regenerates crops that already exist (covers first), e.g. after a
+crop geometry or cover rule change. Writes are atomic (temp file + rename), so racing the daemon is harmless.
 
   sudo -u apache /usr/share/nextcloud/apps/recognize/python/.venv/bin/python \
-      tools/backfill_crops.py /usr/share/nextcloud/apps/recognize/python/nc_config.json
+      tools/backfill_crops.py [--force] /usr/share/nextcloud/apps/recognize/python/nc_config.json
 """
 import os
 import sys
@@ -20,10 +21,14 @@ from service import Service  # noqa: E402
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    force = "--force" in args
+    args = [a for a in args if a != "--force"]
+    if len(args) != 1:
         print(__doc__)
         return 2
-    svc = Service(sys.argv[1], gpu=False)
+    svc = Service(args[0], gpu=False)
+    svc._crop_force = force
     if not os.path.isdir(svc.crop_root):
         print(f"crop root {svc.crop_root} missing: run deploy.sh first")
         return 1
