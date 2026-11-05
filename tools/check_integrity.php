@@ -197,8 +197,11 @@ function controller(array $params, array $mapperOn = [], bool $sensitive = true,
 	$db->on['getQueryBuilder'] = fn () => $qb;
 	$alice = mock(\OCP\IUser::class, ['getUID' => fn () => 'alice']);
 	$users = mock(\OCP\IUserManager::class, ['get' => fn ($uid) => $uid === 'alice' ? $alice : null]);
+	$admins = mock(\OCP\IGroup::class, ['getUsers' => fn () => [
+		mock(\OCP\IUser::class, ['getUID' => fn () => 'zed']), mock(\OCP\IUser::class, ['getUID' => fn () => 'admin1'])]]);
+	$groups = mock(\OCP\IGroupManager::class, ['get' => fn ($g) => $g === 'admin' ? $admins : null]);
 	$c = new InternalController('recognize', $request, new \OCA\Recognize\Service\TagManager($systemTags, $objectMapper),
-		$mapper, $appConfig, mock(\Psr\Log\LoggerInterface::class), $db, $users);
+		$mapper, $appConfig, mock(\Psr\Log\LoggerInterface::class), $db, $users, $groups);
 	return [$c, $mapper, $db, $objectMapper, $appConfig, $systemTags];
 }
 
@@ -211,6 +214,15 @@ $r = $c->results();
 $created = $sys->called('createTag');
 check('new label -> created as the file owner', $r->getStatus() === 200 && $created !== []
 	&& array_reduce($created, fn ($ok, $call) => $ok && ($call[1][3] ?? null) !== null && $call[1][3]->getUID() === 'alice', true));
+
+// Owner null (group folder) or tag creation restricted to admins: retry once as the first admin (by uid).
+$forbidden = fn ($name, $visible, $assignable, $user = null) => ($user === null || $user->getUID() !== 'admin1')
+	? throw new \OCP\SystemTag\TagCreationForbiddenException()
+	: mock(\OCP\SystemTag\ISystemTag::class, ['getId' => fn () => '9']);
+[$c, , , , , $sys] = controller(['file_id' => 42, 'tags' => ['NewLabel'], 'faces' => []], [], true, 's3cret', [
+	'getTag' => function () { throw new \OCP\SystemTag\TagNotFoundException(); }, 'createTag' => $forbidden]);
+check('creation forbidden for the owner -> retried as the first admin, 200', $c->results()->getStatus() === 200
+	&& ($sys->called('createTag')[1][1][3] ?? null)?->getUID() === 'admin1');
 
 [$c, $mapper, $db, $objects] = controller(['file_id' => 42, 'tags' => ['Cat'], 'faces' => [$face(['vector' => array_fill(0, 3, 0.1)])]]);
 $r = $c->results();

@@ -92,3 +92,27 @@ def test_run_end_to_end_and_ctrl_c(tmp_path, capsys):
     assert len(os.listdir(os.path.join(root, "u"))) == 6
     with patch.object(bf, "plan_slices", side_effect=KeyboardInterrupt):
         assert bf.run(FakeDb(rows, paths, set()), root, force=True, workers=2) == 130
+
+
+def test_slices_survive_two_files_with_the_same_path(tmp_path):
+    rows, paths = _setup(tmp_path, 2)
+    paths[2] = paths[1]
+    assert list(bf.plan_slices(FakeDb(rows, paths, set()), str(tmp_path / "c"), True, False))
+
+
+def _killer_for(real):
+    def crop_file(task):
+        if task[0].endswith("/0.jpg"):
+            os._exit(9)  # like the OOM killer
+        return real(task)
+    crop_file.__qualname__, crop_file.__module__ = "crop_file", "backfill_crops"  # picklable by reference
+    return crop_file
+
+
+def test_run_skips_a_task_lost_to_a_killed_worker(tmp_path, capsys):
+    rows, paths = _setup(tmp_path)
+    root = str(tmp_path / "crops")
+    os.makedirs(os.path.join(root, "u"))
+    with patch.object(bf, "crop_file", _killer_for(bf.crop_file)), patch.object(bf, "TASK_TIMEOUT", 3):
+        assert bf.run(FakeDb(rows, paths, set()), root, workers=2) == 0
+    assert len(os.listdir(os.path.join(root, "u"))) == 4

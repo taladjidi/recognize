@@ -563,6 +563,10 @@ class DB:
         """Explicit commit for batching multiple writes."""
         self._commit()
 
+    def rollback(self):
+        """End a read-only transaction (drops the REPEATABLE READ snapshot)."""
+        self._conn.rollback()
+
     def update_face_clusters(self, detection_ids: list[int], cluster_ids: list[int]):
         """Batch-update cluster assignments for face detections."""
         if not detection_ids:
@@ -591,7 +595,7 @@ class DB:
             f"ORDER BY {cover_order('d.')}) AS rn FROM {t} d "
             f"JOIN {self._table('filecache')} fc ON fc.fileid = d.file_id "
             f"JOIN {self._table('storages')} s ON s.numeric_id = fc.storage "
-            f"WHERE d.cluster_id > 0 AND fc.path LIKE 'files/%' "
+            f"WHERE d.cluster_id > 0 AND fc.path LIKE {self._ph()} "
             f"AND s.id IN ({home}, {obj})) c "
             f"WHERE rn = 1) "
             if covers_only else ""
@@ -599,9 +603,13 @@ class DB:
         cur = self._execute(
             f"SELECT id, file_id, user_id, x, y, width, height FROM {t} "
             f"WHERE id > {self._ph()} AND user_id <> '' {covers}ORDER BY id LIMIT {self._ph()}",
-            (after_id, limit),
+            (after_id, *(("files/%",) if covers_only else ()), limit),
         )
         return self._fetchall_dicts(cur)
+
+    def max_detection_id(self) -> int:
+        cur = self._execute(f"SELECT MAX(id) FROM {self._table('recognize_face_detections')}")
+        return cur.fetchone()[0] or 0
 
     def existing_detection_ids(self, user_id: str, ids: list[int]) -> set[int]:
         """The subset of ids that are detections of user_id."""

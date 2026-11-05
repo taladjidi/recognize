@@ -217,9 +217,13 @@ final class FaceDetectionMapper extends QBMapper {
 		$qb->select($qb->func()->count('d.id'))
 			->from('recognize_face_detections', 'd')
 			->innerJoin('d', 'filecache', 'fc', $qb->expr()->eq('d.file_id', 'fc.fileid'))
+			->innerJoin('fc', 'storages', 's', $qb->expr()->eq('s.numeric_id', 'fc.storage'))
 			->where($qb->expr()->eq('d.cluster_id', $qb->createPositionalParameter(-1)))
 			->andWhere($qb->expr()->eq('d.user_id', $qb->createPositionalParameter($userId)))
-			->andWhere($qb->expr()->like('fc.path', $qb->createPositionalParameter('files/%')));
+			->andWhere($qb->expr()->like('fc.path', $qb->createPositionalParameter('files/%')))
+			// Same storage-id forms as InternalController::ownerFromStorageId.
+			->andWhere($qb->expr()->in('s.id', $qb->createPositionalParameter(
+				['home::' . $userId, 'object::user:' . $userId], IQueryBuilder::PARAM_STR_ARRAY)));
 		$result = $qb->executeQuery();
 		$count = $result->fetch(\PDO::FETCH_COLUMN);
 		$result->closeCursor();

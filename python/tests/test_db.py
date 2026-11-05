@@ -272,3 +272,13 @@ class TestMaintenanceMode:
     def test_not_in_maintenance(self, db):
         db._config["config_php"] = "/nonexistent/config.php"
         assert db.check_maintenance_mode() is False
+
+
+def test_detections_after_binds_the_like_pattern(db):
+    """psycopg2 reads a literal %' in executed SQL as a format char."""
+    seen = []
+    db._execute = lambda sql, params=(): seen.append((sql, params))
+    db._fetchall_dicts = lambda cur: []
+    db.detections_after(0, 10, covers_only=True)
+    sql, params = seen[0]
+    assert "%'" not in sql and "files/%" in params

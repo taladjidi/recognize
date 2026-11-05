@@ -524,3 +524,16 @@ def test_setup_keeps_custom_crop_root_and_tightens_existing_secret_files(tmp_pat
     assert stat.S_IMODE(os.stat(out["OUTPUT_CONFIG"]).st_mode) == 0o600
     assert stat.S_IMODE(os.stat(out["OUTPUT_NGINX"]).st_mode) == 0o600
     assert "alias /srv/custom/;" in open(out["OUTPUT_NGINX"]).read()
+
+
+def test_crop_files_are_stat_ed_after_the_db_slot_is_released(config, db, tmp_path, monkeypatch):
+    api = api_server.Api(config)
+    api.crop_root = str(tmp_path)
+    token = mint(exp=int(time.time()) + 250)
+    held = []
+    real = api_server._crop_or_none
+    monkeypatch.setattr(api_server, "_crop_or_none",
+                        lambda *a: held.append(api._db_slots._value < api_server.DB_SLOTS) or real(*a))
+    assert api.handle("/v1/clusters", {}, token)[0] == 200
+    assert api.handle("/v1/clusters/1", {}, token)[0] == 200
+    assert held and not any(held)

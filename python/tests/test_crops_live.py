@@ -88,3 +88,59 @@ def test_idle_sleep_wakes_on_sigterm(tmp_path):
     t0 = _t.monotonic()
     svc._sleep(30)
     assert _t.monotonic() - t0 < 2
+
+
+class _FakeStop:
+    """Event stand-in: runs `n` loop turns, records every wait."""
+    def __init__(self, n):
+        self.n, self.waits = n, []
+
+    def is_set(self):
+        return len(self.waits) >= self.n
+
+    def wait(self, t=None):
+        self.waits.append(t)
+
+    def set(self):
+        self.n = 0
+
+
+def test_crop_loop_ends_its_transaction_every_tick(svc):  # noqa: F811
+    fake = MagicMock()
+    with patch("db.DB", return_value=fake), patch.object(svc, "_crop_maintenance"), \
+            patch.object(svc.pipeline, "stopping", _FakeStop(3)):
+        svc._crop_loop()
+    assert fake.rollback.call_count >= 3  # MariaDB REPEATABLE READ: no tick may pin a snapshot
+
+
+def test_crop_loop_backs_off_after_an_error_and_while_idle(svc):  # noqa: F811
+    import service
+    with patch("db.DB", return_value=MagicMock()), patch.object(svc, "_crop_maintenance", side_effect=RuntimeError), \
+            patch.object(svc.pipeline, "stopping", _FakeStop(2)):
+        svc._crop_loop()
+        assert svc.pipeline.stopping.waits[0] == service.POLL_MAX_INTERVAL
+    with patch("db.DB", side_effect=AssertionError("pinged while idle")), \
+            patch.object(svc.pipeline, "_enabled", set()), patch.object(svc.pipeline, "stopping", _FakeStop(2)):
+        svc._crop_loop()
+        assert svc.pipeline.stopping.waits[0] == service.POLL_MAX_INTERVAL
+    svc._crop_rest_until = time.monotonic() + 1000
+    with patch("db.DB", side_effect=AssertionError("pinged while resting")), patch.object(svc.pipeline, "stopping", _FakeStop(2)):
+        svc._crop_loop()
+        assert svc.pipeline.stopping.waits[0] > service.CROP_THREAD_PAUSE
+
+
+def test_signal_handler_does_not_take_the_event_lock(svc):  # noqa: F811
+    import signal
+    old = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        svc._setup_signals()
+        stop = svc.pipeline.stopping
+        with stop._cond:  # the signal landed while the main thread was inside Event.wait()
+            t = threading.Thread(target=svc._handle_signal, args=(15, None), daemon=True)
+            t.start()
+            t.join(1)
+            assert not t.is_alive(), "handler blocked on the Event lock"
+        assert stop.wait(3)  # a watcher sets it once the lock is free
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)

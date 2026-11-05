@@ -94,6 +94,8 @@ class Service:
         self._crop_rest_until = 0.0
         self._crop_root_warned = False
         self._crop_thread = None
+        self._signalled = False        # set by the signal handler; a watcher thread turns it into the Event
+        self._watcher = None
 
     def start(self):
         """Start the service main loop."""
@@ -126,6 +128,8 @@ class Service:
         try:
             signal.signal(signal.SIGTERM, self._handle_signal)
             signal.signal(signal.SIGINT, self._handle_signal)
+            self._watcher = threading.Thread(target=self._watch_signal, name="sigwatch", daemon=True)
+            self._watcher.start()
         except ValueError:
             # signal() only works in main thread; skip in tests/subthreads
             log.debug("Signal handlers not registered (not main thread)")
@@ -135,6 +139,16 @@ class Service:
         sig_name = signal.Signals(signum).name
         log.info("Received %s, shutting down gracefully...", sig_name)
         self._running = False
+        if self._watcher is None:
+            self.pipeline.stopping.set()  # no real signal context (tests, direct call)
+        else:
+            # Event.set() takes a non-reentrant lock the interrupted thread may hold: only a flag here.
+            self._signalled = True
+
+    def _watch_signal(self):
+        while not self._signalled:
+            if self.pipeline.stopping.wait(0.2):
+                return
         self.pipeline.stopping.set()
 
     def _main_loop(self):
@@ -392,6 +406,11 @@ class Service:
         stop = self.pipeline.stopping
         db = None
         while not stop.is_set():
+            wait = CROP_THREAD_PAUSE
+            idle = self._crop_idle_for()
+            if idle:
+                stop.wait(idle)
+                continue
             try:
                 if db is None:
                     db = DB(self.config)
@@ -399,16 +418,28 @@ class Service:
                 self._crop_maintenance(db=db)
             except Exception as e:
                 log.error("Face crop thread: %s", e)
+                wait = POLL_MAX_INTERVAL
                 try:
                     db and db.close()
                 except Exception:
                     pass
                 db = None
-            stop.wait(CROP_THREAD_PAUSE)
+            finally:
+                try:
+                    db and db.rollback()  # never keep a snapshot between ticks (MariaDB REPEATABLE READ)
+                except Exception:
+                    pass
+            stop.wait(wait)
         try:
             db and db.close()
         except Exception:
             pass
+
+    def _crop_idle_for(self):
+        """Seconds the crop thread has nothing to do (faces off, or resting between passes); 0 when it has work."""
+        if "faces" not in self.pipeline._enabled:
+            return POLL_MAX_INTERVAL
+        return min(max(self._crop_rest_until - time.monotonic(), 0), POLL_MAX_INTERVAL)
 
     def _crop_maintenance(self, db=None):
         """One tick: a bounded slice of crop backfill, then one user dir of orphan cleanup.
@@ -490,8 +521,10 @@ class Service:
         user = self._crop_users.pop()
         user_dir = safe_user_dir(self.crop_root, user)
         if user_dir is not None:
-            files = crop_ids(user_dir)
-            alive = (db or self.pipeline.db).existing_detection_ids(user, sorted(files)) if files else set()
+            db = db or self.pipeline.db
+            max_id = db.max_detection_id()  # read first: a crop of a newer detection is not an orphan
+            files = {i: n for i, n in crop_ids(user_dir).items() if i <= max_id}
+            alive = db.existing_detection_ids(user, sorted(files)) if files else set()
             removed = 0
             for det_id, name in files.items():
                 if det_id not in alive:

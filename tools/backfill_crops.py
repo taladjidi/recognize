@@ -24,6 +24,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
 
+TASK_TIMEOUT = 600  # s a file may take; a task lost to a killed worker is skipped after this
 SLICE = 5000  # detections per DB query; files inside a slice are sorted by path
 REPORT_EVERY = 200  # files
 
@@ -72,7 +73,7 @@ def plan_slices(db, crop_root, force, covers_only):
                 if covers:
                     seen.add(r["id"])
             paths = db.resolve_file_paths(list(by_file)) if by_file else {}
-            yield sorted((paths[fid]["path"], rs) for fid, rs in by_file.items() if fid in paths)
+            yield sorted(((paths[fid]["path"], rs) for fid, rs in by_file.items() if fid in paths), key=lambda t: t[0])
 
 
 def _pct(xs, q):
@@ -94,8 +95,13 @@ def run(db, crop_root, force=False, covers_only=False, workers=2):
     pool = multiprocessing.get_context("fork").Pool(workers, _init_worker)
     try:
         for batch in plan_slices(db, crop_root, force, covers_only):
-            for n, size, *times in pool.imap_unordered(
-                    crop_file, [(p, rs, crop_root, force) for p, rs in batch]):
+            jobs = [(p, pool.apply_async(crop_file, ((p, rs, crop_root, force),))) for p, rs in batch]
+            for p, job in jobs:
+                try:
+                    n, size, *times = job.get(TASK_TIMEOUT)
+                except multiprocessing.TimeoutError:  # worker killed (OOM): the pool never delivers this result
+                    print(f"lost task, skipped: {p}", flush=True)
+                    continue
                 files += 1
                 crops += n
                 nbytes += size

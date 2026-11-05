@@ -131,6 +131,11 @@ def _crop_or_none(uid, did, secret, crop_root):
 def list_clusters(db: DB, uid: str, crop_secret: str, min_count: int = 1, title: str | None = None,
                   crop_root: str | None = None) -> list[dict]:
     """[{id, title, count, cover}] by count desc; cover is the best-ranked box (db.cover_order) that has a crop, else None."""
+    return fill_covers(cluster_candidates(db, uid, min_count, title), uid, crop_secret, crop_root)
+
+
+def cluster_candidates(db: DB, uid: str, min_count: int = 1, title: str | None = None) -> list[dict]:
+    """The DB half of list_clusters: [{id, title, count, dids}], dids = cover candidates in rank order."""
     p = db._ph()
     title_sql = f"AND LOWER(c.title) LIKE {p} ESCAPE '!' " if title is not None else ""
     sql = (
@@ -149,15 +154,32 @@ def list_clusters(db: DB, uid: str, crop_secret: str, min_count: int = 1, title:
     rows = db._fetchall_dicts(db._execute(sql, params))
     out = {}
     for r in rows:
-        c = out.setdefault(r["cid"], {"id": r["cid"], "title": r["title"], "count": r["cnt"], "cover": None})
-        if c["cover"] is None:
-            c["cover"] = _crop_or_none(uid, r["did"], crop_secret, crop_root)
+        out.setdefault(r["cid"], {"id": r["cid"], "title": r["title"], "count": r["cnt"], "dids": []})["dids"].append(r["did"])
     return list(out.values())
+
+
+def fill_covers(clusters: list[dict], uid: str, crop_secret: str, crop_root: str | None) -> list[dict]:
+    """The file half: first candidate whose crop exists. Stats files, so call it with no DB slot held."""
+    for c in clusters:
+        c["cover"] = next((u for u in (_crop_or_none(uid, d, crop_secret, crop_root) for d in c.pop("dids")) if u), None)
+    return clusters
 
 
 def get_cluster(db: DB, uid: str, crop_secret: str, cluster_id: int, offset: int, limit: int,
                 crop_root: str | None = None) -> dict | None:
     """{id, title, count, files} for one of uid's clusters, newest first; None if not uid's."""
+    return fill_crops(cluster_page(db, uid, cluster_id, offset, limit), uid, crop_secret, crop_root)
+
+
+def fill_crops(body: dict | None, uid: str, crop_secret: str, crop_root: str | None) -> dict | None:
+    """Add each detection's crop URL (stats files: call with no DB slot held)."""
+    for f in (body or {}).get("files", []):
+        d = f["detection"]
+        d["crop"] = _crop_or_none(uid, d["id"], crop_secret, crop_root)
+    return body
+
+
+def cluster_page(db: DB, uid: str, cluster_id: int, offset: int, limit: int) -> dict | None:
     p = db._ph()
     det, clusters = db._table("recognize_face_detections"), db._table("recognize_face_clusters")
     mime_join = f"JOIN {db._table('mimetypes')} m ON m.id = fc.mimetype "
@@ -189,7 +211,6 @@ def get_cluster(db: DB, uid: str, crop_secret: str, cluster_id: int, offset: int
             "mime": r["mimetype"], "etag": r["etag"], "mtime": r["mtime"], "size": r["size"],
             "detection": {
                 "id": r["did"], "x": r["x"], "y": r["y"], "width": r["width"], "height": r["height"],
-                "crop": _crop_or_none(uid, r["did"], crop_secret, crop_root),
             },
         } for r in rows],
     }
@@ -284,20 +305,22 @@ class Api:
                 return 401, {}
             if path == "/v1/clusters":
                 min_count = _int(qs, "min", 1, 1, 10**9)
-                return 200, self._with_db(lambda db: list_clusters(db, uid, self.crop_secret, min_count, crop_root=self.crop_root))
+                cl = self._with_db(lambda db: cluster_candidates(db, uid, min_count))
+                return 200, fill_covers(cl, uid, self.crop_secret, self.crop_root)
             m = _CLUSTER_PATH.fullmatch(path)
             if m:
                 offset = _int(qs, "offset", 0, 0, 10**9)
                 limit = _int(qs, "limit", MAX_LIMIT, 1, MAX_LIMIT)
-                body = self._with_db(
-                    lambda db: get_cluster(db, uid, self.crop_secret, int(m.group(1)), offset, limit,
-                                          crop_root=self.crop_root))
+                body = fill_crops(
+                    self._with_db(lambda db: cluster_page(db, uid, int(m.group(1)), offset, limit)),
+                    uid, self.crop_secret, self.crop_root)
                 return (200, body) if body is not None else (404, {"error": "not found"})
             if path == "/v1/search":
                 q = qs.get("q", [""])[-1]
                 if not q or len(q) > MAX_Q:
                     raise ValueError("q")
-                return 200, self._with_db(lambda db: list_clusters(db, uid, self.crop_secret, 1, q, crop_root=self.crop_root))
+                cl = self._with_db(lambda db: cluster_candidates(db, uid, 1, q))
+                return 200, fill_covers(cl, uid, self.crop_secret, self.crop_root)
         except ValueError:
             return 400, {"error": "bad parameter"}
         except Busy:

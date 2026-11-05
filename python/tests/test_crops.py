@@ -264,7 +264,7 @@ def test_backfill_creates_missing_only_and_cleanup_removes_orphans_only(svc, tmp
     gone_file = _det(db, 11, "alice")  # its photo cannot be resolved
     (root / "alice").mkdir()
     (root / "alice" / f"{a1}.jpg").write_bytes(b"keep")          # existing crop left alone
-    (root / "alice" / "999.jpg").write_bytes(b"orphan")
+    (root / "alice" / f"{nobody}.jpg").write_bytes(b"orphan")  # id below the max, not alice's
     for name in ("notes.txt", ".x.tmp", "12.jpg.bak", "abc.jpg"):
         (root / "alice" / name).write_bytes(b"not ours")
     (root / "bob").mkdir()
@@ -352,3 +352,14 @@ def test_crop_equals_upright_photo_cropped_with_head_room(orientation):
     ref = np.asarray(up_img.resize((CROP_SIZE, CROP_SIZE), Image.Resampling.LANCZOS,
                                    box=(left, top, left + side, top + side))).astype(int)
     assert np.abs(got - ref).mean() < 3
+
+
+def test_cleanup_never_deletes_a_crop_above_the_max_detection_id_of_the_tick(svc, tmp_path):
+    db = svc.pipeline.db
+    root = tmp_path / "crops"
+    (root / "alice").mkdir()
+    d = _det(db, 10, "alice")
+    (root / "alice" / f"{d + 1000}.jpg").write_bytes(b"newer than this tick's snapshot")
+    (root / "alice" / f"{d - 1}.jpg").write_bytes(b"orphan")
+    svc._cleanup_crops_one_user(db)
+    assert set(os.listdir(root / "alice")) == {f"{d + 1000}.jpg"}

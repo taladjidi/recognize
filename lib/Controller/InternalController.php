@@ -18,7 +18,9 @@ use OCP\AppFramework\Http\JSONResponse;
 use OCP\AppFramework\Services\IAppConfig;
 use OCP\IDBConnection;
 use OCP\IRequest;
+use OCP\IGroupManager;
 use OCP\IUserManager;
+use OCP\SystemTag\TagCreationForbiddenException;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -39,6 +41,7 @@ final class InternalController extends Controller {
 		private LoggerInterface $logger,
 		private IDBConnection $db,
 		private IUserManager $userManager,
+		private IGroupManager $groupManager,
 	) {
 		parent::__construct($appName, $request);
 	}
@@ -89,11 +92,17 @@ final class InternalController extends Controller {
 		// Always, even with no labels: a file that never gets the processed tag
 		// is re-queued by CatchUpJob every day.
 		try {
-			// shortcut: group-folder files have no owner, and with systemtags
-			// restrict_creation_to_admin a non-admin owner cannot create a new label either;
-			// both still fail here for a label that does not exist yet.
 			$owner = $this->userManager->get($this->ownerOfFile($fileId));
-			$this->tagManager->assignTags($fileId, $tags, $owner);
+			try {
+				$this->tagManager->assignTags($fileId, $tags, $owner);
+			} catch (TagCreationForbiddenException $e) {
+				// Group-folder files have no owner; with restrict_creation_to_admin a non-admin owner cannot create a label.
+				$admin = $this->firstAdmin();
+				if ($admin === null) {
+					throw $e;
+				}
+				$this->tagManager->assignTags($fileId, $tags, $admin);
+			}
 		} catch (\Throwable $e) {
 			$this->logger->error('Failed to assign tags for file ' . $fileId, ['exception' => $e]);
 			return new JSONResponse(
@@ -205,6 +214,13 @@ final class InternalController extends Controller {
 			$this->db->rollBack();
 			throw $e;
 		}
+	}
+
+	/** The admin group's first user by uid, or null. */
+	private function firstAdmin(): ?\OCP\IUser {
+		$users = $this->groupManager->get('admin')?->getUsers() ?? [];
+		usort($users, static fn ($a, $b) => strcmp($a->getUID(), $b->getUID()));
+		return $users[0] ?? null;
 	}
 
 	/** Owner uid of a file from its storage id (works without a user session), '' if none. */
