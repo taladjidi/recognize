@@ -106,7 +106,8 @@ def test_matched_rows_keep_id_cluster_threshold_and_name(env):
     rows = _rows(db)
     assert rows[tom]["cluster_id"] == 7 and rows[tom]["x"] == pytest.approx(0.12)
     assert rows[tom]["face_vector"] == rd.json.dumps(NEW_VEC)
-    assert rows[removed]["threshold"] == 0.6 and rows[removed]["cluster_id"] is None
+    # 0.6 - |OLD_VEC - NEW_VEC| < 0: floor, still a removed face (threshold > 0)
+    assert rows[removed]["threshold"] == pytest.approx(1e-6) and rows[removed]["cluster_id"] is None
     assert rows[removed]["y"] == pytest.approx(0.49)
     assert junk not in rows
     (new_id,) = set(rows) - {tom, removed}
@@ -200,7 +201,8 @@ def test_greedy_match_prefers_best_iou_and_respects_minimum():
 def test_clustered_row_needs_a_mutual_best_match(env):
     """Group photo: a named sideways box covers two faces. Its best face is someone else's
     better match, so greedy alone would hand it the second face (another person). It is
-    left alone instead and that face is inserted unclustered."""
+    left alone, and the second face (inside the named box) is not inserted either: the file
+    is listed for review."""
     db, _, root = env
     p = _photo(env, 10, "a.jpg", 6)
     named = _old(db, 10, _box(0.10, 0.10, 0.40, 0.40), cluster_id=5)
@@ -212,9 +214,96 @@ def test_clustered_row_needs_a_mutual_best_match(env):
     rows = _rows(db)
     assert rows[named] == nb
     assert rows[other]["x"] == pytest.approx(0.10)
-    (new_id,) = set(rows) - {named, other}
-    assert rows[new_id]["cluster_id"] is None and rows[new_id]["x"] == pytest.approx(0.27)
-    assert (s["matched"], s["inserted"], s["kept"]) == (1, 1, 1)
+    assert set(rows) == {named, other}
+    assert (s["matched"], s["inserted"], s["kept"], s["needs_review"]) == (1, 0, 1, [p])
+
+
+def test_threshold_shrinks_by_the_vector_move(env):
+    """PHP's threshold is the OLD vector's distance to the cluster; the new vector may sit
+    closer. t - |v_old - v_new| keeps a removed face out (triangle inequality)."""
+    db, _, root = env
+    p = _photo(env, 10, "a.jpg", 6)
+    removed = _old(db, 10, _box(0.5, 0.5), threshold=2.0)
+    rd.run(db, Detector({p: [_box(0.5, 0.5)]}), root)
+    assert _rows(db)[removed]["threshold"] == pytest.approx(2.0 - 2 ** 0.5)
+
+
+@pytest.mark.parametrize("kind", ["named", "removed"])
+def test_no_fresh_duplicate_of_a_kept_named_or_removed_face(env, kind):
+    db, _, root = env
+    p = _photo(env, 10, "a.jpg", 6)
+    kept = _old(db, 10, _box(0.1, 0.1, 0.6, 0.6), **({"cluster_id": 4} if kind == "named" else {"threshold": 0.5}))
+    inside, apart = _box(0.3, 0.3, 0.1, 0.1), _box(0.8, 0.8, 0.1, 0.1)
+    assert 0 < rd.iou(_rows(db)[kept], inside) < rd.MIN_IOU  # unmatched, but the same face
+    s = rd.run(db, Detector({p: [inside, apart]}), root)
+    rows = _rows(db)
+    assert len(rows) == 2 and kept in rows
+    assert [r["x"] for i, r in rows.items() if i != kept] == [pytest.approx(0.8)]
+    assert (s["inserted"], s["needs_review"]) == (1, [p])
+
+
+def test_row_changed_during_detection_skips_the_file(env):
+    """The user renames / moves a face while the file is being detected: nothing is written."""
+    db, _, root = env
+    p, tom, removed, junk, det = _scene(env)
+    before = _rows(db)
+    inner = det.__call__
+
+    def detect(path):
+        db._execute("UPDATE oc_recognize_face_detections SET cluster_id = 8 WHERE id = ?", (tom,))
+        db._commit()
+        return inner(path)
+
+    s = rd.run(db, detect, root)
+    before[tom]["cluster_id"] = 8
+    assert _rows(db) == before
+    assert (s["raced"], s["matched"], s["inserted"], s["deleted"]) == (1, 0, 0, 0)
+
+
+def test_deleted_counts_rows_actually_deleted(env):
+    db, _, root = env
+    p, tom, removed, junk, det = _scene(env)
+    inner = det.__call__
+
+    def detect(path):  # the daemon clusters the false positive meanwhile: the guard keeps it
+        db._execute("UPDATE oc_recognize_face_detections SET cluster_id = 9 WHERE id = ?", (junk,))
+        db._commit()
+        return inner(path)
+
+    s = rd.run(db, detect, root)
+    assert junk in _rows(db) and s["deleted"] == 0
+
+
+def test_crash_after_commit_never_leaves_the_old_crop(env, monkeypatch):
+    """Power cut between the DB commit and the new crop: the old (sideways-box) crop must be
+    gone, so the backfill rebuilds it from the updated row."""
+    import crops
+    db, _, root = env
+    p, tom, removed, junk, det = _scene(env)
+    os.makedirs(os.path.join(root, "alice"))
+    old_crop = os.path.join(root, "alice", f"{tom}.jpg")
+    open(old_crop, "wb").write(b"old sideways crop")
+
+    def cut(*a, **k):
+        raise KeyboardInterrupt("power cut")
+
+    monkeypatch.setattr(crops, "write_crop", cut)
+    with pytest.raises(KeyboardInterrupt):
+        rd.run(db, det, root)
+    assert _rows(db)[tom]["x"] == pytest.approx(0.12)
+    assert not os.path.exists(old_crop)
+
+
+def test_dry_run_ends_the_read_snapshot_per_file(env, monkeypatch):
+    db, _, root = env
+    paths = [_photo(env, i, f"{i}.jpg", 6) for i in (1, 2, 3)]
+    for i in (1, 2, 3):
+        _old(db, i, _box(0.1, 0.1))
+    calls = []
+    real = db.commit
+    monkeypatch.setattr(db, "commit", lambda: calls.append(1) or real())
+    rd.run(db, Detector({p: [_box(0.1, 0.1)] for p in paths}), root, dry_run=True)
+    assert len(calls) >= 3
 
 
 def test_clustered_tie_is_not_a_match():
@@ -279,6 +368,17 @@ def test_requeue_faceless_limit_resumes_and_a_finished_pass_requeues_nothing(que
     _photo(queue, 4, "z.jpg", 6)  # uploaded later: the fixed daemon already did it
     assert rd.requeue_faceless(db)["requeued"] == 0  # pass complete
     assert _pending(db) == {}
+
+
+def test_requeue_never_overwrites_a_pending_row(queue, monkeypatch):
+    """PHP queues a delete between the scan and the requeue: it must stay a delete."""
+    db, _, _ = queue
+    _photo(queue, 1, "a.jpg", 6)
+    rows = db.faceless_image_files()
+    db.upsert_pending(1, 1, 2)
+    monkeypatch.setattr(db, "faceless_image_files", lambda: rows)
+    rd.requeue_faceless(db)
+    assert _pending(db) == {1: (1, 2)}
 
 
 def test_requeue_faceless_dry_run_writes_nothing(queue):

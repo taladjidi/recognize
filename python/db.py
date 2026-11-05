@@ -302,6 +302,17 @@ class DB:
         self._execute(sql, (file_id, storage_id, action, now))
         self._commit()
 
+    def insert_pending_if_absent(self, file_id: int, storage_id: int, action: int) -> int:
+        """Queue a file unless it already has a pending row (whatever its action). Returns rows inserted."""
+        t = self._table("recognize_pending")
+        ignore, conflict = ("INSERT IGNORE", "") if self.dialect == "mysql" else ("INSERT", " ON CONFLICT (file_id) DO NOTHING")
+        cur = self._execute(
+            f"{ignore} INTO {t} (file_id, storage_id, action, added_at) VALUES ({self._ph(4)}){conflict}",
+            (file_id, storage_id, action, int(time.time())),
+        )
+        self._commit()
+        return cur.rowcount
+
     def delete_pending(self, ids: list[int]):
         """Remove processed entries from the pending table."""
         if not ids:
@@ -517,14 +528,23 @@ class DB:
                 row["face_vector"] = json.loads(row["face_vector"])
         return rows
 
-    def update_face_detection_box(self, detection_id: int, face: dict):
-        """New box + vector for a detection; id, cluster_id, threshold, user_id untouched. Caller commits."""
-        t = self._table("recognize_face_detections")
-        self._execute(
-            f"UPDATE {t} SET x = {self._ph()}, y = {self._ph()}, width = {self._ph()}, height = {self._ph()}, "
-            f"face_vector = {self._ph()} WHERE id = {self._ph()}",
-            (face["x"], face["y"], face["width"], face["height"], json.dumps(face["vector"]), detection_id),
+    def update_face_detection_box(self, row: dict, face: dict, threshold=None) -> int:
+        """New box + vector (and threshold, if given) for a detection read as row; id, cluster_id
+        and user_id untouched. Only while cluster_id and threshold still hold the values read
+        (a user edit meanwhile -> 0 rows). Caller commits."""
+        t, p = self._table("recognize_face_detections"), self._ph()
+        cur = self._execute(
+            f"UPDATE {t} SET x = {p}, y = {p}, width = {p}, height = {p}, face_vector = {p}, threshold = {p} "
+            f"WHERE id = {p} AND (cluster_id = {p} OR (cluster_id IS NULL AND {p} IS NULL)) "
+            f"AND (threshold = {p} OR (threshold IS NULL AND {p} IS NULL))",
+            (face["x"], face["y"], face["width"], face["height"], json.dumps(face["vector"]),
+             row["threshold"] if threshold is None else threshold, row["id"],
+             row["cluster_id"], row["cluster_id"], row["threshold"], row["threshold"]),
         )
+        return cur.rowcount
+
+    def rollback(self):
+        self._conn.rollback()
 
     def delete_detection_if_unassigned(self, detection_id: int) -> int:
         """Delete a detection only while it has no cluster and no user threshold. Caller commits."""

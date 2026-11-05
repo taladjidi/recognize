@@ -243,9 +243,10 @@ class TestClusterRegressions:
         assert before[ids_a[0]] != before[ids_b[0]]
         t = db._table("recognize_face_clusters")
         db._execute(f"UPDATE {t} SET title = 'Tom' WHERE id = {db._ph()}", (before[ids_a[0]],))
+        rows = {d["id"]: d for d in db.get_face_detections_for_user("alice")}
         for i in ids_a[:4]:
-            db.update_face_detection_box(i, {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4,
-                                             "vector": _make_embedding(cb).tolist()})
+            assert db.update_face_detection_box(rows[i], {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4,
+                                                          "vector": _make_embedding(cb).tolist()}) == 1
         db.commit()
         new = _insert_faces(db, "alice", [_make_embedding(cb) for _ in range(5)], file_id_start=3000)
 

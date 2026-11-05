@@ -8,10 +8,17 @@ embeddings. This re-runs detection on the upright image and, per file:
   (greedy best IoU >= 0.3; a clustered row also needs a mutual unique best match)
   and UPDATEs each match in place (box + vector only: id, cluster_id, threshold
   and user_id stay, so names and manual edits survive);
-- inserts unmatched fresh faces unclustered, for the daemon to cluster;
+- a removed face's threshold (PHP: old vector's distance to the cluster) shrinks by
+  how far the vector moved, so the new vector cannot rejoin;
+- the update applies only while cluster_id and threshold still hold the values read
+  (a user edit during detection rolls the file back, counted as raced);
+- inserts unmatched fresh faces unclustered, for the daemon to cluster, except one
+  overlapping a kept named or removed row (likely the same face): the file is listed
+  as "needs review" instead;
 - deletes an unmatched old detection only if it has no cluster and no threshold
   (a likely sideways false positive); every other unmatched one is kept;
-- rewrites the crop of every changed detection.
+- rewrites the crop of every changed detection (the old crop is deleted before the
+  commit, so a crash leaves no crop, which the backfill rebuilds, never a stale one).
 
 Idempotent without any state: a detection whose box and vector already match the
 fresh upright result (IoU >= 0.9, cosine >= 0.99) is left alone, so a re-run, or a
@@ -118,11 +125,13 @@ def candidates(db):
 
 def run(db, detect, crop_root, dry_run=False, limit=None):
     """detect(path) -> (faces with raw boxes, crops). Returns the summary counts."""
-    from crops import write_crop
-    s = dict(files=0, changed=0, matched=0, inserted=0, deleted=0, unchanged=0, kept=0, failed=0)
+    import crops as crops_mod
+    s = dict(files=0, changed=0, matched=0, inserted=0, deleted=0, unchanged=0, kept=0, failed=0, raced=0,
+             needs_review=[])
     for fid, path in candidates(db):
         if limit is not None and s["changed"] >= limit:
             break
+        db.commit()  # end the read snapshot: fresh rows, and no read view held for hours (dry run too)
         old = db.get_face_detections_for_file(fid)
         if not old:
             continue
@@ -137,35 +146,58 @@ def run(db, detect, crop_root, dry_run=False, limit=None):
             continue
         pairs = match(old, faces)
         updates = [(old[i], j) for i, j in pairs if not _same(old[i], faces[j])]
-        inserts = sorted(set(range(len(faces))) - {j for _, j in pairs})
         unmatched = [old[i] for i in sorted(set(range(len(old))) - {i for i, _ in pairs})]
         deletes = [r for r in unmatched if _unassigned(r)]
+        kept = [r for r in unmatched if not _unassigned(r)]
+        fresh = sorted(set(range(len(faces))) - {j for _, j in pairs})
+        # A fresh face touching a kept named/removed row is most likely that face: inserting it
+        # would duplicate it in the person's cluster, or let a removed face rejoin. A human decides.
+        inserts = [j for j in fresh if not any(iou(faces[j], r) > 0 for r in kept)]
+        deleted = len(deletes)
+        if not dry_run:
+            for row, _ in updates:  # before the commit: a crop never shows another box than its row
+                try:
+                    os.unlink(crops_mod.crop_path(crop_root, row["user_id"], row["id"]) or "")
+                except OSError:
+                    pass
+            if not all([db.update_face_detection_box(row, faces[j], _threshold(row, faces[j])) == 1
+                        for row, j in updates]):
+                db.rollback()  # a user edit since the read: leave the file for the next run
+                s["raced"] += 1
+                continue
+            db.commit()
+            written = [(row["user_id"], row["id"], crops[j]) for row, j in updates]
+            user_id = old[0]["user_id"]
+            for j in inserts:
+                new_id = db.insert_face_detection(fid, user_id, faces[j])  # commits; None on pgsql
+                if new_id:
+                    written.append((user_id, new_id, crops[j]))
+            # the deleted rows' crops go with the daemon's idle cleanup
+            deleted = sum(db.delete_detection_if_unassigned(r["id"]) for r in deletes)
+            db.commit()
+            for uid, did, data in written:
+                if data:
+                    crops_mod.write_crop(crop_root, uid, did, data, overwrite=True)
         s["matched"] += len(updates)
         s["unchanged"] += len(pairs) - len(updates)
         s["inserted"] += len(inserts)
-        s["deleted"] += len(deletes)
-        s["kept"] += len(unmatched) - len(deletes)
-        if updates or inserts or deletes:
+        s["deleted"] += deleted
+        s["kept"] += len(kept)
+        if len(inserts) < len(fresh):
+            s["needs_review"].append(path)
+        if updates or inserts or deleted:
             s["changed"] += 1
-        if dry_run:
-            continue
-        written = []
-        for row, j in updates:
-            db.update_face_detection_box(row["id"], faces[j])
-            written.append((row["user_id"], row["id"], crops[j]))
-        db.commit()
-        user_id = old[0]["user_id"]
-        for j in inserts:
-            new_id = db.insert_face_detection(fid, user_id, faces[j])  # commits; None on pgsql
-            if new_id:
-                written.append((user_id, new_id, crops[j]))
-        for row in deletes:
-            db.delete_detection_if_unassigned(row["id"])  # its crop goes with the daemon's idle cleanup
-        db.commit()
-        for uid, did, data in written:
-            if data:
-                write_crop(crop_root, uid, did, data, overwrite=True)
     return s
+
+
+def _threshold(row, face):
+    """A removed face's threshold is PHP's distance of the OLD vector to its cluster; shrink it
+    by how far the vector moved so the new one stays out (triangle inequality)."""
+    t = row["threshold"] or 0
+    if t <= 0:
+        return None
+    moved = float(np.linalg.norm(np.asarray(row["face_vector"], float) - np.asarray(face["vector"], float)))
+    return max(t - moved, 1e-6)
 
 
 def requeue_faceless(db, dry_run=False, limit=None):
@@ -196,9 +228,11 @@ def requeue_faceless(db, dry_run=False, limit=None):
         if orientation not in _ORIENT:
             continue
         s["rotated"] += 1
-        s["requeued"] += 1
-        if not dry_run:
-            db.upsert_pending(fid, storage, ACTION_CREATED)
+        if dry_run:
+            s["requeued"] += 1
+        else:
+            # never overwrites a row PHP queued since the scan (e.g. a delete)
+            s["requeued"] += db.insert_pending_if_absent(fid, storage, ACTION_CREATED)
             db.set_app_value(CURSOR_KEY, path)
     else:
         if not dry_run:
@@ -211,7 +245,7 @@ def requeue_faceless(db, dry_run=False, limit=None):
 
 
 def _line(s):
-    return " ".join(f"{k}={v}" for k, v in s.items())
+    return " ".join(f"{k}={len(v) if isinstance(v, list) else v}" for k, v in s.items())
 
 
 def main() -> int:
@@ -243,6 +277,8 @@ def main() -> int:
     clf = FaceClassifier(svc.models_dir, gpu=True)
     clf.warm_up()
     s = run(svc.pipeline.db, clf.classify_with_crops, svc.crop_root, dry_run, limit)
+    for p in s["needs_review"]:
+        print(f"needs review (a new face overlaps a named or removed one, not inserted): {p}")
     print(("dry run: " if dry_run else "") + _line(s))
     return 0
 

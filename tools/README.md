@@ -48,3 +48,9 @@ detections in place so names and manual edits stay (details in its docstring). D
 
 Add `--requeue-faceless` to instead queue rotated photos that have no detection at all
 (the old code often found no face in them) for the daemon; no model needed.
+
+Re-queuing a rotated photo that already has detections does not fix it:
+`InternalController::results` keeps a file's existing faces (and their clusters) and
+inserts nothing, so the old sideways boxes stay. This tool is the way to fix those.
+Files listed as "needs review" have a new face overlapping a named or removed one that
+did not match it; nothing was inserted there, so check them by hand.

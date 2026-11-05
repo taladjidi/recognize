@@ -97,7 +97,14 @@ def make_crop(img, box, orientation=1):
 
 def open_raw(path, boxes=()):
     """(raw RGB image, EXIF orientation). With boxes, JPEGs decode at the smallest
-    DCT scale that still gives every crop >= CROP_SIZE pixels (much faster)."""
+    DCT scale that still gives every crop >= CROP_SIZE pixels (much faster).
+
+    Raw means as decoded, not yet turned: the orientation is applied once, by the caller.
+    HEIC/HEIF: the service venv has no HEIF plugin (no pillow-heif, 2026-11-05), so
+    Image.open raises and those photos get no faces. Before adding one, check whether its
+    decoder already applies irot/imir to the pixels while still reporting an orientation:
+    that would rotate twice here. (Pillow's own AVIF decoder keeps pixels raw and reports
+    irot/imir as the EXIF orientation, which is consistent.)"""
     with Image.open(path) as im:
         orientation = im.getexif().get(0x0112, 1)
         if boxes and im.format == "JPEG":
