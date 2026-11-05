@@ -211,7 +211,15 @@ class DB:
     def _execute(self, sql: str, params: tuple = ()):
         """Execute a single SQL statement and return the cursor."""
         cur = self._conn.cursor()
-        cur.execute(sql, params)
+        try:
+            cur.execute(sql, params)
+        except Exception:
+            # pgsql refuses every later statement until the aborted transaction is rolled back.
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            raise
         return cur
 
     def _commit(self):
@@ -286,6 +294,27 @@ class DB:
         phs = self._ph(len(ids))
         self._execute(f"DELETE FROM {t} WHERE id IN ({phs})", tuple(ids))
         self._commit()
+
+    def delete_pending_items(self, items: list[dict]):
+        """Delete fetched rows, but not ones re-queued since (added_at moved forward)."""
+        t = self._table("recognize_pending")
+        for it in items:
+            self._execute(
+                f"DELETE FROM {t} WHERE id = {self._ph()} AND added_at <= {self._ph()}",
+                (it["id"], it["added_at"]),
+            )
+        if items:
+            self._commit()
+
+    def existing_file_ids(self, file_ids: list[int]) -> set[int]:
+        """File ids that still have a filecache row (a trashed file keeps its fileid)."""
+        if not file_ids:
+            return set()
+        cur = self._execute(
+            f"SELECT fileid FROM {self._table('filecache')} WHERE fileid IN ({self._ph(len(file_ids))})",
+            tuple(file_ids),
+        )
+        return {r[0] for r in cur.fetchall()}
 
     def pending_count(self) -> int:
         """Count pending entries (action 0 or 1)."""
@@ -511,11 +540,18 @@ class DB:
     # ── Settings & maintenance ──────────────────────────────────────────
 
     def check_maintenance_mode(self) -> bool:
-        """Check if Nextcloud is in maintenance mode."""
-        # Maintenance mode is stored in config.php, not the DB.
-        # We check by reading the config's 'maintenance' key if present,
-        # or by trying a simple query (if DB is locked, we're in maintenance).
-        return self._config.get("maintenance", False)
+        """True when Nextcloud's config.php has 'maintenance' => true (cached ~30 s)."""
+        now = time.monotonic()
+        if now - getattr(self, "_maint_checked", -1e9) < 30:
+            return self._maint
+        path = self._config.get("config_php", "/usr/share/nextcloud/config/config.php")
+        try:
+            with open(path) as f:
+                self._maint = bool(re.search(r"""['"]maintenance['"]\s*=>\s*true""", f.read()))
+        except OSError:
+            self._maint = False
+        self._maint_checked = now
+        return self._maint
 
     # ── MIME type helpers ───────────────────────────────────────────────
 

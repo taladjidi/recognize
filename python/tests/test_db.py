@@ -79,6 +79,31 @@ class TestPending:
         assert len(remaining) == 1
         assert remaining[0]["file_id"] == 200
 
+    def test_delete_pending_items_keeps_requeued(self, db):
+        db.upsert_pending(file_id=100, storage_id=1, action=0)
+        row = db.fetch_pending(limit=10)[0]
+        db._execute("UPDATE oc_recognize_pending SET added_at = added_at + 5")
+        db._commit()
+        db.delete_pending_items([row])
+        assert len(db.fetch_pending(limit=10)) == 1
+
+    def test_execute_failure_rolls_back(self, db):
+        from unittest.mock import MagicMock
+        db._conn = MagicMock()
+        db._conn.cursor.return_value.execute.side_effect = RuntimeError("x")
+        with pytest.raises(RuntimeError):
+            db._execute("SELECT 1")
+        db._conn.rollback.assert_called_once()
+
+    def test_maintenance_read_from_config_php(self, db, tmp_path):
+        php = tmp_path / "config.php"
+        db._config["config_php"] = str(php)
+        php.write_text("<?php $CONFIG = array ('maintenance' => false,);")
+        assert db.check_maintenance_mode() is False
+        db._maint_checked = 0
+        php.write_text("<?php $CONFIG = array ('maintenance' => true,);")
+        assert db.check_maintenance_mode() is True
+
     def test_delete_empty_list(self, db):
         db.delete_pending([])  # Should not raise
 
@@ -221,10 +246,5 @@ class TestStoragePath:
 
 class TestMaintenanceMode:
     def test_not_in_maintenance(self, db):
+        db._config["config_php"] = "/nonexistent/config.php"
         assert db.check_maintenance_mode() is False
-
-    def test_in_maintenance(self, sqlite_config):
-        sqlite_config["maintenance"] = True
-        d = DB(sqlite_config)
-        assert d.check_maintenance_mode() is True
-        d.close()

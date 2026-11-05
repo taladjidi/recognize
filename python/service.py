@@ -67,7 +67,8 @@ class Service:
         )
         # Honour the admin page's per-model toggles. Previously every
         # classifier ran regardless, so the settings had no effect.
-        self.pipeline.enable_classifiers(self.pipeline.db.get_enabled_models())
+        self._refresh_enabled()
+        self._warned_unsupported = set()
 
         self._running = False
         self._poll_interval = POLL_MIN_INTERVAL
@@ -125,6 +126,15 @@ class Service:
             # a paused daemon still reports itself as running.
             self.pipeline.db.set_app_value("daemon.lastSeen", str(int(time.time())))
 
+            try:
+                self.pipeline.db.ping()  # reconnect if MySQL/Postgres dropped us
+                self._refresh_enabled()
+                self._consume_deleted()
+            except Exception as e:
+                log.error("Database unavailable: %s", e)
+                time.sleep(POLL_MAX_INTERVAL)
+                continue
+
             # Check maintenance mode
             if self.pipeline.db.check_maintenance_mode():
                 log.info("Nextcloud in maintenance mode, waiting...")
@@ -152,6 +162,28 @@ class Service:
             if self._running:
                 time.sleep(self._poll_interval)
 
+    def _refresh_enabled(self):
+        """Re-read the admin page's model toggles (cheap query) so changes apply live."""
+        models = self.pipeline.db.get_enabled_models()
+        wanted = None if models is None else set(models)
+        if wanted is None:
+            wanted = {"imagenet", "landmarks", "faces", "movinet", "musicnn"}
+        if wanted != self.pipeline._enabled:
+            self.pipeline.enable_classifiers(wanted)
+
+    def _consume_deleted(self):
+        """Consume ACTION_DELETED rows. Detections go only once the filecache row is
+        gone: trashing keeps the fileid and a restore must not lose faces or names."""
+        db = self.pipeline.db
+        rows = db.fetch_pending(limit=BATCH_SIZE, action_filter=(2,))
+        if not rows:
+            return
+        alive = db.existing_file_ids([r["file_id"] for r in rows])
+        for r in rows:
+            if r["file_id"] not in alive:
+                db.delete_face_detections(r["file_id"])
+        db.delete_pending_items(rows)
+
     def _fetch_and_resolve(self, limit):
         """Fetch pending rows and resolve to file paths.
 
@@ -171,49 +203,85 @@ class Service:
         file_ids = [r["file_id"] for r in rows]
         try:
             path_map = self.pipeline.db.resolve_file_paths(file_ids)
+            unresolved = [f for f in file_ids if f not in path_map]
+            alive = self.pipeline.db.existing_file_ids(unresolved)
         except Exception as e:
             log.error("Failed to resolve paths: %s", e)
             return None, None, None
 
         images, videos, audios = [], [], []
-        orphan_ids = []
+        orphans = []
 
+        # shortcut: unresolvable-but-existing rows (S3/SMB, empty, odd mimetype) stay
+        # pending and are refetched every loop; more than BATCH_SIZE of them would
+        # starve the queue. Upgrade: attempt counter or skip-offset.
         for r in rows:
             info = path_map.get(r["file_id"])
             if not info:
-                orphan_ids.append(r["id"])
+                if r["file_id"] not in alive:
+                    orphans.append(r)  # filecache row gone: nothing left to classify
+                elif r["file_id"] not in self._warned_unsupported:
+                    self._warned_unsupported.add(r["file_id"])
+                    log.warning("file_id=%d cannot be read from local storage; leaving it pending",
+                                r["file_id"])
                 continue
 
-            import os
-            path = info["path"]
-            mimetype = info["mimetype"]
-            if not path or not os.path.isfile(path):
-                orphan_ids.append(r["id"])
-                continue
-
-            item = {"id": r["id"], "file_id": r["file_id"],
-                    "path": path, "mimetype": mimetype}
-            media_type = self.pipeline.db.classify_mimetype(mimetype)
+            item = {"id": r["id"], "file_id": r["file_id"], "added_at": r["added_at"],
+                    "path": info["path"], "mimetype": info["mimetype"]}
+            media_type = self.pipeline.db.classify_mimetype(info["mimetype"])
             if media_type == "image":
                 images.append(item)
             elif media_type == "video":
                 videos.append(item)
             elif media_type == "audio":
                 audios.append(item)
-            else:
-                orphan_ids.append(r["id"])
 
-        if orphan_ids:
-            log.info("Removing %d orphaned pending entries", len(orphan_ids))
-            self.pipeline.db.delete_pending(orphan_ids)
+        if orphans:
+            log.info("Removing %d orphaned pending entries", len(orphans))
+            self.pipeline.db.delete_pending_items(orphans)
 
         return images, videos, audios
+
+    @staticmethod
+    def _good(items, *result_sets):
+        """Merge per-pass results for items; None for a file any pass failed or never reached."""
+        merged = {}
+        for item in items:
+            fid = item["file_id"]
+            parts = [rs.get(fid) for rs in result_sets]
+            if any(p is None or "error" in p for p in parts):
+                merged[fid] = None
+            else:
+                merged[fid] = {k: v for p in parts for k, v in p.items()}
+        return merged
+
+    def _submit_items(self, items, results):
+        """Submit results[file_id] (None = failed) and drop the pending rows that are finished.
+
+        shortcut: a file that failed classification loses its pending row without being
+        tagged, so the daily CatchUpJob retries it; a poison file is retried daily forever.
+        Upgrade: attempt counter. A failed submit keeps the row. Returns False when the
+        API rejected our credentials (stop the pass).
+        """
+        done = []
+        for item in items:
+            res = results.get(item["file_id"])
+            if res is None or self.pipeline._submit_result(item["file_id"], res):
+                done.append(item)
+            elif self.pipeline.api_blocked:
+                break
+        self.pipeline.db.delete_pending_items(done)
+        return not self.pipeline.api_blocked
 
     def _run_classifier_passes(self):
         """Run each classifier group as a separate pass over pending files.
 
+        A file is submitted (= tagged processed) only if every applicable
+        classifier produced a real result for it.
+
         Returns True if any work was done.
         """
+        self.pipeline.api_blocked = False
         images, videos, audios = self._fetch_and_resolve(limit=BATCH_SIZE)
         if images is None:
             time.sleep(POLL_MAX_INTERVAL)
@@ -222,64 +290,40 @@ class Service:
         if not images and not videos and not audios:
             return False
 
-        had_work = False
+        enabled = self.pipeline._enabled
         pending_count = self.pipeline.db.pending_count()
 
-        # === Pass 1: Faces (subprocess — gets full VRAM) ===
-        if images and "faces" in self.pipeline._enabled:
-            face_results = self.pipeline.process_images_faces(images)
-            for item in images:
-                fid = item["file_id"]
-                result = face_results.get(fid, {})
-                if result.get("faces"):
-                    self.pipeline._submit_result(fid, {"tags": [], "faces": result["faces"]})
-            had_work = True
-
-        # === Pass 2: Tags (subprocess — imagenet + landmarks coexist) ===
-        if images and ("imagenet" in self.pipeline._enabled or
-                       "landmarks" in self.pipeline._enabled):
-            tag_results = self.pipeline.process_images_tags(images)
-            processed_ids = []
-            for item in images:
-                fid = item["file_id"]
-                result = tag_results.get(fid, {})
-                # Submit even with no labels: the result marks the file as
-                # processed, or CatchUpJob would re-queue it every day.
-                self.pipeline._submit_result(fid, {"tags": result.get("tags", []), "faces": []})
-                processed_ids.append(item["id"])
-
-            if processed_ids:
-                self.pipeline.db.delete_pending(processed_ids)
+        # Images: faces pass, then tags pass (each in its own subprocess), then ONE
+        # combined result per image.
+        if images:
+            do_faces = "faces" in enabled
+            do_tags = "imagenet" in enabled or "landmarks" in enabled
+            face_res = self.pipeline.process_images_faces(images) if do_faces else {}
+            tag_res = self.pipeline.process_images_tags(images) if do_tags else {}
+            sets = ([face_res] if do_faces else []) + ([tag_res] if do_tags else [])
+            results = self._good(images, *sets) if sets else {}
+            for fid, r in results.items():
+                if r is not None:
+                    r.setdefault("tags", [])
+                    r.setdefault("faces", [])
+            if not self._submit_items(images, results):
+                return self._back_off()
             log.info("Processed %d images (%d pending)", len(images), pending_count)
-            had_work = True
 
-        # === Pass 3: Video (subprocess) ===
-        if videos:
-            vid_results = self.pipeline.process_videos(videos)
-            processed_ids = []
-            for item in videos:
-                fid = item["file_id"]
-                self.pipeline._submit_result(fid, vid_results.get(fid, {}))
-                processed_ids.append(item["id"])
-            if processed_ids:
-                self.pipeline.db.delete_pending(processed_ids)
-            log.info("Processed %d videos", len(videos))
-            had_work = True
+        # Video / audio: a type whose classifier is disabled yields {} -> not submitted.
+        for items, run, label in ((videos, self.pipeline.process_videos, "videos"),
+                                  (audios, self.pipeline.process_audio, "audio files")):
+            if not items:
+                continue
+            if not self._submit_items(items, self._good(items, run(items))):
+                return self._back_off()
+            log.info("Processed %d %s", len(items), label)
 
-        # === Pass 4: Audio (subprocess) ===
-        if audios:
-            aud_results = self.pipeline.process_audio(audios)
-            processed_ids = []
-            for item in audios:
-                fid = item["file_id"]
-                self.pipeline._submit_result(fid, aud_results.get(fid, {}))
-                processed_ids.append(item["id"])
-            if processed_ids:
-                self.pipeline.db.delete_pending(processed_ids)
-            log.info("Processed %d audio files", len(audios))
-            had_work = True
+        return True
 
-        return had_work
+    def _back_off(self):
+        time.sleep(POLL_MAX_INTERVAL)
+        return False
 
     def _run_clustering(self):
         """Run face clustering for all users with recent changes."""
@@ -354,6 +398,12 @@ def main():
         gpu=not args.no_gpu,
         ffmpeg_binary=args.ffmpeg,
     )
+
+    if service.pipeline.nc_api is None:
+        log.error("nextcloud_url / internal_secret missing in %s: results cannot be "
+                  "submitted, refusing to start", args.config)
+        service.stop()
+        sys.exit(2)
 
     if args.profile:
         import cProfile

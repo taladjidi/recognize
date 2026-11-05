@@ -51,7 +51,7 @@ def _worker_faces(models_dir, gpu, file_items_json, result_pipe):
                 results[item["file_id"]] = {"faces": faces}
             except Exception as e:
                 log.warning("Face detection error for %s: %s", item["path"], e)
-                results[item["file_id"]] = {"faces": []}
+                results[item["file_id"]] = {"error": str(e)}
 
         result_pipe.send(results)
     except Exception as e:
@@ -80,6 +80,7 @@ def _worker_tags(models_dir, gpu, file_items_json, result_pipe):
                 preprocessed.append((item["file_id"], arr))
             except Exception as e:
                 log.warning("ImageNet preprocess error for %s: %s", item["path"], e)
+                results[item["file_id"]] = {"error": str(e)}
 
         for start in range(0, len(preprocessed), IMG_BS):
             chunk = preprocessed[start:start + IMG_BS]
@@ -93,11 +94,14 @@ def _worker_tags(models_dir, gpu, file_items_json, result_pipe):
         clf2.warm_up()
         preprocessed = []
         for item in file_items:
+            if "error" in results[item["file_id"]]:
+                continue
             try:
                 arr = clf2.preprocess(item["path"])
                 preprocessed.append((item["file_id"], arr))
             except Exception as e:
                 log.warning("Landmark preprocess error for %s: %s", item["path"], e)
+                results[item["file_id"]] = {"error": str(e)}
 
         for start in range(0, len(preprocessed), LM_BS):
             chunk = preprocessed[start:start + LM_BS]
@@ -128,7 +132,7 @@ def _worker_video(models_dir, gpu, ffmpeg_binary, file_items_json, result_pipe):
                 results[item["file_id"]] = {"tags": labels}
             except Exception as e:
                 log.warning("MoViNet error for %s: %s", item["path"], e)
-                results[item["file_id"]] = {"tags": []}
+                results[item["file_id"]] = {"error": str(e)}
 
         result_pipe.send(results)
     except Exception as e:
@@ -152,7 +156,7 @@ def _worker_audio(models_dir, gpu, ffmpeg_binary, file_items_json, result_pipe):
                 results[item["file_id"]] = {"tags": labels}
             except Exception as e:
                 log.warning("Audio error for %s: %s", item["path"], e)
-                results[item["file_id"]] = {"tags": []}
+                results[item["file_id"]] = {"error": str(e)}
 
         result_pipe.send(results)
     except Exception as e:
@@ -182,6 +186,8 @@ class Pipeline:
         self.ffmpeg_binary = ffmpeg_binary
         self.nc_api = nc_api
         self._enabled = set()
+        self.api_blocked = False      # set on 401/403/404: config error, stop submitting
+        self._api_error_logged = False
 
     def enable_classifiers(self, names=None):
         if names is None:
@@ -202,7 +208,9 @@ class Pipeline:
             timeout: Max seconds to wait for the worker.
 
         Returns:
-            Results dict from the worker, or empty dict on failure.
+            Results dict {file_id: {"tags"|"faces": ...} | {"error": str}}.
+            Files the worker never reached are absent (all of them after a
+            crash or timeout); callers must treat absent and error as failed.
         """
         parent_conn, child_conn = mp.Pipe(duplex=False)
         proc = mp.Process(target=target, args=(*args, child_conn), daemon=True)
@@ -290,22 +298,34 @@ class Pipeline:
         return results
 
     def _submit_result(self, file_id, result):
-        """Submit classification results for a file."""
-        tags = result.get("tags", [])
-        faces = result.get("faces", [])
+        """Submit results for a file; True only if Nextcloud accepted them.
 
-        if self.nc_api:
-            try:
-                self.nc_api.submit_results(
-                    file_id=file_id,
-                    tags=tags if tags else None,
-                    faces=faces if faces else None,
-                )
-            except Exception as e:
+        Accepted means the file is now tagged "processed". Sets api_blocked on
+        401/403/404 (wrong secret or URL), so the caller stops and keeps rows.
+        """
+        if not self.nc_api:
+            self.api_blocked = True
+            log.error("No Nextcloud API configured; cannot submit file_id=%d", file_id)
+            return False
+        try:
+            ok = self.nc_api.submit_results(
+                file_id=file_id,
+                tags=result.get("tags") or None,
+                faces=result.get("faces") or None,
+            )
+        except Exception as e:
+            if getattr(e, "status_code", 0) in (401, 403, 404):
+                self.api_blocked = True
+                if not self._api_error_logged:
+                    log.error("Nextcloud rejected results (%s): check nextcloud_url and "
+                              "internal_secret in nc_config.json; keeping pending rows", e)
+                    self._api_error_logged = True
+            else:
                 log.error("Failed to submit results for file_id=%d: %s", file_id, e)
-        else:
-            log.debug("Results for file_id=%d: tags=%s, faces=%d",
-                       file_id, tags, len(faces))
+            return False
+        if ok:
+            self._api_error_logged = False
+        return bool(ok)
 
     def close(self):
         """Clean up resources."""

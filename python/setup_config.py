@@ -338,6 +338,7 @@ def main():
         "datadirectory": nc_php_config["datadirectory"],
         "nextcloud_url": nc_php_config.get("overwrite.cli.url", f"http://localhost/nextcloud"),
         "internal_secret": secret,
+        "config_php": os.path.join(nc_root, "config", "config.php"),
     }
 
     # 4. Write nc_config.json (0640 — readable by service user, not world)
