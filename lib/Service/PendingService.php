@@ -47,8 +47,9 @@ class PendingService {
 		$platform = $this->db->getDatabasePlatform();
 		$isMySQL = $platform instanceof \Doctrine\DBAL\Platforms\AbstractMySQLPlatform;
 
-		$prefix = \OC::$server->getConfig()->getSystemValueString('dbtableprefix', 'oc_');
-		$table = $prefix . 'recognize_pending';
+		// The connection substitutes *PREFIX*. (The Server getConfig getter this
+		// used was removed in Nextcloud 34 and made every upload throw here.)
+		$table = '*PREFIX*recognize_pending';
 
 		if ($isMySQL) {
 			$sql = "INSERT INTO `{$table}` (`file_id`, `storage_id`, `action`, `added_at`) "

@@ -20,6 +20,7 @@ use OCP\AppFramework\Http\StreamResponse;
 use OCP\AppFramework\Services\IAppConfig;
 use OCP\Files\IRootFolder;
 use OCP\Files\NotFoundException;
+use OCP\IDBConnection;
 use OCP\IRequest;
 use Psr\Log\LoggerInterface;
 
@@ -41,6 +42,7 @@ final class InternalController extends Controller {
 		private IRootFolder $rootFolder,
 		private IAppConfig $appConfig,
 		private LoggerInterface $logger,
+		private IDBConnection $db,
 	) {
 		parent::__construct($appName, $request);
 	}
@@ -166,7 +168,7 @@ final class InternalController extends Controller {
 	private function writeFaces(int $fileId, array $faces): void {
 		// Resolve file owner from storage ID (works without user session)
 		$userId = '';
-		$qb = \OC::$server->getDatabaseConnection()->getQueryBuilder();
+		$qb = $this->db->getQueryBuilder();
 		$result = $qb->select('s.id')
 			->from('filecache', 'f')
 			->innerJoin('f', 'storages', 's', $qb->expr()->eq('f.storage', 's.numeric_id'))
@@ -176,6 +178,15 @@ final class InternalController extends Controller {
 		$result->closeCursor();
 		if ($storageId && str_starts_with($storageId, 'home::')) {
 			$userId = substr($storageId, 6);
+		}
+
+		// A rename or move re-queues the file; keep the faces it already has
+		// (and their cluster assignments) instead of inserting a second set.
+		// insert()'s own de-duplication binds the float coordinates as ints,
+		// so it only ever matches faces at exactly x = 0.
+		// shortcut: content replaced in place keeps its old faces; NodeWrittenEvent is not listened to anyway.
+		if ($this->faceDetectionMapper->findByFileIdAndUser($fileId, $userId) !== []) {
+			return;
 		}
 
 		foreach ($faces as $face) {
