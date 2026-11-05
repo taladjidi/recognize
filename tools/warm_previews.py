@@ -81,8 +81,9 @@ def main() -> int:
                 print(f"  {done}/{len(urls)}  cold={cold} failed={len(failed)}  {rate:.1f}/s  "
                       f"p50={b.pct(lat, 50):.0f} ms p95={b.pct(lat, 95):.0f} ms  eta {eta / 60:.0f} min", flush=True)
     print(f"done: {done} previews, {cold} generated now (>{a.cold_ms:.0f} ms), {len(failed)} failed")
-    for (fid, size), status in failed[:20]:
-        print(f"  failed: fileid {fid} size {size} HTTP {status} ({files[fid]['path']})")
+    for (fid, size), status in failed:
+        f = files[fid]
+        print(f"  failed: fileid {fid} size {size} HTTP {status} {f.get('size', 0) / 1048576:.1f} MB ({f['path']})")
     return 0 if not failed else 1
 
 
