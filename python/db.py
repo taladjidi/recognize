@@ -384,8 +384,17 @@ class DB:
                     "path": abs_path,
                     "mimetype": row["mimetype"],
                     "storage": row["storage"],
+                    "owner": self.owner_from_storage_id(row["storage_id_str"]),
                 }
         return result
+
+    @staticmethod
+    def owner_from_storage_id(storage_id_str: str | None) -> str:
+        """Same rule as InternalController::ownerFromStorageId (the user_id PHP stores)."""
+        for prefix in ("home::", "object::user:"):
+            if storage_id_str and storage_id_str.startswith(prefix):
+                return storage_id_str[len(prefix):]
+        return ""
 
     @staticmethod
     def _resolve_storage_path(
@@ -549,6 +558,29 @@ class DB:
                 (cluster_id if cluster_id >= 0 else None, det_id),
             )
         self._commit()
+
+    def detections_after(self, after_id: int, limit: int) -> list[dict]:
+        """Detections with an owner and id > after_id, by id (crop backfill cursor)."""
+        t = self._table("recognize_face_detections")
+        cur = self._execute(
+            f"SELECT id, file_id, user_id, x, y, width, height FROM {t} "
+            f"WHERE id > {self._ph()} AND user_id <> '' ORDER BY id LIMIT {self._ph()}",
+            (after_id, limit),
+        )
+        return self._fetchall_dicts(cur)
+
+    def existing_detection_ids(self, user_id: str, ids: list[int]) -> set[int]:
+        """The subset of ids that are detections of user_id."""
+        t = self._table("recognize_face_detections")
+        found = set()
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            cur = self._execute(
+                f"SELECT id FROM {t} WHERE user_id = {self._ph()} AND id IN ({self._ph(len(chunk))})",
+                (user_id, *chunk),
+            )
+            found.update(r[0] for r in cur.fetchall())
+        return found
 
     def get_users_with_faces(self) -> list[str]:
         """Get distinct user IDs that have face detections."""

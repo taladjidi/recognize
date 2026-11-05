@@ -219,29 +219,37 @@ check('invalid face -> nothing written, no processed tag', $mapper->called('inse
 
 $n = 0;
 [$c, $mapper, $db, $objects] = controller(['file_id' => 42, 'tags' => ['Cat'], 'faces' => [$face(), $face(['x' => 0.5])]],
-	['insert' => function () use (&$n) {
+	['insert' => function ($d) use (&$n) {
 		if (++$n === 2) {
 			throw new \OCP\DB\Exception('disk full');
 		}
+		return $d;
 	}]);
 $r = $c->results();
 check('insert fails mid-way -> 500 on the second insert', $r->getStatus() === 500 && $n === 2 && str_contains($r->getData()['error'], 'disk full'));
 check('insert fails mid-way -> rolled back, not committed', count($db->called('rollBack')) === 1 && $db->called('commit') === []);
 check('insert fails mid-way -> file not tagged processed (will be retried)', $objects->called('assignTags') === []);
 
-[$c, $mapper, $db, $objects] = controller(['file_id' => 42, 'tags' => ['Cat'], 'faces' => [$face(), $face(['x' => 0.5])]]);
+$nextId = 100;
+[$c, $mapper, $db, $objects] = controller(['file_id' => 42, 'tags' => ['Cat'], 'faces' => [$face(), $face(['x' => 0.5])]],
+	['insert' => function (FaceDetection $d) use (&$nextId) {
+		$d->setId($nextId++);
+		return $d;
+	}]);
 $r = $c->results();
 $order = array_values(array_filter(Log::$order, fn ($s) => preg_match('/beginTransaction|::insert$|commit|::assignTags/', $s)));
 check('success -> 200 ' . json_encode($r->getData()), $r->getStatus() === 200);
 check('success -> begin, insert x2, commit, then tags', array_map(fn ($s) => preg_replace('/^.*::/', '', $s), $order) === ['beginTransaction', 'insert', 'insert', 'commit', 'assignTags']);
 $ins = $mapper->called('insert');
 check('success -> owner and coordinates stored', $ins[0][1][0]->getUserId() === 'alice' && $ins[1][1][0]->getX() === 0.5 && count($ins[0][1][0]->getVector()) === 512);
+check('success -> detection ids returned in input order', $r->getData() === ['status' => 'ok', 'detection_ids' => [100, 101]]);
 check('success -> processed tag assigned with label', in_array('7', $objects->called('assignTags')[0][1][2], true));
 
 [$c, $mapper, $db, $objects] = controller(['file_id' => 42, 'tags' => [], 'faces' => [$face()]],
 	['findByFileIdAndUser' => fn () => [new FaceDetection()]]);
 $r = $c->results();
 check('existing faces kept -> no insert, still tagged', $r->getStatus() === 200 && $mapper->called('insert') === [] && count($objects->called('assignTags')) === 1);
+check('existing faces kept -> detection_ids is []', $r->getData()['detection_ids'] === []);
 
 [$c, , , , $appConfig] = controller(['file_id' => 42], [], false);
 $c->results();

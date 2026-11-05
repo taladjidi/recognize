@@ -31,6 +31,12 @@ MAX_PASS_FILES = 5000        # Max files per single classifier pass
 # Clustering interval
 CLUSTER_INTERVAL = 300       # Re-cluster every 5 minutes
 
+# Face crops: idle-time backfill + orphan cleanup
+CROP_BATCH = 200             # detections examined per idle tick
+CROP_TICK_SECONDS = 2.0      # wall-clock budget per idle tick, so new work waits at most this
+CROP_RESCAN_INTERVAL = 3600  # after a full backfill pass and cleanup round, rest this long
+CROP_LOG_EVERY = 500         # INFO line every N crops created by the backfill
+
 
 class Service:
     """Main service daemon."""
@@ -74,6 +80,15 @@ class Service:
         self._poll_interval = POLL_MIN_INTERVAL
         self._last_cluster_time = 0.0
         self._cluster_state = {}  # user_id -> unclustered signature of last run
+
+        from crops import DEFAULT_CROP_ROOT
+        self.crop_root = self.config.get("face_crop_root") or DEFAULT_CROP_ROOT
+        self._crop_cursor = 0          # backfill: last detection id examined
+        self._crop_created = 0         # backfill: crops created this pass
+        self._crop_users = []          # cleanup: user dirs left in this round
+        self._crop_done = {"backfill": False, "cleanup": False}
+        self._crop_rest_until = 0.0
+        self._crop_root_warned = False
 
     def start(self):
         """Start the service main loop."""
@@ -148,6 +163,7 @@ class Service:
                     self._poll_interval * POLL_BACKOFF_FACTOR,
                     POLL_MAX_INTERVAL,
                 )
+                self._crop_maintenance()
             else:
                 self._poll_interval = POLL_MIN_INTERVAL
 
@@ -278,8 +294,12 @@ class Service:
         done, stopped = [], None
         for i, item in enumerate(items):
             res = results.get(item["file_id"])
-            if res is None or self.pipeline._submit_result(item["file_id"], res):
+            if res is None:
                 done.append(item)
+            elif self.pipeline._submit_result(item["file_id"], res):
+                done.append(item)
+                if res.get("crops"):
+                    self._write_crops(item, res["crops"], self.pipeline.detection_ids)
             elif self.pipeline.submit_failure == "permanent":
                 done.append(item)
             else:
@@ -337,6 +357,101 @@ class Service:
             log.info("Processed %d %s", len(items), label)
 
         return True
+
+    def _write_crops(self, item, crops, detection_ids):
+        """Write the crops of a just-submitted image (PHP returned their detection ids)."""
+        from crops import write_crop
+        owner = item.get("owner", "")
+        if not owner or len(detection_ids) != len(crops):
+            return  # no owner, or PHP kept the old detections ([]): the backfill covers it
+        for det_id, data in zip(detection_ids, crops):
+            if data:
+                write_crop(self.crop_root, owner, det_id, data)
+
+    def _crop_maintenance(self):
+        """Idle tick: a bounded slice of crop backfill, then one user dir of orphan cleanup.
+
+        Never raises: crops are derived data and must not stop classification.
+        """
+        now = time.monotonic()
+        if now < self._crop_rest_until or "faces" not in self.pipeline._enabled:
+            return
+        if not os.path.isdir(self.crop_root):
+            if not self._crop_root_warned:
+                log.warning("Face crop root %s missing (run deploy.sh); no face crops", self.crop_root)
+                self._crop_root_warned = True
+            return
+        try:
+            deadline = now + CROP_TICK_SECONDS
+            if not self._crop_done["backfill"]:
+                self._crop_done["backfill"] = self._backfill_crops(deadline)
+            if not self._crop_done["cleanup"] and time.monotonic() < deadline:
+                self._crop_done["cleanup"] = self._cleanup_crops_one_user()
+            if all(self._crop_done.values()):
+                self._crop_done = {"backfill": False, "cleanup": False}
+                self._crop_rest_until = time.monotonic() + CROP_RESCAN_INTERVAL
+        except Exception as e:
+            log.error("Face crop maintenance failed: %s", e)
+
+    def _backfill_crops(self, deadline):
+        """Create missing crops for up to CROP_BATCH detections; True when a full pass ended."""
+        from crops import has_crop, make_crop, open_raw, write_crop
+        db = self.pipeline.db
+        rows = db.detections_after(self._crop_cursor, CROP_BATCH)
+        if not rows:
+            if self._crop_created:
+                log.info("Face crop backfill pass done: %d created", self._crop_created)
+            self._crop_cursor, self._crop_created = 0, 0
+            return True
+        by_file = {}
+        for r in rows:
+            by_file.setdefault(r["file_id"], []).append(r)
+        missing = {fid: [r for r in rs if not has_crop(self.crop_root, r["user_id"], r["id"])]
+                   for fid, rs in by_file.items()}
+        missing = {fid: rs for fid, rs in missing.items() if rs}
+        paths = db.resolve_file_paths(list(missing)) if missing else {}
+        for fid, rs in by_file.items():
+            if time.monotonic() >= deadline:
+                return False  # cursor stays before this file: resumed next tick
+            info = paths.get(fid)
+            if fid in missing and info:
+                try:
+                    img, orientation = open_raw(info["path"], rs)
+                    for r in missing[fid]:
+                        if write_crop(self.crop_root, r["user_id"], r["id"], make_crop(img, r, orientation)):
+                            self._crop_created += 1
+                            if self._crop_created % CROP_LOG_EVERY == 0:
+                                log.info("Face crop backfill: %d created (at detection %d)",
+                                         self._crop_created, r["id"])
+                except Exception as e:
+                    log.warning("Face crop backfill failed for file %d: %s", fid, e)
+            self._crop_cursor = max(r["id"] for r in rs)
+        return False
+
+    def _cleanup_crops_one_user(self):
+        """Delete orphan crops in one user dir; True when every user dir was visited this round."""
+        from crops import crop_ids, safe_user_dir
+        if not self._crop_users:
+            with os.scandir(self.crop_root) as it:
+                self._crop_users = sorted(e.name for e in it if e.is_dir(follow_symlinks=False))
+            if not self._crop_users:
+                return True
+        user = self._crop_users.pop()
+        user_dir = safe_user_dir(self.crop_root, user)
+        if user_dir is not None:
+            files = crop_ids(user_dir)
+            alive = self.pipeline.db.existing_detection_ids(user, sorted(files)) if files else set()
+            removed = 0
+            for det_id, name in files.items():
+                if det_id not in alive:
+                    try:
+                        os.unlink(os.path.join(user_dir, name))
+                        removed += 1
+                    except FileNotFoundError:
+                        pass
+            if removed:
+                log.info("Face crops: removed %d orphans for %s", removed, user)
+        return not self._crop_users
 
     def _back_off(self):
         time.sleep(POLL_MAX_INTERVAL)

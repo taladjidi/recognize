@@ -50,7 +50,7 @@ class NextcloudAPI:
         file_id: int,
         tags: list[str] | None = None,
         faces: list[dict] | None = None,
-    ) -> bool:
+    ) -> list[int] | None:
         """Submit classification results for a file.
 
         Tags are written via PHP's ISystemTagManager (fires events, updates etags).
@@ -62,7 +62,8 @@ class NextcloudAPI:
             faces: List of face dicts with keys: x, y, width, height, vector.
 
         Returns:
-            True on success.
+            On success the inserted detection ids, in the order of faces ([] when
+            PHP kept the file's existing detections); None when not accepted.
 
         Raises:
             NextcloudAPIError: On HTTP error or invalid response.
@@ -75,7 +76,10 @@ class NextcloudAPI:
             payload["faces"] = faces
 
         response = self._request("POST", url, json=payload)
-        return response.get("status") == "ok"
+        if response.get("status") != "ok":
+            return None
+        ids = response.get("detection_ids") or []
+        return [i for i in ids if type(i) is int]
 
     def get_file(self, file_id: int) -> tuple[bytes, str]:
         """Download a file via the PHP storage abstraction.

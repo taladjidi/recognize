@@ -212,6 +212,24 @@ class FaceClassifier:
         img_bgr = self.preprocess(img_path)
         return self.infer_one(img_bgr)
 
+    def classify_with_crops(self, img_path):
+        """(faces, crops): crops[i] is the JPEG of faces[i], or None if it failed.
+
+        Same pixels as classify() (raw, not EXIF-rotated), so the stored boxes stay
+        in raw coordinates; only the crop is turned upright.
+        """
+        from crops import make_crop, open_raw
+        img, orientation = open_raw(img_path)
+        faces = self.infer_one(np.array(img)[:, :, ::-1])
+        crops = []
+        for face in faces:
+            try:
+                crops.append(make_crop(img, face, orientation))
+            except Exception as e:
+                log.warning("Face crop failed for %s: %s", img_path, e)
+                crops.append(None)
+        return faces, crops
+
     def warm_up(self):
         """Run a dummy inference to warm up the session."""
         dummy = np.zeros((640, 640, 3), dtype=np.uint8)

@@ -47,8 +47,9 @@ def _worker_faces(models_dir, gpu, file_items_json, result_pipe):
         results = {}
         for item in json.loads(file_items_json):
             try:
-                faces = clf.classify(item["path"])
-                results[item["file_id"]] = {"faces": faces}
+                faces, crops = clf.classify_with_crops(item["path"])
+                # crops stay in the daemon (written once PHP returns the detection ids)
+                results[item["file_id"]] = {"faces": faces, "crops": crops}
             except Exception as e:
                 log.warning("Face detection error for %s: %s", item["path"], e)
                 results[item["file_id"]] = {"error": str(e)}
@@ -189,6 +190,7 @@ class Pipeline:
         # Why the last _submit_result failed: "blocked" (401/403/404: wrong secret/URL),
         # "permanent" (other 4xx: this payload will never be accepted) or "transient".
         self.submit_failure = None
+        self.detection_ids = []  # of the last accepted _submit_result, in face order
         self._api_error_logged = False
 
     def enable_classifiers(self, names=None):
@@ -306,12 +308,13 @@ class Pipeline:
         submit_failure says whether to stop, defer or drop the row.
         """
         self.submit_failure = None
+        self.detection_ids = []
         if not self.nc_api:
             self.submit_failure = "blocked"
             log.error("No Nextcloud API configured; cannot submit file_id=%d", file_id)
             return False
         try:
-            ok = self.nc_api.submit_results(
+            ids = self.nc_api.submit_results(
                 file_id=file_id,
                 tags=result.get("tags") or None,
                 faces=result.get("faces") or None,
@@ -332,11 +335,12 @@ class Pipeline:
                 self.submit_failure = "transient"
                 log.error("Failed to submit results for file_id=%d: %s", file_id, e)
             return False
-        if ok:
-            self._api_error_logged = False
-        if not ok:
+        if ids is None:
             self.submit_failure = "transient"
-        return bool(ok)
+            return False
+        self._api_error_logged = False
+        self.detection_ids = ids
+        return True
 
     def close(self):
         """Clean up resources."""

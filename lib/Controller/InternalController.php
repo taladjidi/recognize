@@ -73,9 +73,10 @@ final class InternalController extends Controller {
 
 		// Faces first, tags last: assignTags() adds the processed tag, and a
 		// processed file is never retried, so its faces must be stored first.
+		$detectionIds = [];
 		if (count($faces) > 0) {
 			try {
-				$this->writeFaces($fileId, $faces);
+				$detectionIds = $this->writeFaces($fileId, $faces);
 			} catch (\Throwable $e) {
 				$this->logger->error('Failed to write faces for file ' . $fileId, ['exception' => $e]);
 				return new JSONResponse(
@@ -101,7 +102,8 @@ final class InternalController extends Controller {
 			);
 		}
 
-		return new JSONResponse(['status' => 'ok']);
+		// The daemon names each face crop after its detection id; [] when existing detections were kept.
+		return new JSONResponse(['status' => 'ok', 'detection_ids' => $detectionIds]);
 	}
 
 	/**
@@ -191,12 +193,14 @@ final class InternalController extends Controller {
 		return '';
 	}
 
-	private function writeFaces(int $fileId, array $faces): void {
+	/** @return list<int> the detection ids in input order */
+	private function writeFaces(int $fileId, array $faces): array {
 		// All or nothing: a partial set would be kept forever by the early return below.
 		$this->db->beginTransaction();
 		try {
-			$this->insertFaces($fileId, $faces);
+			$ids = $this->insertFaces($fileId, $faces);
 			$this->db->commit();
+			return $ids;
 		} catch (\Throwable $e) {
 			$this->db->rollBack();
 			throw $e;
@@ -216,7 +220,8 @@ final class InternalController extends Controller {
 		return self::ownerFromStorageId(is_string($storageId) ? $storageId : '');
 	}
 
-	private function insertFaces(int $fileId, array $faces): void {
+	/** @return list<int> */
+	private function insertFaces(int $fileId, array $faces): array {
 		$userId = $this->ownerOfFile($fileId);
 
 		// A rename or move re-queues the file; keep the faces it already has
@@ -225,8 +230,10 @@ final class InternalController extends Controller {
 		// so it only ever matches faces at exactly x = 0.
 		// shortcut: content replaced in place keeps its old faces; NodeWrittenEvent is not listened to anyway.
 		if ($this->faceDetectionMapper->findByFileIdAndUser($fileId, $userId) !== []) {
-			return;
+			return [];
 		}
+
+		$ids = [];
 
 		foreach ($faces as $face) {
 			$detection = new FaceDetection();
@@ -237,7 +244,8 @@ final class InternalController extends Controller {
 			$detection->setWidth((float)$face['width']);
 			$detection->setHeight((float)$face['height']);
 			$detection->setVector(array_map('floatval', $face['vector']));
-			$this->faceDetectionMapper->insert($detection);
+			$ids[] = (int)$this->faceDetectionMapper->insert($detection)->getId();
 		}
+		return $ids;
 	}
 }

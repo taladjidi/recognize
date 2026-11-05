@@ -339,6 +339,8 @@ def main():
         "nextcloud_url": nc_php_config.get("overwrite.cli.url", f"http://localhost/nextcloud"),
         "internal_secret": secret,
         "config_php": os.path.join(nc_root, "config", "config.php"),
+        # Face crops (<root>/<uid>/<detection id>.jpg); deploy.sh creates it, apache-owned 0750.
+        "face_crop_root": "/var/lib/nextcloud/recognize-faces",
     }
 
     # 4. Write nc_config.json (0640 — readable by service user, not world)

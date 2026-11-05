@@ -33,7 +33,7 @@ class TestSubmitResults:
         with patch.object(api._session, "request", return_value=mock_resp) as mock_req:
             result = api.submit_results(file_id=42, tags=["Cat", "Animal"])
 
-        assert result is True
+        assert result == []
         call_args = mock_req.call_args
         assert call_args[0] == ("POST", "http://localhost:8080/apps/recognize/api/internal/results")
         body = call_args[1]["json"]
@@ -49,7 +49,21 @@ class TestSubmitResults:
         with patch.object(api._session, "request", return_value=mock_resp):
             result = api.submit_results(file_id=42, faces=faces)
 
-        assert result is True
+        assert result == []
+
+    def test_submit_returns_detection_ids(self, api):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"status": "ok", "detection_ids": [7, 9]}
+        with patch.object(api._session, "request", return_value=mock_resp):
+            assert api.submit_results(file_id=42, faces=[{"x": 0}]) == [7, 9]
+
+    def test_submit_not_ok_returns_none(self, api):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"status": "nope"}
+        with patch.object(api._session, "request", return_value=mock_resp):
+            assert api.submit_results(file_id=42) is None
 
     def test_submit_empty(self, api):
         """Submitting with no tags or faces should still work (marks as processed)."""
@@ -60,7 +74,7 @@ class TestSubmitResults:
         with patch.object(api._session, "request", return_value=mock_resp):
             result = api.submit_results(file_id=42)
 
-        assert result is True
+        assert result == []
 
     def test_server_error_retries(self, api):
         error_resp = MagicMock()
@@ -75,7 +89,7 @@ class TestSubmitResults:
             with patch("nc_api.time.sleep"):  # Don't actually sleep
                 result = api.submit_results(file_id=42, tags=["Cat"])
 
-        assert result is True
+        assert result == []
         assert mock.call_count == 2
 
     def test_server_error_exhausts_retries(self, api):
@@ -109,7 +123,7 @@ class TestSubmitResults:
             with patch("nc_api.time.sleep"):
                 result = api.submit_results(file_id=42, tags=["Cat"])
 
-        assert result is True
+        assert result == []
 
 
 class TestGetFile:
