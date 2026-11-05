@@ -18,6 +18,9 @@
 $nc = $argv[1] ?? '/usr/share/nextcloud';
 require "$nc/3rdparty/autoload.php";
 require "$nc/lib/composer/autoload.php";
+require "$nc/apps/dav/composer/autoload.php";
+// The real FaceDetectionMapper cannot coexist with its stub; its SQL checks run in a child process.
+$realMapper = getenv('CHECK_REAL_MAPPER') === '1';
 
 // Recording stubs for final classes; must exist before the app autoloader runs.
 class Stub {
@@ -26,7 +29,10 @@ class Stub {
 	public function __call(string $name, array $args): mixed {
 		$this->calls[] = [$name, $args];
 		Log::$order[] = static::class . '::' . $name;
-		return isset($this->on[$name]) ? ($this->on[$name])(...$args) : null;
+		if (isset($this->on[$name])) {
+			return ($this->on[$name])(...$args);
+		}
+		return isset($this->on['*']) ? ($this->on['*'])($name, $args) : null;
 	}
 	public function called(string $name): array {
 		return array_values(array_filter($this->calls, fn ($c) => $c[0] === $name));
@@ -35,8 +41,10 @@ class Stub {
 class Log {
 	public static array $order = [];
 }
-eval('namespace OCA\Recognize\Db; class FaceDetectionMapper extends \Stub {} class FaceClusterMapper extends \Stub {}');
-eval('namespace OCA\Recognize\Service; class Logger extends \Stub {} class StorageService extends \Stub {} class PendingService extends \Stub { public const ACTION_CREATED = 0; }');
+if (!$realMapper) {
+	eval('namespace OCA\Recognize\Db; class FaceDetectionMapper extends \Stub {} class FaceClusterMapper extends \Stub {}');
+	eval('namespace OCA\Recognize\Service; class Logger extends \Stub {} class StorageService extends \Stub {} class PendingService extends \Stub { public const ACTION_CREATED = 0; }');
+}
 
 spl_autoload_register(function (string $class): void {
 	$prefix = 'OCA\\Recognize\\';
@@ -100,6 +108,35 @@ function throws(callable $f, string $class): bool {
 
 use OCA\Recognize\Controller\InternalController;
 use OCA\Recognize\Db\FaceDetection;
+
+// --- 0. (child process) the real mapper's queries filter on user_id ---------
+if ($realMapper) {
+	/** Run $call on a real FaceDetectionMapper over a recording query builder; return the conditions it built. */
+	$conditions = function (callable $call): array {
+		$expr = mock(\OCP\DB\QueryBuilder\IExpressionBuilder::class, ['*' => fn ($name, $args) => "$name({$args[0]}, {$args[1]})"]);
+		$res = mock(\OCP\DB\IResult::class, ['fetch' => fn () => false, 'closeCursor' => fn () => true]);
+		$qb = mock(\OCP\DB\QueryBuilder\IQueryBuilder::class);
+		$where = [];
+		$qb->on = [
+			'expr' => fn () => $expr,
+			'createNamedParameter' => fn ($v) => 'param:' . json_encode($v),
+			'createPositionalParameter' => fn ($v) => 'param:' . json_encode($v),
+			'executeQuery' => fn () => $res,
+			'*' => function ($name, $args) use ($qb, &$where) {
+				if (in_array($name, ['where', 'andWhere'], true)) {
+					array_push($where, ...$args);
+				}
+				return $qb;
+			},
+		];
+		$db = mock(\OCP\IDBConnection::class, ['getQueryBuilder' => fn () => $qb]);
+		$call(new \OCA\Recognize\Db\FaceDetectionMapper($db, mock(\OCP\IConfig::class)));
+		return $where;
+	};
+	check('findByFileIdWithTitle filters on the given user', in_array('eq(d.user_id, param:"alice")', $conditions(fn ($m) => $m->findByFileIdWithTitle(9, 'alice')), true));
+	check('findByFileIdsWithTitle filters on the given user', in_array('eq(d.user_id, param:"alice")', $conditions(fn ($m) => $m->findByFileIdsWithTitle([9, 10], 'alice')), true));
+	exit($fails === 0 ? 0 : 1);
+}
 
 // --- 1. validateResults --------------------------------------------------
 $face = static fn (array $o = []) => array_merge(['x' => 0.1, 'y' => 0.2, 'width' => 0.3, 'height' => 0.4, 'vector' => array_fill(0, 512, 0.01), 'score' => 0.9], $o);
@@ -292,6 +329,59 @@ check('setName: normal title saved', $cluster->getTitle() === 'Alice' && count($
 
 $orphan = new \OCA\Recognize\Dav\Faces\FacePhoto($dm, $det(8, 'alice', null), mock(\OCP\Files\Folder::class), $tm, $pv);
 check('FacePhoto::delete with no cluster does not throw', !throws(fn () => $orphan->delete(), Throwable::class) && $dm->called('findByClusterId') === []);
+
+// --- 6. face-detections on a plain file: only the session user's ------------
+$propFindFor = function (?\OCP\IUser $sessionUser, \OCA\Recognize\Db\FaceDetectionMapper $dm): mixed {
+	$plugin = new \OCA\Recognize\Dav\Faces\PropFindPlugin($dm, mock(\OCP\IPreview::class), new \OCA\Recognize\Db\FaceClusterMapper(),
+		mock(\OCP\IUserSession::class, ['getUser' => fn () => $sessionUser]), mock(\OCP\Security\ICrypto::class),
+		mock(\Psr\Log\LoggerInterface::class), mock(\OCP\AppFramework\Utility\ITimeFactory::class));
+	$file = new class extends \OCA\DAV\Connector\Sabre\File {
+		public function __construct() {
+		}
+		public function getId(): ?int {
+			return 42;
+		}
+	};
+	$propFind = new \Sabre\DAV\PropFind('files/bob/x.jpg', [\OCA\Recognize\Dav\Faces\PropFindPlugin::FACE_DETECTIONS_PROPERTYNAME]);
+	$plugin->propFind($propFind, $file);
+	return $propFind->get(\OCA\Recognize\Dav\Faces\PropFindPlugin::FACE_DETECTIONS_PROPERTYNAME);
+};
+$dm = new \OCA\Recognize\Db\FaceDetectionMapper();
+$dm->on['findByFileIdWithTitle'] = fn () => [];
+$propFindFor($alice, $dm);
+$asked = $dm->called('findByFileIdWithTitle');
+check("file face-detections: asks for the session user's detections only", count($asked) === 1 && $asked[0][1] === [42, 'alice']);
+$dm = new \OCA\Recognize\Db\FaceDetectionMapper();
+$dm->on['findByFileIdWithTitle'] = fn () => [];
+check('file face-detections: no session -> [] without a query', $propFindFor(null, $dm) === '[]' && $dm->calls === []);
+
+// --- 7. face owner from the storage id --------------------------------------
+check('owner: local home storage', InternalController::ownerFromStorageId('home::alice') === 'alice');
+check('owner: S3 primary storage', InternalController::ownerFromStorageId('object::user:alice') === 'alice');
+check('owner: no single owner -> empty', InternalController::ownerFromStorageId('local::/mnt/photos/') === '' && InternalController::ownerFromStorageId('') === '');
+
+// --- 8. CatchUpJob crawls only enabled models -------------------------------
+function catchUp(array $config): array {
+	$jobList = mock(\OCP\BackgroundJob\IJobList::class, ['getJobsIterator' => fn () => []]);
+	$storage = new \OCA\Recognize\Service\StorageService();
+	$storage->on['getMounts'] = fn () => [['storage_id' => 3, 'root_id' => 4, 'override_root' => 4]];
+	$appConfig = mock(\OCP\AppFramework\Services\IAppConfig::class, [
+		'hasAppKey' => fn ($k) => isset($config[$k]),
+		'getAppValueString' => fn ($k, $d = '') => $config[$k] ?? $d,
+	]);
+	$job = new \OCA\Recognize\BackgroundJobs\CatchUpJob(mock(\OCP\AppFramework\Utility\ITimeFactory::class), $jobList, $storage,
+		mock(\Psr\Log\LoggerInterface::class), $appConfig);
+	(new ReflectionMethod($job, 'run'))->invoke($job, null);
+	return array_map(fn ($c) => $c[1][1]['models'] ?? \OCA\Recognize\Constants::MODELS, $jobList->called('add'));
+}
+check('catch-up: only enabled models crawled', catchUp(['faces.enabled' => 'true', 'imagenet.enabled' => 'true', 'movinet.enabled' => 'false', 'musicnn.enabled' => 'false']) === [['faces', 'imagenet']]);
+check('catch-up: nothing enabled -> no crawl', catchUp(['faces.enabled' => 'false', 'movinet.enabled' => 'false']) === []);
+check('catch-up: no settings yet -> all models, like the daemon', catchUp([]) === [\OCA\Recognize\Constants::MODELS]);
+
+// --- 0, in a child process with the real mapper ------------------------------
+exec('CHECK_REAL_MAPPER=1 ' . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(__FILE__) . ' ' . escapeshellarg($nc) . ' 2>&1', $out, $code);
+echo implode("\n", $out), "\n";
+$fails += substr_count(implode("\n", $out), 'FAIL ') + ($code !== 0 && !str_contains(implode("\n", $out), 'FAIL ') ? 1 : 0);
 
 echo $fails === 0 ? "all checks passed\n" : "$fails check(s) failed\n";
 exit($fails === 0 ? 0 : 1);

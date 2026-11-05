@@ -171,6 +171,20 @@ final class InternalController extends Controller {
 	 * @param int $fileId
 	 * @param array $faces Each face: {x, y, width, height, vector, score, user_id}
 	 */
+	/**
+	 * The owning user of a home storage: local (`home::<uid>`) or S3 primary (`object::user:<uid>`).
+	 *
+	 * shortcut: group folders and external storage have no single owner and get ''; their faces show in no view.
+	 */
+	public static function ownerFromStorageId(string $storageId): string {
+		foreach (['home::', 'object::user:'] as $prefix) {
+			if (str_starts_with($storageId, $prefix)) {
+				return substr($storageId, strlen($prefix));
+			}
+		}
+		return '';
+	}
+
 	private function writeFaces(int $fileId, array $faces): void {
 		// All or nothing: a partial set would be kept forever by the early return below.
 		$this->db->beginTransaction();
@@ -185,7 +199,6 @@ final class InternalController extends Controller {
 
 	private function insertFaces(int $fileId, array $faces): void {
 		// Resolve file owner from storage ID (works without user session)
-		$userId = '';
 		$qb = $this->db->getQueryBuilder();
 		$result = $qb->select('s.id')
 			->from('filecache', 'f')
@@ -194,9 +207,7 @@ final class InternalController extends Controller {
 			->executeQuery();
 		$storageId = $result->fetchOne();
 		$result->closeCursor();
-		if ($storageId && str_starts_with($storageId, 'home::')) {
-			$userId = substr($storageId, 6);
-		}
+		$userId = self::ownerFromStorageId(is_string($storageId) ? $storageId : '');
 
 		// A rename or move re-queues the file; keep the faces it already has
 		// (and their cluster assignments) instead of inserting a second set.

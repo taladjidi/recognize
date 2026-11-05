@@ -70,6 +70,7 @@ final class StorageCrawlJob extends QueuedJob {
 			}
 		} catch (Exception $e) {
 			// This job's row is already gone: without re-adding it the rest of the storage is never crawled.
+			// shortcut: no retry cap; a permanently failing query logs every cron run. Upgrade: attempt count in the job argument.
 			$this->logger->error('Failed to queue file for recognition, will retry', ['exception' => $e]);
 			$failed = true;
 		}

@@ -7,7 +7,9 @@
 declare(strict_types=1);
 namespace OCA\Recognize\BackgroundJobs;
 
+use OCA\Recognize\Constants;
 use OCA\Recognize\Service\StorageService;
+use OCP\AppFramework\Services\IAppConfig;
 use OCP\AppFramework\Utility\ITimeFactory;
 use OCP\BackgroundJob\IJobList;
 use OCP\BackgroundJob\TimedJob;
@@ -28,13 +30,33 @@ final class CatchUpJob extends TimedJob {
 		private IJobList $jobList,
 		private StorageService $storageService,
 		private LoggerInterface $logger,
+		private IAppConfig $appConfig,
 	) {
 		parent::__construct($timeFactory);
 		$this->setInterval(24 * 60 * 60);
 		$this->setTimeSensitivity(self::TIME_INSENSITIVE);
 	}
 
+	/**
+	 * Models whose `<model>.enabled` is true; all of them when no such key exists,
+	 * as the daemon does (python/db.py get_enabled_models).
+	 *
+	 * @return list<string>
+	 */
+	private function enabledModels(): array {
+		$set = array_filter(Constants::MODELS, fn (string $m) => $this->appConfig->hasAppKey($m . '.enabled'));
+		if ($set === []) {
+			return Constants::MODELS;
+		}
+		return array_values(array_filter($set, fn (string $m) => in_array(strtolower($this->appConfig->getAppValueString($m . '.enabled')), ['true', '1', 'yes'], true)));
+	}
+
 	protected function run($argument): void {
+		// Files of a disabled model would be queued, dropped untagged, and queued again the next day.
+		$models = $this->enabledModels();
+		if ($models === []) {
+			return;
+		}
 		// Stand down only for an unfinished catch-up: a stuck full recrawl must
 		// not block this forever. Crawl chains hold one row per mount, so few.
 		foreach ($this->jobList->getJobsIterator(StorageCrawlJob::class, null, 0) as $job) {
@@ -50,6 +72,7 @@ final class CatchUpJob extends TimedJob {
 				'root_id' => $mount['root_id'],
 				'override_root' => $mount['override_root'],
 				'last_file_id' => 0,
+				'models' => $models,
 				'skip_tagged' => true,
 			]);
 		}
