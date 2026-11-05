@@ -216,6 +216,27 @@ class TestQueries:
         assert [(c["id"], c["title"], c["count"]) for c in out] == [(1, "Alice Mum", 2), (3, "100%_real", 1)]
         assert out[0]["cover"].startswith("/recognize-faces/alice/2.jpg?")
 
+    def test_crop_urls_only_for_crops_on_disk(self, db, tmp_path):
+        root = tmp_path / "crops"
+        (root / "alice").mkdir(parents=True)
+
+        def cover():
+            return list_clusters(db, "alice", CROP, crop_root=str(root))[0]["cover"]
+
+        def crops():
+            files = get_cluster(db, "alice", CROP, 1, 0, 100, crop_root=str(root))["files"]
+            return [f["detection"]["crop"] is not None for f in files]  # newest first: det 2, det 1
+
+        assert cover() is None                                    # no crop at all
+        (root / "alice" / "2.jpg").write_bytes(b"")
+        assert cover() is None                                    # empty file = torn write
+        (root / "alice" / "1.jpg").write_bytes(b"x")
+        assert cover().startswith("/recognize-faces/alice/1.jpg?")  # largest WITH a crop
+        assert crops() == [False, True]
+        (root / "alice" / "2.jpg").write_bytes(b"x")
+        assert cover().startswith("/recognize-faces/alice/2.jpg?")
+        assert crops() == [True, True]
+
     def test_bob_never_sees_alice(self, db):
         assert ids(list_clusters(db, "bob", CROP)) == [2]
         assert get_cluster(db, "bob", CROP, 1, 0, 100) is None

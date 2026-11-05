@@ -19,6 +19,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import threading
 import time
 import traceback
 
@@ -187,6 +188,7 @@ class Pipeline:
         self.ffmpeg_binary = ffmpeg_binary
         self.nc_api = nc_api
         self._enabled = set()
+        self.stopping = threading.Event()  # set on SIGTERM: workers are killed, nothing is submitted
         # Why the last _submit_result failed: "blocked" (401/403/404: wrong secret/URL),
         # "permanent" (other 4xx: this payload will never be accepted) or "transient".
         self.submit_failure = None
@@ -216,16 +218,23 @@ class Pipeline:
             Files the worker never reached are absent (all of them after a
             crash or timeout); callers must treat absent and error as failed.
         """
+        if self.stopping.is_set():
+            return {}
         parent_conn, child_conn = mp.Pipe(duplex=False)
         proc = mp.Process(target=target, args=(*args, child_conn), daemon=True)
         proc.start()
         child_conn.close()  # Parent doesn't write to child's end
 
         try:
-            if parent_conn.poll(timeout):
+            deadline = time.monotonic() + timeout
+            while not (ready := parent_conn.poll(0.2)):
+                if self.stopping.is_set() or time.monotonic() >= deadline:
+                    break
+            if ready:
                 results = parent_conn.recv()
             else:
-                log.error("Worker %s timed out after %ds", target.__name__, timeout)
+                if not self.stopping.is_set():
+                    log.error("Worker %s timed out after %ds", target.__name__, timeout)
                 proc.kill()
                 results = {}
         except EOFError:

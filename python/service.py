@@ -34,6 +34,7 @@ CLUSTER_INTERVAL = 300       # Re-cluster every 5 minutes
 # Face crops: idle-time backfill + orphan cleanup
 CROP_BATCH = 200             # detections examined per idle tick
 CROP_TICK_SECONDS = 2.0      # wall-clock budget per idle tick, so new work waits at most this
+CROP_BUSY_BATCH = 25         # detections examined after each classifier pass, so backfill moves under load
 CROP_RESCAN_INTERVAL = 3600  # after a full backfill pass and cleanup round, rest this long
 CROP_LOG_EVERY = 500         # INFO line every N crops created by the backfill
 
@@ -86,6 +87,7 @@ class Service:
         self._crop_cursor = 0          # backfill: last detection id examined
         self._crop_created = 0         # backfill: crops created this pass
         self._crop_users = []          # cleanup: user dirs left in this round
+        self._crop_covers_done = False  # backfill phase 1: each cluster's largest box first
         self._crop_done = {"backfill": False, "cleanup": False}
         self._crop_rest_until = 0.0
         self._crop_root_warned = False
@@ -125,6 +127,7 @@ class Service:
         sig_name = signal.Signals(signum).name
         log.info("Received %s, shutting down gracefully...", sig_name)
         self._running = False
+        self.pipeline.stopping.set()
 
     def _main_loop(self):
         """Classifier-pass loop: load one model group, process all files, unload.
@@ -166,6 +169,8 @@ class Service:
                 self._crop_maintenance()
             else:
                 self._poll_interval = POLL_MIN_INTERVAL
+            if had_work and self._running:
+                self._crop_maintenance(busy=True)
 
             # Periodic face clustering
             now = time.monotonic()
@@ -336,6 +341,8 @@ class Service:
             do_tags = "imagenet" in enabled or "landmarks" in enabled
             face_res = self.pipeline.process_images_faces(images) if do_faces else {}
             tag_res = self.pipeline.process_images_tags(images) if do_tags else {}
+            if self.pipeline.stopping.is_set():
+                return False  # SIGTERM mid-batch: leave the pending rows as they are
             sets = ([face_res] if do_faces else []) + ([tag_res] if do_tags else [])
             results = self._good(images, *sets) if sets else {}
             for fid, r in results.items():
@@ -352,7 +359,10 @@ class Service:
                                   (audios, self.pipeline.process_audio, "audio files")):
             if not items:
                 continue
-            if not self._submit_items(items, self._good(items, run(items))):
+            res = run(items)
+            if self.pipeline.stopping.is_set():
+                return False
+            if not self._submit_items(items, self._good(items, res)):
                 return self._back_off()
             log.info("Processed %d %s", len(items), label)
 
@@ -368,8 +378,10 @@ class Service:
             if data:
                 write_crop(self.crop_root, owner, det_id, data)
 
-    def _crop_maintenance(self):
+    def _crop_maintenance(self, busy=False):
         """Idle tick: a bounded slice of crop backfill, then one user dir of orphan cleanup.
+
+        busy: a small backfill slice after a classifier pass (no cleanup).
 
         Never raises: crops are derived data and must not stop classification.
         """
@@ -384,7 +396,9 @@ class Service:
         try:
             deadline = now + CROP_TICK_SECONDS
             if not self._crop_done["backfill"]:
-                self._crop_done["backfill"] = self._backfill_crops(deadline)
+                self._crop_done["backfill"] = self._backfill_crops(deadline, CROP_BUSY_BATCH if busy else CROP_BATCH)
+            if busy:
+                return
             if not self._crop_done["cleanup"] and time.monotonic() < deadline:
                 self._crop_done["cleanup"] = self._cleanup_crops_one_user()
             if all(self._crop_done.values()):
@@ -393,12 +407,19 @@ class Service:
         except Exception as e:
             log.error("Face crop maintenance failed: %s", e)
 
-    def _backfill_crops(self, deadline):
-        """Create missing crops for up to CROP_BATCH detections; True when a full pass ended."""
+    def _backfill_crops(self, deadline, batch=CROP_BATCH):
+        """Create missing crops for up to `batch` detections; True when a full pass ended.
+
+        A pass first covers only each cluster's largest box, then everything.
+        """
         from crops import has_crop, make_crop, open_raw, write_crop
         db = self.pipeline.db
-        rows = db.detections_after(self._crop_cursor, CROP_BATCH)
+        rows = db.detections_after(self._crop_cursor, batch, covers_only=not self._crop_covers_done)
+        if not rows and not self._crop_covers_done:
+            self._crop_covers_done, self._crop_cursor = True, 0
+            return False
         if not rows:
+            self._crop_covers_done = False
             if self._crop_created:
                 log.info("Face crop backfill pass done: %d created", self._crop_created)
             self._crop_cursor, self._crop_created = 0, 0

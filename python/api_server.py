@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import queue
 import re
 import sys
@@ -24,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
 import config as nc_config
+from crops import DEFAULT_CROP_ROOT
 from db import DB
 
 log = logging.getLogger("recognize.api")
@@ -110,8 +112,26 @@ def escape_like(q: str) -> str:
     return q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
 
 
-def list_clusters(db: DB, uid: str, crop_secret: str, min_count: int = 1, title: str | None = None) -> list[dict]:
-    """[{id, title, count, cover}] by count desc; cover is the largest box's crop."""
+COVER_CANDIDATES = 5  # largest boxes per cluster examined for a crop on disk
+
+
+def _crop_or_none(uid, did, secret, crop_root):
+    """Signed URL, or None when the crop file is missing or empty (nginx would 404).
+
+    crop_root None skips the check.
+    """
+    if crop_root is not None:
+        try:
+            if os.stat(os.path.join(crop_root, uid, f"{did}.jpg")).st_size <= 0:
+                return None
+        except OSError:
+            return None
+    return crop_url(uid, did, secret)
+
+
+def list_clusters(db: DB, uid: str, crop_secret: str, min_count: int = 1, title: str | None = None,
+                  crop_root: str | None = None) -> list[dict]:
+    """[{id, title, count, cover}] by count desc; cover is the largest box that has a crop, else None."""
     p = db._ph()
     title_sql = f"AND LOWER(c.title) LIKE {p} ESCAPE '!' " if title is not None else ""
     sql = (
@@ -121,20 +141,23 @@ def list_clusters(db: DB, uid: str, crop_secret: str, min_count: int = 1, title:
         f"    ROW_NUMBER() OVER (PARTITION BY d.cluster_id ORDER BY d.width * d.height DESC, d.id) AS rn"
         f"  FROM {db._table('recognize_face_detections')} d {_owned(db)} AND d.cluster_id > 0"
         f") t JOIN {db._table('recognize_face_clusters')} c ON c.id = t.cluster_id "
-        f"WHERE t.rn = 1 AND t.cnt >= {p} AND c.user_id = {p} {title_sql}"
-        f"ORDER BY t.cnt DESC, t.cluster_id"
+        f"WHERE t.rn <= {COVER_CANDIDATES} AND t.cnt >= {p} AND c.user_id = {p} {title_sql}"
+        f"ORDER BY t.cnt DESC, t.cluster_id, t.rn"
     )
     params = _owned_params(uid) + (min_count, uid)
     if title is not None:
         params += (f"%{escape_like(title.lower())}%",)
     rows = db._fetchall_dicts(db._execute(sql, params))
-    return [
-        {"id": r["cid"], "title": r["title"], "count": r["cnt"], "cover": crop_url(uid, r["did"], crop_secret)}
-        for r in rows
-    ]
+    out = {}
+    for r in rows:
+        c = out.setdefault(r["cid"], {"id": r["cid"], "title": r["title"], "count": r["cnt"], "cover": None})
+        if c["cover"] is None:
+            c["cover"] = _crop_or_none(uid, r["did"], crop_secret, crop_root)
+    return list(out.values())
 
 
-def get_cluster(db: DB, uid: str, crop_secret: str, cluster_id: int, offset: int, limit: int) -> dict | None:
+def get_cluster(db: DB, uid: str, crop_secret: str, cluster_id: int, offset: int, limit: int,
+                crop_root: str | None = None) -> dict | None:
     """{id, title, count, files} for one of uid's clusters, newest first; None if not uid's."""
     p = db._ph()
     det, clusters = db._table("recognize_face_detections"), db._table("recognize_face_clusters")
@@ -167,7 +190,7 @@ def get_cluster(db: DB, uid: str, crop_secret: str, cluster_id: int, offset: int
             "mime": r["mimetype"], "etag": r["etag"], "mtime": r["mtime"], "size": r["size"],
             "detection": {
                 "id": r["did"], "x": r["x"], "y": r["y"], "width": r["width"], "height": r["height"],
-                "crop": crop_url(uid, r["did"], crop_secret),
+                "crop": _crop_or_none(uid, r["did"], crop_secret, crop_root),
             },
         } for r in rows],
     }
@@ -194,6 +217,7 @@ class Api:
         self.config = config
         self.token_secret = config.get("api_token_secret", "")
         self.crop_secret = config.get("crop_link_secret", "")
+        self.crop_root = config.get("face_crop_root") or DEFAULT_CROP_ROOT
         self._idle = queue.SimpleQueue()
         self._db_slots = threading.BoundedSemaphore(DB_SLOTS)
         self._users = {}  # uid -> (ok, monotonic expiry); only validly signed uids get here
@@ -261,19 +285,20 @@ class Api:
                 return 401, {}
             if path == "/v1/clusters":
                 min_count = _int(qs, "min", 1, 1, 10**9)
-                return 200, self._with_db(lambda db: list_clusters(db, uid, self.crop_secret, min_count))
+                return 200, self._with_db(lambda db: list_clusters(db, uid, self.crop_secret, min_count, crop_root=self.crop_root))
             m = _CLUSTER_PATH.fullmatch(path)
             if m:
                 offset = _int(qs, "offset", 0, 0, 10**9)
                 limit = _int(qs, "limit", MAX_LIMIT, 1, MAX_LIMIT)
                 body = self._with_db(
-                    lambda db: get_cluster(db, uid, self.crop_secret, int(m.group(1)), offset, limit))
+                    lambda db: get_cluster(db, uid, self.crop_secret, int(m.group(1)), offset, limit,
+                                          crop_root=self.crop_root))
                 return (200, body) if body is not None else (404, {"error": "not found"})
             if path == "/v1/search":
                 q = qs.get("q", [""])[-1]
                 if not q or len(q) > MAX_Q:
                     raise ValueError("q")
-                return 200, self._with_db(lambda db: list_clusters(db, uid, self.crop_secret, 1, q))
+                return 200, self._with_db(lambda db: list_clusters(db, uid, self.crop_secret, 1, q, crop_root=self.crop_root))
         except ValueError:
             return 400, {"error": "bad parameter"}
         except Busy:

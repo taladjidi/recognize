@@ -250,7 +250,7 @@ def test_maintenance_is_bounded_and_never_raises(svc, tmp_path):
     with patch.object(svc.pipeline.db, "detections_after", side_effect=RuntimeError("db gone")):
         svc._crop_maintenance()  # logged, not raised
     calls = []
-    with patch.object(svc.pipeline.db, "detections_after", side_effect=lambda a, n: calls.append(n) or []):
+    with patch.object(svc.pipeline.db, "detections_after", side_effect=lambda a, n, **kw: calls.append(n) or []):
         svc._crop_maintenance()
     assert calls == [svc_mod().CROP_BATCH]
 

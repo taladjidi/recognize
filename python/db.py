@@ -560,12 +560,20 @@ class DB:
             )
         self._commit()
 
-    def detections_after(self, after_id: int, limit: int) -> list[dict]:
-        """Detections with an owner and id > after_id, by id (crop backfill cursor)."""
+    def detections_after(self, after_id: int, limit: int, covers_only: bool = False) -> list[dict]:
+        """Detections with an owner and id > after_id, by id (crop backfill cursor).
+
+        covers_only: just each cluster's largest box (the API's cover candidate).
+        """
         t = self._table("recognize_face_detections")
+        covers = (
+            f"AND id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY cluster_id "
+            f"ORDER BY width * height DESC, id) AS rn FROM {t} WHERE cluster_id > 0) c WHERE rn = 1) "
+            if covers_only else ""
+        )
         cur = self._execute(
             f"SELECT id, file_id, user_id, x, y, width, height FROM {t} "
-            f"WHERE id > {self._ph()} AND user_id <> '' ORDER BY id LIMIT {self._ph()}",
+            f"WHERE id > {self._ph()} AND user_id <> '' {covers}ORDER BY id LIMIT {self._ph()}",
             (after_id, limit),
         )
         return self._fetchall_dicts(cur)
