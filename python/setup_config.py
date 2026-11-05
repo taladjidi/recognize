@@ -17,6 +17,7 @@ import glob
 import grp
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,14 @@ NEXTCLOUD_ROOT = os.environ.get("NEXTCLOUD_ROOT", "/usr/share/nextcloud")
 OUTPUT_CONFIG = os.path.join(SCRIPT_DIR, "nc_config.json")
 SERVICE_TEMPLATE = os.path.join(SCRIPT_DIR, "recognize.service.template")
 OUTPUT_SERVICE = os.path.join(SCRIPT_DIR, "recognize.service")
+API_SERVICE_TEMPLATE = os.path.join(SCRIPT_DIR, "recognize-api.service.template")
+OUTPUT_API_SERVICE = os.path.join(SCRIPT_DIR, "recognize-api.service")
+NGINX_TEMPLATE = os.path.join(SCRIPT_DIR, "nginx-recognize.conf.template")
+OUTPUT_NGINX = os.path.join(SCRIPT_DIR, "nginx-recognize.conf")
+DEFAULT_CROP_ROOT = "/var/lib/nextcloud/recognize-faces"
+DEFAULT_API_PORT = 8291
+# Kept across runs: rotating them would log every user out of the Faces API / break cached crop links.
+KEPT_SECRETS = ("api_token_secret", "crop_link_secret")
 
 REQUIRED_KEYS = ["dbtype", "dbhost", "dbname", "dbuser", "dbpassword", "datadirectory"]
 
@@ -106,8 +115,8 @@ def _detect_web_user():
     return None
 
 
-def store_secret_in_nextcloud(nc_root, secret):
-    """Store the internal secret in Nextcloud's appconfig via occ.
+def store_secret_in_nextcloud(nc_root, secret, key="internal_secret", sensitive=False):
+    """Store a secret in Nextcloud's appconfig via occ.
 
     Tries running as the web server user first (required when running as root),
     falls back to direct invocation.
@@ -115,14 +124,12 @@ def store_secret_in_nextcloud(nc_root, secret):
     occ = os.path.join(nc_root, "occ")
     web_user = _detect_web_user()
 
+    cmd = ["php", occ, "config:app:set", "recognize", key, "--value", secret]
+    if sensitive:
+        cmd += ["--type", "string", "--sensitive", "--no-interaction"]
     # If running as root, occ must run as the web server user
     if os.getuid() == 0 and web_user:
-        cmd = ["sudo", "-u", web_user, "php", occ,
-               "config:app:set", "recognize", "internal_secret",
-               "--value", secret]
-    else:
-        cmd = ["php", occ, "config:app:set", "recognize", "internal_secret",
-               "--value", secret]
+        cmd = ["sudo", "-u", web_user] + cmd
 
     try:
         subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=True)
@@ -244,13 +251,32 @@ def get_nvidia_lib_path(python_bin=None):
     return ":".join(lib_dirs)
 
 
-def generate_service_file(config, nc_root, python_bin):
+def generate_nginx_conf(config):
+    """The nginx snippet for the Faces API proxy and the signed crop links."""
+    with open(NGINX_TEMPLATE) as f:
+        template = f.read()
+    return (template
+            .replace("__API_PORT__", str(int(config.get("api_port") or DEFAULT_API_PORT)))
+            .replace("__CROP_LINK_SECRET__", config["crop_link_secret"])
+            .replace("__CROP_ROOT__", config.get("face_crop_root", DEFAULT_CROP_ROOT).rstrip("/")))
+
+
+def read_existing_config():
+    """The current nc_config.json, or {} when there is none (or it is unreadable)."""
+    try:
+        with open(OUTPUT_CONFIG) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def generate_service_file(config, nc_root, python_bin, template_path=SERVICE_TEMPLATE):
     """Generate systemd service unit from template."""
-    if not os.path.isfile(SERVICE_TEMPLATE):
-        print(f"WARNING: Template not found: {SERVICE_TEMPLATE}", file=sys.stderr)
+    if not os.path.isfile(template_path):
+        print(f"WARNING: Template not found: {template_path}", file=sys.stderr)
         return None
 
-    with open(SERVICE_TEMPLATE) as f:
+    with open(template_path) as f:
         template = f.read()
 
     # Determine user/group (web server user)
@@ -326,8 +352,14 @@ def main():
     # 2. Generate shared secret
     secret = generate_secret()
 
-    # 3. Build nc_config.json
-    nc_config = {
+    # 3. Build nc_config.json; keys this script does not own (api_port, face_crop_root, ...) survive
+    nc_config = read_existing_config()
+    for key in KEPT_SECRETS:
+        if not nc_config.get(key):
+            nc_config[key] = secrets.token_urlsafe(32)
+    nc_config.setdefault("face_crop_root", DEFAULT_CROP_ROOT)
+    nc_config.setdefault("api_port", DEFAULT_API_PORT)
+    nc_config |= {
         "dbtype": nc_php_config["dbtype"],
         "dbhost": nc_php_config["dbhost"],
         "dbport": nc_php_config.get("dbport", ""),
@@ -364,6 +396,14 @@ def main():
         print("  Run manually as root:")
         print(f"    sudo -u apache php {nc_root}/occ config:app:set recognize internal_secret --value {secret}")
 
+    print("\nStoring Faces API token secret in Nextcloud appconfig (sensitive)...")
+    if store_secret_in_nextcloud(nc_root, nc_config["api_token_secret"], "api_token_secret", sensitive=True):
+        print("  Secret stored successfully")
+    else:
+        print("  WARNING: Could not store it. Run manually as root:")
+        print(f"    sudo -u apache php {nc_root}/occ config:app:set recognize api_token_secret "
+              f"--type string --sensitive --no-interaction --value <api_token_secret from {OUTPUT_CONFIG}>")
+
     # 6. Generate systemd service file
     print("\nGenerating systemd service file...")
     service_content = generate_service_file(nc_config, nc_root, args.python_bin)
@@ -381,6 +421,18 @@ def main():
         print(f"    sudo systemctl enable --now recognize")
     else:
         print("  Skipped (template not found)")
+
+    api_service = generate_service_file(nc_config, nc_root, args.python_bin, API_SERVICE_TEMPLATE)
+    if api_service:
+        with open(OUTPUT_API_SERVICE, "w") as f:
+            f.write(api_service)
+        print(f"  Service file written to {OUTPUT_API_SERVICE}")
+
+    # The snippet holds crop_link_secret: 0600 here, deploy.sh installs it root:nginx 0640.
+    fd = os.open(OUTPUT_NGINX, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(generate_nginx_conf(nc_config))
+    print(f"  nginx snippet written to {OUTPUT_NGINX}")
 
     print("\nSetup complete.")
     print("NOTE: If not running as root, the following steps require elevated privileges:")

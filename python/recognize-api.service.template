@@ -1,0 +1,28 @@
+[Unit]
+Description=Nextcloud Recognize Faces read API
+After=network.target mysql.service postgresql.service
+Wants=network.target
+
+# StartLimit* must live in [Unit] (see recognize.service.template).
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=__USER__
+Group=__GROUP__
+WorkingDirectory=__PYTHON_DIR__
+ExecStart=__PYTHON_BIN__ api_server.py __CONFIG_PATH__
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Resource limits
+MemoryMax=1G
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

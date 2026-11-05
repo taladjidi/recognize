@@ -25,4 +25,7 @@ deploy.sh
 # Local instance secrets — contains plaintext DB password
 python/nc_config.json
 python/recognize.service
+python/recognize-api.service
+# Holds crop_link_secret
+python/nginx-recognize.conf
 bench-results/

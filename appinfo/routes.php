@@ -23,6 +23,9 @@ return [
 		// Internal API for Python daemon
 		['name' => 'internal#results', 'url' => '/api/internal/results', 'verb' => 'POST'],
 
+		// Bearer token for the Faces read API (python/api_server.py)
+		['name' => 'faces_token#token', 'url' => '/api/v1/faces-token', 'verb' => 'GET'],
+
 		//internal ADMIN API
 		['name' => 'admin#reset', 'url' => '/admin/reset', 'verb' => 'GET'],
 		['name' => 'admin#clearAllJobs', 'url' => '/admin/clearJobs', 'verb' => 'GET'],

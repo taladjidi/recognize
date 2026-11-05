@@ -111,7 +111,8 @@ class DB:
             db_path = self._config["dbname"]
             if db_path != ":memory:" and not db_path.endswith(".db") and not os.path.isabs(db_path):
                 db_path = os.path.join(self._config.get("datadirectory", ""), db_path)
-            self._conn = sqlite3.connect(db_path)
+            # api_server.py hands a pooled connection between threads, one at a time.
+            self._conn = sqlite3.connect(db_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             if db_path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode=WAL")
