@@ -11,6 +11,7 @@ use OCA\Recognize\Constants;
 use OCA\Recognize\Service\Logger;
 use OCA\Recognize\Service\PendingService;
 use OCA\Recognize\Service\StorageService;
+use OCA\Recognize\Service\TagManager;
 use OCP\AppFramework\Utility\ITimeFactory;
 use OCP\BackgroundJob\IJobList;
 use OCP\BackgroundJob\QueuedJob;
@@ -38,12 +39,13 @@ final class StorageCrawlJob extends QueuedJob {
 		private IJobList $jobList,
 		private StorageService $storageService,
 		private PendingService $pending,
+		private TagManager $tagManager,
 	) {
 		parent::__construct($timeFactory);
 	}
 
 	/**
-	 * @param array{storage_id:int, root_id:int, override_root:int, last_file_id:int, models?: list<string>} $argument
+	 * @param array{storage_id:int, root_id:int, override_root:int, last_file_id:int, models?: list<string>, skip_tagged?: bool} $argument
 	 */
 	protected function run($argument): void {
 		$storageId = $argument['storage_id'];
@@ -52,12 +54,15 @@ final class StorageCrawlJob extends QueuedJob {
 		$lastFileId = $argument['last_file_id'];
 		/** @var list<string> $models */
 		$models = $argument['models'] ?? Constants::MODELS;
+		// Catch-up crawls (CatchUpJob) only queue files the daemon has not tagged yet.
+		$skipTagged = $argument['skip_tagged'] ?? false;
+		$skipTagId = $skipTagged ? (int)$this->tagManager->getProcessedTag()->getId() : null;
 
 		// Remove current iteration
 		$this->jobList->remove(self::class, $argument);
 
 		$lastSeenFileId = null;
-		foreach ($this->storageService->getFilesInMount($storageId, $overrideRoot, $models, $lastFileId, self::BATCH_SIZE) as $file) {
+		foreach ($this->storageService->getFilesInMount($storageId, $overrideRoot, $models, $lastFileId, self::BATCH_SIZE, $skipTagId) as $file) {
 			try {
 				$this->pending->upsert((int)$file['fileid'], $storageId, PendingService::ACTION_CREATED);
 				$lastSeenFileId = (int)$file['fileid'];
@@ -75,6 +80,7 @@ final class StorageCrawlJob extends QueuedJob {
 				'override_root' => $overrideRoot,
 				'last_file_id' => $lastSeenFileId,
 				'models' => $models,
+				'skip_tagged' => $skipTagged,
 			]);
 		}
 	}

@@ -92,7 +92,11 @@ final class StorageService {
 	 * @param int $maxResults
 	 * @return \Generator<int,array{fileid:int, image:bool, video:bool, audio:bool},mixed,void>
 	 */
-	public function getFilesInMount(int $storageId, int $rootId, array $models, int $lastFileId = 0, int $maxResults = 100) : \Generator {
+	/**
+	 * @param int|null $skipTaggedWith systemtag id: leave out files that carry it
+	 *                                 (the "processed" tag, for a catch-up crawl)
+	 */
+	public function getFilesInMount(int $storageId, int $rootId, array $models, int $lastFileId = 0, int $maxResults = 100, ?int $skipTaggedWith = null) : \Generator {
 		$qb = new CacheQueryBuilder($this->db->getQueryBuilder(), $this->metadataManager);
 		try {
 			$result = $qb->selectFileCache()
@@ -155,6 +159,13 @@ final class StorageService {
 				->andWhere($qb->expr()->orX(...$ignoreFileidsExpr));
 			if (count($ignoreExprAll) > 0) {
 				$qb->andWhere($qb->expr()->andX(...$ignoreExprAll));
+			}
+			if ($skipTaggedWith !== null) {
+				$qb->leftJoin('filecache', 'systemtag_object_mapping', 'som', $qb->expr()->andX(
+					$qb->expr()->eq('som.objecttype', $qb->createNamedParameter('files')),
+					$qb->expr()->eq('som.objectid', $qb->expr()->castColumn('filecache.fileid', IQueryBuilder::PARAM_STR)),
+					$qb->expr()->eq('som.systemtagid', $qb->createNamedParameter($skipTaggedWith, IQueryBuilder::PARAM_INT)),
+				))->andWhere($qb->expr()->isNull('som.objectid'));
 			}
 			if ($maxResults !== 0) {
 				$qb->setMaxResults($maxResults);
