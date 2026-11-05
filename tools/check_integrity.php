@@ -171,7 +171,7 @@ foreach ([
 
 // --- 2. results(): order and transaction --------------------------------
 /** @return array{InternalController, Stub, Stub, Stub, Stub, Stub} */
-function controller(array $params, array $mapperOn = [], bool $sensitive = true, string $stored = 's3cret'): array {
+function controller(array $params, array $mapperOn = [], bool $sensitive = true, string $stored = 's3cret', array $tagsOn = []): array {
 	Log::$order = [];
 	$request = mock(\OCP\IRequest::class, [
 		'getParams' => fn () => $params,
@@ -183,7 +183,7 @@ function controller(array $params, array $mapperOn = [], bool $sensitive = true,
 		'setAppValueString' => fn () => true,
 	]);
 	$tag = mock(\OCP\SystemTag\ISystemTag::class, ['getId' => fn () => '7']);
-	$systemTags = mock(\OCP\SystemTag\ISystemTagManager::class, ['getTag' => fn () => $tag]);
+	$systemTags = mock(\OCP\SystemTag\ISystemTagManager::class, $tagsOn + ['getTag' => fn () => $tag]);
 	$objectMapper = mock(\OCP\SystemTag\ISystemTagObjectMapper::class, ['getTagIdsForObjects' => fn ($ids) => [(string)$ids[0] => []]]);
 	$mapper = new \OCA\Recognize\Db\FaceDetectionMapper();
 	$mapper->on = $mapperOn + ['findByFileIdAndUser' => fn () => []];
@@ -195,10 +195,22 @@ function controller(array $params, array $mapperOn = [], bool $sensitive = true,
 	$qb->on = ['select' => fn () => $qb, 'from' => fn () => $qb, 'innerJoin' => fn () => $qb, 'where' => fn () => $qb,
 		'expr' => fn () => $expr, 'createNamedParameter' => fn () => ':p', 'executeQuery' => fn () => $res];
 	$db->on['getQueryBuilder'] = fn () => $qb;
+	$alice = mock(\OCP\IUser::class, ['getUID' => fn () => 'alice']);
+	$users = mock(\OCP\IUserManager::class, ['get' => fn ($uid) => $uid === 'alice' ? $alice : null]);
 	$c = new InternalController('recognize', $request, new \OCA\Recognize\Service\TagManager($systemTags, $objectMapper),
-		$mapper, $appConfig, mock(\Psr\Log\LoggerInterface::class), $db);
-	return [$c, $mapper, $db, $objectMapper, $appConfig];
+		$mapper, $appConfig, mock(\Psr\Log\LoggerInterface::class), $db, $users);
+	return [$c, $mapper, $db, $objectMapper, $appConfig, $systemTags];
 }
+
+// NC 34 refuses createTag() without a user outside the CLI: a new label must be created as the file's owner.
+[$c, , , $objects, , $sys] = controller(['file_id' => 42, 'tags' => ['NewLabel'], 'faces' => []], [], true, 's3cret', [
+	'getTag' => function () { throw new \OCP\SystemTag\TagNotFoundException(); },
+	'createTag' => fn ($name, $visible, $assignable, $user = null) => mock(\OCP\SystemTag\ISystemTag::class, ['getId' => fn () => '9']),
+]);
+$r = $c->results();
+$created = $sys->called('createTag');
+check('new label -> created as the file owner', $r->getStatus() === 200 && $created !== []
+	&& array_reduce($created, fn ($ok, $call) => $ok && ($call[1][3] ?? null) !== null && $call[1][3]->getUID() === 'alice', true));
 
 [$c, $mapper, $db, $objects] = controller(['file_id' => 42, 'tags' => ['Cat'], 'faces' => [$face(['vector' => array_fill(0, 3, 0.1)])]]);
 $r = $c->results();

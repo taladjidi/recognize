@@ -18,6 +18,7 @@ use OCP\AppFramework\Http\JSONResponse;
 use OCP\AppFramework\Services\IAppConfig;
 use OCP\IDBConnection;
 use OCP\IRequest;
+use OCP\IUserManager;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -37,6 +38,7 @@ final class InternalController extends Controller {
 		private IAppConfig $appConfig,
 		private LoggerInterface $logger,
 		private IDBConnection $db,
+		private IUserManager $userManager,
 	) {
 		parent::__construct($appName, $request);
 	}
@@ -86,7 +88,11 @@ final class InternalController extends Controller {
 		// Always, even with no labels: a file that never gets the processed tag
 		// is re-queued by CatchUpJob every day.
 		try {
-			$this->tagManager->assignTags($fileId, $tags);
+			// shortcut: group-folder files have no owner, and with systemtags
+			// restrict_creation_to_admin a non-admin owner cannot create a new label either;
+			// both still fail here for a label that does not exist yet.
+			$owner = $this->userManager->get($this->ownerOfFile($fileId));
+			$this->tagManager->assignTags($fileId, $tags, $owner);
 		} catch (\Throwable $e) {
 			$this->logger->error('Failed to assign tags for file ' . $fileId, ['exception' => $e]);
 			return new JSONResponse(
@@ -197,8 +203,8 @@ final class InternalController extends Controller {
 		}
 	}
 
-	private function insertFaces(int $fileId, array $faces): void {
-		// Resolve file owner from storage ID (works without user session)
+	/** Owner uid of a file from its storage id (works without a user session), '' if none. */
+	private function ownerOfFile(int $fileId): string {
 		$qb = $this->db->getQueryBuilder();
 		$result = $qb->select('s.id')
 			->from('filecache', 'f')
@@ -207,7 +213,11 @@ final class InternalController extends Controller {
 			->executeQuery();
 		$storageId = $result->fetchOne();
 		$result->closeCursor();
-		$userId = self::ownerFromStorageId(is_string($storageId) ? $storageId : '');
+		return self::ownerFromStorageId(is_string($storageId) ? $storageId : '');
+	}
+
+	private function insertFaces(int $fileId, array $faces): void {
+		$userId = $this->ownerOfFile($fileId);
 
 		// A rename or move re-queues the file; keep the faces it already has
 		// (and their cluster assignments) instead of inserting a second set.

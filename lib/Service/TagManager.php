@@ -7,6 +7,7 @@
 declare(strict_types=1);
 namespace OCA\Recognize\Service;
 
+use OCP\IUser;
 use OCP\SystemTag\ISystemTag;
 use OCP\SystemTag\ISystemTagManager;
 use OCP\SystemTag\ISystemTagObjectMapper;
@@ -27,11 +28,17 @@ final class TagManager {
 	 * @param string $name
 	 * @return \OCP\SystemTag\ISystemTag
 	 */
-	public function getTag(string $name) : ISystemTag {
+	/**
+	 * @param IUser|null $creator user to create a missing tag as. Nextcloud 34
+	 *                            refuses createTag() without a user outside the CLI
+	 *                            (TagCreationForbiddenException), which is every
+	 *                            daemon results request.
+	 */
+	public function getTag(string $name, ?IUser $creator = null) : ISystemTag {
 		try {
 			$tag = $this->tagManager->getTag($name, true, true);
 		} catch (TagNotFoundException $e) {
-			$tag = $this->tagManager->createTag($name, true, true);
+			$tag = $this->tagManager->createTag($name, true, true, $creator);
 		}
 		return $tag;
 	}
@@ -39,11 +46,11 @@ final class TagManager {
 	/**
 	 * @return \OCP\SystemTag\ISystemTag
 	 */
-	public function getProcessedTag(): ISystemTag {
+	public function getProcessedTag(?IUser $creator = null): ISystemTag {
 		try {
 			$tag = $this->tagManager->getTag(self::RECOGNIZED_TAG, false, false);
 		} catch (TagNotFoundException $e) {
-			$tag = $this->tagManager->createTag(self::RECOGNIZED_TAG, false, false);
+			$tag = $this->tagManager->createTag(self::RECOGNIZED_TAG, false, false, $creator);
 		}
 		return $tag;
 	}
@@ -67,11 +74,11 @@ final class TagManager {
 	 * @param array<string> $tags
 	 * @return void
 	 */
-	public function assignTags(int $fileId, array $tags): void {
-		$tags = array_map(function ($tag) : string {
-			return $this->getTag($tag)->getId();
+	public function assignTags(int $fileId, array $tags, ?IUser $creator = null): void {
+		$tags = array_map(function ($tag) use ($creator) : string {
+			return $this->getTag($tag, $creator)->getId();
 		}, $tags);
-		$tags[] = $this->getProcessedTag()->getId();
+		$tags[] = $this->getProcessedTag($creator)->getId();
 		/** @var array<string, string[]> $tagsByFile */
 		$tagsByFile = $this->objectMapper->getTagIdsForObjects([$fileId], 'files');
 		$oldTags = $tagsByFile[(string) $fileId];
