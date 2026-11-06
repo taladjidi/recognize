@@ -15,6 +15,9 @@ use OCA\Recognize\Service\TagManager;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\JSONResponse;
+use OCP\AppFramework\Http\Attribute\NoAdminRequired;
+use OCP\AppFramework\Http\Attribute\NoCSRFRequired;
+use OCP\AppFramework\Http\Attribute\PublicPage;
 use OCP\AppFramework\Services\IAppConfig;
 use OCP\IDBConnection;
 use OCP\IRequest;
@@ -49,11 +52,9 @@ final class InternalController extends Controller {
 	public const VECTOR_DIM = 512;
 	private const BBOX_EPSILON = 1e-6;
 
-	/**
-	 * @NoCSRFRequired
-	 * @PublicPage
-	 * @NoAdminRequired
-	 */
+	#[NoCSRFRequired]
+	#[PublicPage]
+	#[NoAdminRequired]
 	public function results(): JSONResponse {
 		if (!$this->validateSecret()) {
 			return new JSONResponse(['error' => 'Unauthorized'], Http::STATUS_UNAUTHORIZED);
