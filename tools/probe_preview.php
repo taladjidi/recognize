@@ -40,7 +40,9 @@ if (function_exists('getimagesize') && $node instanceof \OCP\Files\File) {
 $t0 = hrtime(true);
 try {
 	$p = $preview->getPreview($node, $size, $size, false);
-	printf("OK: %s %dx? in %.0f ms\n", $p->getMimeType(), $size, (hrtime(true) - $t0) / 1e6);
+	// getPreview() can return an index row whose file is gone: read it, as the HTTP response does.
+	$bytes = strlen($p->getContent());
+	printf("OK: %s %s, %d bytes read in %.0f ms\n", $p->getMimeType(), $p->getName(), $bytes, (hrtime(true) - $t0) / 1e6);
 } catch (\Throwable $e) {
 	printf("FAILED after %.0f ms: %s: %s\n", (hrtime(true) - $t0) / 1e6, get_class($e), $e->getMessage());
 	foreach (array_slice($e->getTrace(), 0, 6) as $f) {
