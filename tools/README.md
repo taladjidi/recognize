@@ -31,6 +31,11 @@ and `covers_null`. Same Basic-auth app password, no API key needed:
     tools/bench_faces.py --api python --scenario all --runs 2
     tools/bench_faces.py --api python --scenario overview --compare bench-results/<dav>.json
 
+Grid thumbnails, PHP preview vs the nginx-served `python/thumbs.py` file on the
+same file ids (from the largest clusters), p50/p95/max and bytes per run:
+
+    tools/bench_thumbs.py --n 120 --runs 3
+
 Run 1 is reported apart (cold-ish); the median is over runs 2..N. HTTP/1.1 with
 10 workers, so compare tool runs with each other, not with browser timings.
 
