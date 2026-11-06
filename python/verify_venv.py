@@ -74,7 +74,7 @@ def cv2_():
     return cv2.__version__
 
 def others():
-    import PIL, soundfile, requests, scipy  # noqa: F401
+    import PIL, soundfile, requests, scipy, pillow_heif  # noqa: F401
     return None
 
 def mysql():

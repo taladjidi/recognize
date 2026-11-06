@@ -34,6 +34,7 @@ ORT_VERSION = '1.29.0'
 BASE_DEPS = [
     'numpy>=2.0',
     'pillow>=10.0',
+    'pillow-heif>=0.18',  # HEIC/HEIF (iPhone) photos; registered in classifiers/ and crops.py
     'opencv-python-headless>=4.8',
     'insightface>=0.7',
     'scikit-learn>=1.4',

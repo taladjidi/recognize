@@ -14,6 +14,11 @@ import stat
 import tempfile
 
 from PIL import Image
+from pillow_heif import register_heif_opener
+
+# HEIC/HEIF: pillow-heif applies irot/imir to the pixels and reports EXIF orientation 1
+# (checked 2026-11-06 on iPhone portraits), so raw == upright and nothing rotates twice.
+register_heif_opener()
 
 log = logging.getLogger(__name__)
 
@@ -100,11 +105,7 @@ def open_raw(path, boxes=()):
     DCT scale that still gives every crop >= CROP_SIZE pixels (much faster).
 
     Raw means as decoded, not yet turned: the orientation is applied once, by the caller.
-    HEIC/HEIF: the service venv has no HEIF plugin (no pillow-heif, 2026-11-05), so
-    Image.open raises and those photos get no faces. Before adding one, check whether its
-    decoder already applies irot/imir to the pixels while still reporting an orientation:
-    that would rotate twice here. (Pillow's own AVIF decoder keeps pixels raw and reports
-    irot/imir as the EXIF orientation, which is consistent.)"""
+    HEIC/HEIF come back already upright with orientation 1 (see register_heif_opener above)."""
     with Image.open(path) as im:
         orientation = im.getexif().get(0x0112, 1)
         if boxes and im.format == "JPEG":
