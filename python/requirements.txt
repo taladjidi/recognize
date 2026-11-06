@@ -11,7 +11,7 @@ onnxruntime-gpu==1.29.0
 
 numpy>=2.0
 Pillow>=10.0
-pillow-heif>=0.18
+pillow-heif>=1.0
 opencv-python-headless>=4.8
 insightface>=0.7
 scikit-learn>=1.4

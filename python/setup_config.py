@@ -34,7 +34,7 @@ ORT_VERSION = '1.29.0'
 BASE_DEPS = [
     'numpy>=2.0',
     'pillow>=10.0',
-    'pillow-heif>=0.18',  # HEIC/HEIF (iPhone) photos; registered in classifiers/ and crops.py
+    'pillow-heif>=1.0',  # HEIC/HEIF (iPhone) photos; registered in classifiers/ and crops.py
     'opencv-python-headless>=4.8',
     'insightface>=0.7',
     'scikit-learn>=1.4',
@@ -171,8 +171,13 @@ def setup_venv(venv_dir, source_python=None, force=False, no_gpu=False):
         shutil.rmtree(venv_dir)
 
     if os.path.isfile(os.path.join(venv_dir, "bin", "python")):
-        print(f"  Venv already exists at {venv_dir}")
+        print(f"  Venv already exists at {venv_dir}; installing any missing dependency")
         print(f"  To force recreation: pass --force-venv or delete {venv_dir}")
+        # Adds BASE_DEPS added since the venv was built (e.g. pillow-heif). --no-deps:
+        # resolving deps would pull CPU `onnxruntime` for insightface over the GPU build
+        # (see install_onnxruntime_gpu); a new dep's own deps then fail verify_venv.py.
+        subprocess.run([os.path.join(venv_dir, "bin", "pip"), "install", "--no-cache-dir", "--no-deps"]
+                       + BASE_DEPS + DB_DEPS, check=True)
         return os.path.join(venv_dir, "bin", "python")
 
     print(f"  Creating venv with --copies (self-contained)...")

@@ -14,11 +14,13 @@ import stat
 import tempfile
 
 from PIL import Image
-from pillow_heif import register_heif_opener
-
 # HEIC/HEIF: pillow-heif applies irot/imir to the pixels and reports EXIF orientation 1
 # (checked 2026-11-06 on iPhone portraits), so raw == upright and nothing rotates twice.
-register_heif_opener()
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:  # an old venv must not take every classifier down; verify_venv.py flags it
+    logging.getLogger(__name__).warning("pillow-heif missing: HEIC/HEIF photos are not classified")
 
 log = logging.getLogger(__name__)
 
