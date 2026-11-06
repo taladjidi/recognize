@@ -2,6 +2,7 @@
 
 import errno
 import logging
+import multiprocessing as mp
 import os
 import shutil
 import signal
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ProcessPoolExecutor
 from types import SimpleNamespace
 
 import numpy as np
@@ -191,9 +193,12 @@ class TestMake:
         monkeypatch.setattr(thumbs, "MAX_PIXELS", 1000)
         for name in ("big.jpg", "big.png"):
             Image.new("RGB", (40, 30)).save(tmp_path / name)
+        Image.new("RGB", (40, 30)).save(tmp_path / "prog.jpg", progressive=True)
         assert _make(tmp_path, tmp_path / "big.jpg", fid=1)[1] == ("made", "")
         root, (status, detail) = _make(tmp_path, tmp_path / "big.png", "image/png", fid=2)
         assert status == "failed" and "over 1000 pixels" in detail
+        _, (status, detail) = _make(tmp_path, tmp_path / "prog.jpg", fid=3)
+        assert status == "failed" and "over 1000 pixels" in detail  # a progressive JPEG is decoded whole
 
     @pytest.mark.parametrize("exc", [
         subprocess.TimeoutExpired("ffmpeg", 20), MemoryError(), OSError(errno.EIO, "I/O error"),
@@ -230,12 +235,23 @@ class TestMake:
         assert _make(tmp_path, src)[1][0] == want
 
     def test_worker_init(self):
-        code = ("import ctypes, os, platform, thumbs; thumbs.worker_init()\n"
+        code = ("import ctypes, os, platform, thumbs; thumbs.worker_init('/x/ffmpeg')\n"
                 "nr = {'x86_64': 252, 'aarch64': 31}[platform.machine()]  # ioprio_get\n"
-                "print(os.nice(0), ctypes.CDLL(None).syscall(nr, 1, 0) >> 13, thumbs.Image.MAX_IMAGE_PIXELS)")
+                "print(os.nice(0), ctypes.CDLL(None).syscall(nr, 1, 0) >> 13, thumbs.Image.MAX_IMAGE_PIXELS,\n"
+                "      open('/proc/self/oom_score_adj').read().strip(), thumbs.FFMPEG)")
         out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
                              cwd=os.path.dirname(thumbs.__file__))
-        assert out.stdout.split() == ["19", "3", "None"]  # nice 19, IOPRIO_CLASS_IDLE
+        # nice 19, IOPRIO_CLASS_IDLE, Pillow's limit off, oom_score_adj 1000, the ffmpeg binary passed in
+        assert out.stdout.split() == ["19", "3", "None", "1000", "/x/ffmpeg"]
+
+    def test_job_timeout_kills_a_hung_decode(self):
+        code = ("import thumbs, time\n"
+                "thumbs.JOB_TIMEOUT = 1\n"
+                "thumbs._decode = lambda *a: time.sleep(30)\n"
+                "thumbs.make(('unused', 1, 'thumbs.py', 'image/jpeg', 0))")
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=20,
+                             cwd=os.path.dirname(thumbs.__file__))
+        assert out.returncode == -signal.SIGALRM, out  # make's alarm, not a 30 s wait then a marker
 
 
 # ── The service pass (sqlite) ──────────────────────────────────────────
@@ -261,6 +277,7 @@ def env(tmp_path):
     svc.pipeline = SimpleNamespace(stopping=threading.Event())
     svc.thumb_root, svc.thumb_workers, svc._thumb_root_warned = str(root), 1, False
     svc._thumb_enospc_logged, svc._thumb_suspects = False, set()
+    svc._thumb_retries, svc.ffmpeg_binary = {}, thumbs.FFMPEG
     yield svc, db, data
     db.close()
 
@@ -281,6 +298,7 @@ def _file(env, fid, storage, path, mime=1, mtime=MTIME, content=None):
 
 MIMEPART = {1: 3, 2: 6, 3: 3, 4: 5, 5: 5, 6: 6}  # as Nextcloud fills filecache.mimepart
 CRASH, SLOW, FULL = 13, 14, 15
+HANG, RETRY = 20, 18
 
 
 def _fake_make(job):
@@ -289,6 +307,12 @@ def _fake_make(job):
         os.kill(os.getpid(), signal.SIGKILL)
     if job[1] == SLOW:
         time.sleep(60)
+    if job[1] == HANG:
+        thumbs.JOB_TIMEOUT = 2
+        signal.alarm(2)
+        time.sleep(60)
+    if job[1] == RETRY:
+        return "retry", "x"
     if job[1] == FULL:
         return "nospace", f"{job[1]}: [Errno 28] No space left on device"
     return thumbs.make(job)
@@ -482,3 +506,130 @@ class TestPass:
         svc, db, _ = env
         shutil.rmtree(svc.thumb_root)
         assert not svc._thumb_pass(db) and svc._thumb_root_warned
+
+
+def _kids():
+    """Pids whose parent is this process (the pool workers and their ffmpeg children), minus the resource tracker."""
+    me = str(os.getpid())
+    out = []
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            try:
+                st = open(f"/proc/{p}/stat").read().rsplit(") ", 1)[1].split()
+                cmd = open(f"/proc/{p}/cmdline", "rb").read()
+            except OSError:
+                continue
+            if st[1] == me and b"resource_tracker" not in cmd:
+                out.append(int(p))
+    return out
+
+
+def _running(argv):
+    """Pids whose command line starts with argv (bytes list)."""
+    out = []
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            try:
+                cmd = open(f"/proc/{p}/cmdline", "rb").read().split(b"\0")
+            except OSError:
+                continue
+            if cmd[:len(argv)] == argv:
+                out.append(int(p))
+    return out
+
+
+def _wait_for(pred, seconds=10):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if pred():
+            return True
+        time.sleep(0.1)
+    return pred()
+
+
+def test_systemd_stop_marks_no_healthy_file_failed(env, monkeypatch):
+    """systemd's SIGTERM reaches the pool workers too: the BrokenProcessPool they cause is not the file's fault."""
+    svc, db, _ = env
+    _file(env, SLOW, 1, "files/slow.jpg")  # healthy, just slow (sleeps 60 in the fake)
+    svc._thumb_suspects = {SLOW}           # was in flight when some other file crashed a pool
+    svc._signalled, svc._running = False, True
+    svc._watcher = threading.Thread(target=svc._watch_signal, daemon=True)
+    svc._watcher.start()
+    monkeypatch.setattr(thumbs, "make", _fake_make)
+
+    def systemd_stop():
+        time.sleep(4)
+        for k in _kids():
+            os.kill(k, signal.SIGTERM)  # systemd: SIGTERM to every process in the cgroup
+        svc._handle_signal(signal.SIGTERM, None)
+    threading.Thread(target=systemd_stop, daemon=True).start()
+    assert _run_pass(svc, db) is False
+    assert thumbs.state(svc.thumb_root, SLOW, MTIME) != "failed", "healthy file got a permanent fail marker"
+
+
+def test_suspects_survive_a_stop(env, monkeypatch):
+    """A stop in the suspect loop keeps the suspects not yet retried, for the next pass."""
+    svc, db, _ = env
+    _file(env, SLOW, 1, "files/slow.jpg")
+    _file(env, 16, 1, "files/next.jpg")
+    svc._thumb_suspects = {SLOW, 16}
+    monkeypatch.setattr(thumbs, "make", _fake_make)
+    threading.Timer(2, svc.pipeline.stopping.set).start()
+    assert _run_pass(svc, db) is False
+    assert svc._thumb_suspects == {SLOW, 16}
+
+
+def test_hung_decode_is_aborted_then_marked(env, monkeypatch):
+    svc, db, _ = env
+    _file(env, HANG, 1, "files/hang.jpg")
+    monkeypatch.setattr(thumbs, "make", _fake_make)
+    assert _run_pass(svc, db) is False  # the worker is killed by its alarm: the pass aborts
+    assert thumbs.state(svc.thumb_root, HANG, MTIME) == "todo"
+    _run_pass(svc, db)                  # alone, it kills its worker again: marked
+    assert thumbs.state(svc.thumb_root, HANG, MTIME) == "failed"
+
+
+def test_retries_are_bounded(env, monkeypatch):
+    svc, db, _ = env
+    _file(env, RETRY, 1, "files/retry.jpg")
+    monkeypatch.setattr(thumbs, "make", _fake_make)
+    _run_pass(svc, db)
+    _run_pass(svc, db)
+    assert thumbs.state(svc.thumb_root, RETRY, MTIME) == "todo"
+    _run_pass(svc, db)
+    assert thumbs.state(svc.thumb_root, RETRY, MTIME) == "failed"
+
+
+def test_service_passes_ffmpeg_to_its_workers(env, tmp_path):
+    svc, db, _ = env
+    marker = tmp_path / "ran"
+    fake = tmp_path / "ffmpeg"
+    fake.write_text(f"#!/bin/sh\necho ran > {marker}\n")  # no frame on stdout: the file fails, the marker proves the call
+    fake.chmod(0o755)
+    svc.ffmpeg_binary = str(fake)
+    _file(env, 19, 1, "files/clip.mp4", mime=4, content=b"not a video")
+    _run_pass(svc, db)
+    assert marker.exists()
+    assert thumbs.state(svc.thumb_root, 19, MTIME) == "failed"
+
+
+def test_ffmpeg_dies_with_its_worker(tmp_path):
+    """A worker killed mid-decode takes its ffmpeg child with it (PR_SET_PDEATHSIG)."""
+    fake = tmp_path / "ffmpeg"
+    fake.write_text("#!/bin/sh\nexec sleep 91\n")
+    fake.chmod(0o755)
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"x")
+    argv = [b"sleep", b"91"]
+    pool = ProcessPoolExecutor(1, mp_context=mp.get_context("spawn"), initializer=thumbs.worker_init,
+                               initargs=(str(fake),))
+    try:
+        pool.submit(thumbs.make, (str(tmp_path), 7, str(src), "video/mp4", MTIME))
+        assert _wait_for(lambda: _running(argv)), "the fake ffmpeg never started"
+        for p in pool._processes.values():
+            os.kill(p.pid, signal.SIGKILL)
+        assert _wait_for(lambda: not _running(argv)), "ffmpeg outlived its worker"
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        for pid in _running(argv):
+            os.kill(pid, signal.SIGKILL)

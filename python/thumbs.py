@@ -13,6 +13,7 @@ import logging
 import os
 import platform
 import re
+import signal
 import subprocess
 from io import BytesIO
 
@@ -31,18 +32,30 @@ VIDEO_SEEK = "1"  # seconds: past fade-ins; clips shorter than this fall back to
 VIDEO_TIMEOUT = 20
 NAME_RE = re.compile(r"^([0-9]+)(?:-(?:%s)\.jpg|\.fail)$" % "|".join(map(str, SIZES)))
 TMP_RE = re.compile(r"^\..*\.tmp$")  # crops.atomic_write temp names
-MAX_PIXELS = 10**9  # non-JPEG ceiling (a full decode, ~3 GB in RGB); JPEGs are drafted to 1/8 and have none
+MAX_PIXELS = 150_000_000  # a full decode of anything but a baseline JPEG (~450 MB RGB at this size)
+JOB_TIMEOUT = 600  # seconds per file: SIGALRM ends a hung decode, the pass then marks it
 # Failures that say nothing about the file: no marker, retried next pass.
 TRANSIENT_ERRNOS = {errno.EIO, errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.EAGAIN}
 IOPRIO_SET = {"x86_64": 251, "aarch64": 30}  # syscall numbers
 _last_refusal = None
 
 
-def worker_init():
+def _die_with_parent():
+    ctypes.CDLL(None).prctl(1, 9)  # PR_SET_PDEATHSIG, SIGKILL
+
+
+def worker_init(ffmpeg=FFMPEG):
     """Pool initializer: nice 19 and the idle I/O class, so decoding yields to classification and
     Nextcloud; Pillow's own pixel limit off, _decode applies MAX_PIXELS."""
+    global FFMPEG
+    FFMPEG = ffmpeg
     os.nice(19)
     Image.MAX_IMAGE_PIXELS = None
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:  # the kernel kills a decoder, not the daemon
+            f.write("1000")
+    except OSError:
+        pass
     nr = IOPRIO_SET.get(platform.machine())
     if nr:  # best effort: ioprio_set(IOPRIO_WHO_PROCESS, this process, IOPRIO_CLASS_IDLE << 13)
         ctypes.CDLL(None, use_errno=True).syscall(nr, 1, 0, 3 << 13)
@@ -83,7 +96,8 @@ def _video_frame(src):
         out = subprocess.run(
             [FFMPEG, "-nostdin", "-v", "error", *seek, "-i", src, "-an", "-sn", "-dn",
              "-frames:v", "1", "-f", "image2pipe", "-c:v", "ppm", "-"],
-            capture_output=True, timeout=VIDEO_TIMEOUT, check=False)
+            capture_output=True, timeout=VIDEO_TIMEOUT, check=False,
+            preexec_fn=_die_with_parent)  # a killed worker must not leave a 20 s ffmpeg behind
         if out.stdout:  # a seek past the end exits 0 with no frame
             return Image.open(BytesIO(out.stdout))
     raise ValueError(f"ffmpeg gave no frame: {out.stderr[-200:]!r}")
@@ -97,12 +111,12 @@ def _decode(src, mimetype, box):
     else:
         with Image.open(src) as im:
             w, h = im.size
+            if w * h > MAX_PIXELS and (im.format != "JPEG" or im.info.get("progressive")):
+                raise ValueError(f"{w}x{h} is over {MAX_PIXELS} pixels (only a baseline JPEG is decoded reduced)")
             if im.format == "JPEG":
                 # Smallest DCT scale that still covers the fitted size: decodes 2-8x less.
                 f = min(1.0, box / max(w, h))
                 im.draft("RGB", (max(1, int(w * f)), max(1, int(h * f))))
-            elif w * h > MAX_PIXELS:
-                raise ValueError(f"{w}x{h} is over {MAX_PIXELS} pixels")
             icc = im.info.get("icc_profile")
             orientation = im.getexif().get(0x0112, 1)  # read before the pixels: TIFF keeps it in the file
             if im.mode in ("P", "PA"):
@@ -159,9 +173,10 @@ def make(job):
     no memory, an I/O error: both retried next pass, no marker), 'nospace' (thumb disk full) or
     'error' (writing failed). Never raises."""
     root, fileid, src, mimetype, mtime = job
-    if not os.access(src, os.R_OK):
-        return "missing", src
+    signal.alarm(JOB_TIMEOUT)  # SIGALRM's default action kills a hung decoder: the pass sees BrokenProcessPool
     try:
+        if not os.access(src, os.R_OK):
+            return "missing", src
         try:
             im, icc = _decode(src, mimetype, SIZES[-1])
         except Exception as e:  # anything the decoders throw: corrupt, truncated, unsupported
@@ -185,6 +200,8 @@ def make(job):
         return "nospace" if e.errno in (errno.ENOSPC, errno.EDQUOT) else "error", f"{fileid}: {e}"
     except Exception as e:
         return "error", f"{fileid}: {e}"
+    finally:
+        signal.alarm(0)
 
 
 def remove_orphans(root, keep):

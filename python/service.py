@@ -108,6 +108,8 @@ class Service:
         self._thumb_root_warned = False
         self._thumb_enospc_logged = False
         self._thumb_suspects = set()   # fileids in flight when a decoder process died: retried alone
+        self._thumb_retries = {}       # fileid -> passes that ended in 'retry'; the third marks it failed
+        self.ffmpeg_binary = ffmpeg_binary  # worker_init gives it to each decoder pool worker
         self._thumb_thread = None
         self._signalled = False        # set by the signal handler; a watcher thread turns it into the Event
         self._watcher = None
@@ -618,11 +620,18 @@ class Service:
             db.rollback()
         # A file in flight when a decoder died runs alone first: if it kills that one too, it is the cause.
         suspects, self._thumb_suspects = self._thumb_suspects, set()
+        left = set(suspects)  # not yet run alone: kept for the next pass if this one stops early
         for job in [j for j in jobs if j[1] in suspects]:
             try:
                 if not self._thumb_run([job], 1, counts, errors):
+                    self._thumb_suspects |= left
                     return False
+                left.discard(job[1])
             except BrokenProcessPool:
+                if stop.wait(1):  # systemd's SIGTERM reaches the workers too: not the file's fault
+                    self._thumb_suspects |= left
+                    return False
+                left.discard(job[1])
                 self._thumb_suspects.discard(job[1])
                 thumbs.mark_failed(job[0], job[1], job[4])
                 counts["failed"] += 1
@@ -632,6 +641,8 @@ class Service:
             if not self._thumb_run([j for j in jobs if j[1] not in suspects], self.thumb_workers, counts, errors):
                 return False
         except BrokenProcessPool:
+            if stop.wait(1):  # systemd's SIGTERM reaches the workers too: not the file's fault
+                return False
             log.error("Thumbnails: a decoder process died (out of memory, a crash) with %d files in flight; "
                       "pass aborted, they run alone next pass", len(self._thumb_suspects))
             return False
@@ -656,7 +667,8 @@ class Service:
             return True
         stop = self.pipeline.stopping
         # spawn: never fork the CUDA-holding parent; worker_init: nice 19, idle I/O
-        pool = ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), initializer=thumbs.worker_init)
+        pool = ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), initializer=thumbs.worker_init,
+                                   initargs=(self.ffmpeg_binary,))
         pending, todo = {}, iter(jobs)
         try:
             while True:
@@ -669,7 +681,18 @@ class Service:
                     return False
                 for f in done:
                     status, detail = f.result()
-                    del pending[f]
+                    job = pending.pop(f)
+                    if status == "retry":
+                        n = self._thumb_retries[job[1]] = self._thumb_retries.get(job[1], 0) + 1
+                        if n >= 3:
+                            try:
+                                thumbs.mark_failed(job[0], job[1], job[4])
+                            except OSError:
+                                pass
+                            del self._thumb_retries[job[1]]
+                            status = "failed"
+                    elif status in ("made", "failed"):
+                        self._thumb_retries.pop(job[1], None)
                     counts[status] += 1
                     if status == "made":
                         self._thumb_enospc_logged = False
