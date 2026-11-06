@@ -132,6 +132,41 @@ def crop_path(root, user_id, detection_id):
     return os.path.join(d, f"{detection_id}.jpg")
 
 
+def atomic_write(path, data, mtime=None):
+    """Write data to path via a temp file and rename (mtime set before the rename). Raises OSError.
+
+    The parent dir is created when missing; its parent (the root) must exist."""
+    d = os.path.dirname(path)
+    if not os.path.isdir(d):
+        # Root itself must exist (deploy.sh, apache:nginx 2750): never created here. mkdir
+        # inherits its setgid group, so files land group nginx. No chmod unless the umask
+        # took bits: apache is not in group nginx, so its chmod would clear S_ISGID.
+        try:
+            os.mkdir(d, 0o750)
+        except FileExistsError:  # a concurrent writer made it
+            pass
+        mode = os.stat(d).st_mode
+        if mode & 0o777 != 0o750:
+            os.chmod(d, 0o750 | (mode & stat.S_ISGID))
+            if mode & stat.S_ISGID and not os.stat(d).st_mode & stat.S_ISGID:
+                log.warning("umask took bits of %s and fixing them cleared setgid: nginx may get 403", d)
+    # shortcut: no fsync; a file torn by a power cut is 0 bytes and the backfill redoes it.
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), 0o640)
+            f.write(data)
+        if mtime is not None:
+            os.utime(tmp, (mtime, mtime))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_crop(root, user_id, detection_id, data, overwrite=False):
     """Atomically write one crop; False (logged) on any failure or an existing crop (unless overwrite)."""
     global _enospc_logged
@@ -139,35 +174,13 @@ def write_crop(root, user_id, detection_id, data, overwrite=False):
     if path is None:
         log.warning("Refusing face crop path for user %r, detection %r", user_id, detection_id)
         return False
-    d = os.path.dirname(path)
-    tmp = None
+    if not overwrite and has_crop(root, user_id, detection_id):
+        return False
     try:
-        if not os.path.isdir(d):
-            # Root itself must exist (deploy.sh, apache:nginx 2750): never created here. mkdir
-            # inherits its setgid group, so files land group nginx. No chmod unless the umask
-            # took bits: apache is not in group nginx, so its chmod would clear S_ISGID.
-            os.mkdir(d, 0o750)
-            mode = os.stat(d).st_mode
-            if mode & 0o777 != 0o750:
-                os.chmod(d, 0o750 | (mode & stat.S_ISGID))
-                if mode & stat.S_ISGID and not os.stat(d).st_mode & stat.S_ISGID:
-                    log.warning("umask took bits of %s and fixing them cleared setgid: nginx may get 403", d)
-        if not overwrite and has_crop(root, user_id, detection_id):
-            return False
-        # shortcut: no fsync; a crop torn by a power cut is 0 bytes and the backfill redoes it.
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=".", suffix=".tmp")
-        with os.fdopen(fd, "wb") as f:
-            os.fchmod(f.fileno(), 0o640)
-            f.write(data)
-        os.replace(tmp, path)
+        atomic_write(path, data)
         _enospc_logged = False
         return True
     except OSError as e:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
         if e.errno in (errno.ENOSPC, errno.EDQUOT):
             if not _enospc_logged:
                 log.error("No space left for face crops in %s; skipping crops until a write succeeds", root)

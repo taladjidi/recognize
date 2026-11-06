@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 import api_server
+import thumbs
 from api_server import crop_url, get_cluster, list_clusters, make_server, verify_token
 from db import DB
 
@@ -537,3 +538,105 @@ def test_crop_files_are_stat_ed_after_the_db_slot_is_released(config, db, tmp_pa
     assert api.handle("/v1/clusters", {}, token)[0] == 200
     assert api.handle("/v1/clusters/1", {}, token)[0] == 200
     assert held and not any(held)
+
+
+# ── Grid thumbnails ────────────────────────────────────────────────────
+
+def _thumbs_on_disk(root, fid, mtime):
+    for s in thumbs.SIZES:
+        p = os.path.join(root, thumbs.thumb_name(fid, s))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(b"jpg")
+        os.utime(p, (mtime, mtime))
+
+
+class TestThumbs:
+    @pytest.fixture
+    def api(self, config, db, tmp_path):
+        api = api_server.Api(config)
+        api.thumb_root = str(tmp_path / "thumbs")
+        # filecache mtimes: 10 -> 100, 11 -> 200, 12 (alice's trash) -> 300, 20 (bob) -> 400, 30 (carol S3) -> 500
+        for fid, mtime in ((10, 100), (11, 199), (12, 300), (20, 400), (30, 500)):
+            _thumbs_on_disk(api.thumb_root, fid, mtime)  # 11 is stale
+        return api
+
+    def call(self, api, ids, uid="alice"):
+        qs = {"ids": [ids]} if ids is not None else {}
+        return api.handle("/v1/thumbs", qs, mint(uid, exp=int(time.time()) + 250))
+
+    def test_only_own_current_thumbs(self, api):
+        status, body = self.call(api, "10,11,12,20,30,999,10")
+        assert status == 200 and list(body) == ["10"]
+        assert set(body["10"]) == {"256", "1024"}
+        u = urlsplit(body["10"]["1024"])
+        assert u.path == "/recognize-thumbs/10/10-1024.jpg" and parse_qs(u.query)["v"] == ["100"]
+        assert list(self.call(api, "10,20", uid="bob")[1]) == ["20"]
+        assert list(self.call(api, "30", uid="carol")[1]) == ["30"]  # object-storage home
+
+    def test_missing_size_means_absent(self, api):
+        os.unlink(os.path.join(api.thumb_root, thumbs.thumb_name(10, 256)))
+        assert self.call(api, "10") == (200, {})
+
+    @pytest.mark.parametrize("ids", [None, "", "a", "1,a", "1,,2", ",1", "1,", "-1", "1.5", "1;2", " 1",
+                                     "1234567890123456789", "1,+2", "1_0", "1, 2", "1,\u0661", ",".join(["1"] * 501)])
+    def test_bad_ids_are_400(self, api, ids):
+        assert self.call(api, ids)[0] == 400
+
+    def test_500_ids_ok(self, api):
+        status, body = self.call(api, ",".join(str(i) for i in range(1, 501)))
+        assert status == 200 and list(body) == ["10"]
+
+    def test_stat_after_db_slot_released(self, api, monkeypatch):
+        held, real = [], thumbs.is_fresh
+        monkeypatch.setattr(thumbs, "is_fresh",
+                            lambda *a: held.append(api._db_slots._value < api_server.DB_SLOTS) or real(*a))
+        assert self.call(api, "10")[0] == 200
+        assert held and not any(held)
+
+    def test_http(self, server):
+        status, headers, body = get(server, "/v1/thumbs?ids=10,11")
+        assert status == 200 and headers["Cache-Control"] == "private, no-store"
+        assert body == {}  # no thumb files under this server's root
+        assert get(server, "/v1/thumbs?ids=x")[0] == 400
+        assert get(server, "/v1/thumbs?ids=10", uid=None)[0] == 401
+
+
+class TestThumbUrl:
+    def test_signature_is_nginx_secure_link_md5(self):
+        parts = urlsplit(api_server.thumb_url(1234, 256, 777, "secret", now=NOW))
+        q = parse_qs(parts.query)
+        assert parts.path == "/recognize-thumbs/34/1234-256.jpg"
+        want = base64.urlsafe_b64encode(hashlib.md5(
+            f"{q['expires'][0]}/recognize-thumbs/34/1234-256.jpg secret".encode()).digest()).rstrip(b"=").decode()
+        assert q["md5"] == [want] and q["v"] == ["777"]
+
+    @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl not installed")
+    def test_matches_openssl(self):
+        url = api_server.thumb_url(5, 1024, 1, "s3", now=NOW)
+        out = subprocess.run(["openssl", "md5", "-binary"], input=b"1700092800/recognize-thumbs/05/5-1024.jpg s3",
+                             capture_output=True, check=True).stdout
+        want = base64.b64encode(out).decode().replace("+", "-").replace("/", "_").rstrip("=")
+        assert url == f"/recognize-thumbs/05/5-1024.jpg?md5={want}&expires=1700092800&v=1"
+
+    def test_expires_in_whole_days_one_to_two_ahead(self):
+        day = NOW // 86400 * 86400
+        for now in (day, NOW, day + 86399):
+            exp = int(parse_qs(urlsplit(api_server.thumb_url(1, 256, 1, "s", now=now)).query)["expires"][0])
+            assert exp == day + 2 * 86400
+        assert api_server.thumb_url(1, 256, 1, "s", now=day + 86400) != api_server.thumb_url(1, 256, 1, "s", now=day)
+
+
+def test_thumb_location_keeps_security_headers_and_root():
+    import setup_config
+    conf = setup_config.generate_nginx_conf({"crop_link_secret": "S3", "thumb_root": "/srv/thumbs/"})
+    loc = conf[conf.index("location ^~ /recognize-thumbs/"):]
+    loc = loc[:loc.index("\n}")]
+    for line in ('secure_link_md5 "$secure_link_expires$uri S3";', "alias /srv/thumbs/;",
+                 'add_header Cache-Control "private, max-age=86400";',
+                 'add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;',
+                 "add_header Referrer-Policy no-referrer always;", 'add_header X-Robots-Tag "noindex, nofollow";',
+                 "add_header X-Content-Type-Options nosniff;", "access_log off;",
+                 'if ($secure_link = "") { return 403; }', 'if ($secure_link = "0") { return 410; }'):
+        assert line in loc
+    assert "alias /var/lib/nextcloud/recognize-thumbs/;" in setup_config.generate_nginx_conf({"crop_link_secret": "S"})

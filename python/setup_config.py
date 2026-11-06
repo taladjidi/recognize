@@ -66,6 +66,7 @@ OUTPUT_API_SERVICE = os.path.join(SCRIPT_DIR, "recognize-api.service")
 NGINX_TEMPLATE = os.path.join(SCRIPT_DIR, "nginx-recognize.conf.template")
 OUTPUT_NGINX = os.path.join(SCRIPT_DIR, "nginx-recognize.conf")
 DEFAULT_CROP_ROOT = "/var/lib/nextcloud/recognize-faces"
+DEFAULT_THUMB_ROOT = "/var/lib/nextcloud/recognize-thumbs"  # = thumbs.DEFAULT_THUMB_ROOT, copied as the crop root is
 DEFAULT_API_PORT = 8291
 # Kept across runs: rotating them would log every user out of the Faces API / break cached crop links.
 KEPT_SECRETS = ("api_token_secret", "crop_link_secret")
@@ -269,7 +270,8 @@ def generate_nginx_conf(config):
     return (template
             .replace("__API_PORT__", str(int(config.get("api_port") or DEFAULT_API_PORT)))
             .replace("__CROP_LINK_SECRET__", config["crop_link_secret"])
-            .replace("__CROP_ROOT__", config.get("face_crop_root", DEFAULT_CROP_ROOT).rstrip("/")))
+            .replace("__CROP_ROOT__", config.get("face_crop_root", DEFAULT_CROP_ROOT).rstrip("/"))
+            .replace("__THUMB_ROOT__", config.get("thumb_root", DEFAULT_THUMB_ROOT).rstrip("/")))
 
 
 def read_existing_config():
@@ -369,6 +371,7 @@ def main():
         if not nc_config.get(key):
             nc_config[key] = secrets.token_urlsafe(32)
     nc_config.setdefault("face_crop_root", DEFAULT_CROP_ROOT)
+    nc_config.setdefault("thumb_root", DEFAULT_THUMB_ROOT)
     nc_config.setdefault("api_port", DEFAULT_API_PORT)
     nc_config |= {
         "dbtype": nc_php_config["dbtype"],

@@ -39,6 +39,11 @@ CROP_THREAD_PAUSE = 0.5      # the crop thread rests this long between ticks (bo
 CROP_RESCAN_INTERVAL = 3600  # after a full backfill pass and cleanup round, rest this long
 CROP_LOG_EVERY = 500         # INFO line every N crops created by the backfill
 
+# Photos grid thumbnails (thumbs.py): full pass over every image/video, then rest
+THUMB_PAGE = 1000            # candidates per DB page
+THUMB_INTERVAL = 120         # seconds between passes
+THUMB_WORKERS = 3            # decode processes (nice 19), config key thumb_workers
+
 
 class Service:
     """Main service daemon."""
@@ -94,6 +99,11 @@ class Service:
         self._crop_rest_until = 0.0
         self._crop_root_warned = False
         self._crop_thread = None
+        from thumbs import DEFAULT_THUMB_ROOT
+        self.thumb_root = self.config.get("thumb_root") or DEFAULT_THUMB_ROOT
+        self.thumb_workers = int(self.config.get("thumb_workers") or THUMB_WORKERS)
+        self._thumb_root_warned = False
+        self._thumb_thread = None
         self._signalled = False        # set by the signal handler; a watcher thread turns it into the Event
         self._watcher = None
 
@@ -103,6 +113,8 @@ class Service:
         self._setup_signals()
         self._crop_thread = threading.Thread(target=self._crop_loop, name="crops", daemon=True)
         self._crop_thread.start()
+        self._thumb_thread = threading.Thread(target=self._thumb_loop, name="thumbs", daemon=True)
+        self._thumb_thread.start()
 
         log.info("Service starting (models_dir=%s)", self.models_dir)
 
@@ -118,8 +130,9 @@ class Service:
         self._running = False
         log.info("Service stopping")
         self.pipeline.stopping.set()
-        if self._crop_thread:
-            self._crop_thread.join(timeout=5)
+        for t in (self._crop_thread, self._thumb_thread):
+            if t:
+                t.join(timeout=5)  # the thumb pool's daemonic workers die with the process
         self.pipeline.close()
         log.info("Service stopped")
 
@@ -536,6 +549,93 @@ class Service:
             if removed:
                 log.info("Face crops: removed %d orphans for %s", removed, user)
         return not self._crop_users
+
+    def _thumb_loop(self):
+        """Thumbnail thread: a full pass every THUMB_INTERVAL s on its own DB connection. Never raises."""
+        from db import DB
+        db = None
+        while not self.pipeline.stopping.is_set():
+            try:
+                if db is None:
+                    db = DB(self.config)
+                db.ping()
+                self._thumb_pass(db)
+            except Exception as e:
+                log.error("Thumbnail thread: %s", e)
+                try:
+                    db and db.close()
+                except Exception:
+                    pass
+                db = None
+            self._sleep(THUMB_INTERVAL)
+        try:
+            db and db.close()
+        except Exception:
+            pass
+
+    def _thumb_pass(self, db):
+        """Make missing or stale thumbs for every candidate, then delete orphans; True when complete.
+
+        Orphans are only deleted after a full walk: a pass cut short (SIGTERM, error) knows too little."""
+        import thumbs
+        if not os.path.isdir(self.thumb_root):
+            if not self._thumb_root_warned:
+                log.warning("Thumbnail root %s missing (run deploy.sh); no grid thumbnails", self.thumb_root)
+                self._thumb_root_warned = True
+            return False
+        if db.check_maintenance_mode():  # filecache may be mid-migration: deleting orphans now is unsafe
+            return False
+        stop = self.pipeline.stopping
+        t0 = time.monotonic()
+        counts = dict.fromkeys(("fresh", "marked", "made", "failed", "missing", "error", "remote"), 0)
+        errors = []
+        seen = set()
+        pool = None
+        try:
+            after = 0
+            while True:
+                try:
+                    rows = db.thumb_candidates(after, THUMB_PAGE)
+                finally:
+                    db.rollback()  # never hold a snapshot while decoding (MariaDB REPEATABLE READ)
+                if not rows:
+                    break
+                after = rows[-1]["fileid"]
+                jobs = []
+                for r in rows:
+                    fid = r["fileid"]
+                    seen.add(fid)
+                    if r["path"] is None:
+                        counts["remote"] += 1
+                        continue
+                    st = thumbs.state(self.thumb_root, fid, r["mtime"])
+                    if st == "todo":
+                        jobs.append((self.thumb_root, fid, r["path"], r["mimetype"], r["mtime"]))
+                    else:
+                        counts["fresh" if st == "fresh" else "marked"] += 1
+                if jobs:
+                    if pool is None:  # spawn: never fork the CUDA-holding parent; nice 19 yields to classification
+                        pool = mp.get_context("spawn").Pool(self.thumb_workers, initializer=os.nice, initargs=(19,))
+                    for status, detail in pool.imap_unordered(thumbs.make, jobs):
+                        counts[status] += 1
+                        if status in ("failed", "error") and len(errors) < 3:
+                            errors.append(detail)
+                        if stop.is_set():
+                            return False
+                if stop.is_set():
+                    return False
+        finally:
+            if pool is not None:
+                pool.terminate()
+                pool.join()
+        removed = thumbs.remove_orphans(self.thumb_root, seen)
+        changed = counts["made"] or counts["failed"] or counts["error"] or removed
+        log.log(logging.INFO if changed else logging.DEBUG,  # an idle pass every 2 min stays out of the journal
+                "Thumbnails: %d files, %d fresh, %d made, %d failed (+%d known), %d missing, %d not local, "
+                "%d write errors, %d orphans removed in %.1f s%s", len(seen), counts["fresh"], counts["made"],
+                counts["failed"], counts["marked"], counts["missing"], counts["remote"], counts["error"],
+                removed, time.monotonic() - t0, f"; first: {'; '.join(errors)}" if errors else "")
+        return True
 
     def _sleep(self, seconds):
         """Wait, but wake at once on SIGTERM: POLL_MAX_INTERVAL equals systemd's stop timeout."""

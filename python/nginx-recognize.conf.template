@@ -25,5 +25,21 @@ location ^~ /recognize-faces/ {
     access_log off;
 }
 
+# Photos grid thumbnails (python/thumbs.py), same signature and secret as the face crops.
+location ^~ /recognize-thumbs/ {
+    secure_link $arg_md5,$arg_expires;
+    secure_link_md5 "$secure_link_expires$uri __CROP_LINK_SECRET__";
+    if ($secure_link = "") { return 403; }
+    if ($secure_link = "0") { return 410; }
+    alias __THUMB_ROOT__/;
+    # Any add_header here drops all the server-level ones: these are copied from nextcloud.conf.
+    add_header Cache-Control "private, max-age=86400";
+    add_header X-Content-Type-Options nosniff;
+    add_header X-Robots-Tag "noindex, nofollow";
+    add_header Referrer-Policy no-referrer always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+    access_log off;
+}
+
 # Defense in depth: the app's python/ dir (nc_config.json holds the DB password) is never served.
 location ^~ /apps/recognize/python/ { deny all; }

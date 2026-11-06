@@ -503,6 +503,25 @@ class DB:
             r["path"] = self._resolve_storage_path(r.pop("storage_id_str"), r["path"], self._config["datadirectory"])
         return rows
 
+    def thumb_candidates(self, after_id: int, limit: int) -> list[dict]:
+        """Owners' non-empty image/* and video/* files (files/, home:: or object::user:, as api_server
+        _owned) with fileid > after_id, by fileid: {fileid, path, mimetype, mtime, size}, path absolute
+        or None when not on local disk. Roll back after each page: a held MySQL snapshot hides new files."""
+        fc, s, m = self._table("filecache"), self._table("storages"), self._table("mimetypes")
+        cur = self._execute(
+            f"SELECT fc.fileid, fc.path, m.mimetype, fc.mtime, fc.size, s.id AS storage_id_str FROM {fc} fc "
+            f"JOIN {s} s ON fc.storage = s.numeric_id JOIN {m} m ON fc.mimetype = m.id "
+            f"WHERE fc.fileid > {self._ph()} AND fc.path LIKE 'files/%' AND fc.size > 0 "
+            f"AND (s.id LIKE 'home::%' OR s.id LIKE 'object::user:%') "
+            f"AND (m.mimetype LIKE 'image/%' OR m.mimetype LIKE 'video/%') "
+            f"ORDER BY fc.fileid LIMIT {int(limit)}",
+            (after_id,),
+        )
+        rows = self._fetchall_dicts(cur)
+        for r in rows:
+            r["path"] = self._resolve_storage_path(r.pop("storage_id_str"), r["path"], self._config["datadirectory"])
+        return rows
+
     def get_app_value(self, key: str) -> str | None:
         t = self._table("appconfig")
         row = self._execute(

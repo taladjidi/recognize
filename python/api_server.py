@@ -4,7 +4,8 @@
 Stdlib HTTP server on 127.0.0.1, reached through nginx at /recognize-api/.
 Auth is a short-lived bearer token minted by lib/Service/FacesToken.php;
 every query is scoped to the token's uid and to files in that user's home
-storage under files/ (not trash). Covers and crops are nginx secure_link URLs.
+storage under files/ (not trash). Covers, crops and grid thumbnails are nginx
+secure_link URLs.
 
     python api_server.py /path/to/nc_config.json
 """
@@ -25,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
 import config as nc_config
+import thumbs
 from crops import DEFAULT_CROP_ROOT
 from db import COVER_CANDIDATES, DB, cover_order
 
@@ -35,6 +37,8 @@ TOKEN_MAX_TTL = 300  # lib/Service/FacesToken.php TTL
 CLOCK_SKEW = 60
 CROP_PREFIX = "/recognize-faces"
 CROP_TTL = 6 * 3600
+THUMB_PREFIX = "/recognize-thumbs"
+MAX_THUMB_IDS = 500
 MAX_Q = 100
 MAX_LIMIT = 1000
 POOL_IDLE = 8
@@ -45,6 +49,7 @@ HANDLER_WAIT = 5.0
 USER_CACHE_TTL = 60
 _B64URL = re.compile(r"[A-Za-z0-9_-]+")
 _CLUSTER_PATH = re.compile(r"/v1/clusters/(\d{1,18})")
+_IDS = re.compile(r"[0-9]{1,18}(?:,[0-9]{1,18})*")
 
 
 # ── Tokens and signed links ─────────────────────────────────────────────
@@ -81,31 +86,52 @@ def verify_token(header: str | None, secret: str, now: float | None = None) -> s
     return uid
 
 
+def _signed(uri: str, expires: int, secret: str) -> str:
+    """nginx secure_link query: md5 = b64url(md5("$secure_link_expires$uri <secret>")), $uri decoded."""
+    return f"md5={b64url(hashlib.md5(f'{expires}{uri} {secret}'.encode()).digest())}&expires={expires}"
+
+
 def crop_url(uid: str, detection_id: int, secret: str, now: float | None = None) -> str:
-    """nginx secure_link URL: md5 = b64url(md5("$secure_link_expires$uri <secret>")), $uri decoded."""
     now = time.time() if now is None else now
     # Next hourly boundary + 6 h: every link minted within the same hour is identical, so browsers cache it.
     expires = (int(now) // 3600 + 1) * 3600 + CROP_TTL
     name = f"{int(detection_id)}.jpg"
-    digest = hashlib.md5(f"{expires}{CROP_PREFIX}/{uid}/{name} {secret}".encode()).digest()
-    return f"{CROP_PREFIX}/{quote(uid, safe='')}/{name}?md5={b64url(digest)}&expires={expires}"
+    return f"{CROP_PREFIX}/{quote(uid, safe='')}/{name}?{_signed(f'{CROP_PREFIX}/{uid}/{name}', expires, secret)}"
+
+
+def thumb_url(fileid: int, size: int, mtime: int, secret: str, now: float | None = None) -> str:
+    """Signed link to a grid thumb; v (unsigned) changes with the file, so the browser refetches."""
+    now = time.time() if now is None else now
+    # Whole UTC days, 1-2 days ahead: the URL is the same all day, so it stays in the browser cache.
+    expires = (int(now) // 86400 + 2) * 86400
+    uri = f"{THUMB_PREFIX}/{thumbs.thumb_name(fileid, size)}"
+    return f"{uri}?{_signed(uri, expires, secret)}&v={mtime}"
 
 
 # ── Queries (one per endpoint) ──────────────────────────────────────────
 
-def _owned(db: DB, extra_join: str = "") -> str:
-    """Join + filter: the detection is uid's and its file is in uid's home storage under files/."""
+def _owned_file(db: DB, extra_join: str = "") -> str:
+    """Join + filter on filecache fc: the file is in uid's home storage under files/ (params _file_params)."""
     p = db._ph()
     return (
-        f"JOIN {db._table('filecache')} fc ON fc.fileid = d.file_id "
         f"JOIN {db._table('storages')} s ON s.numeric_id = fc.storage {extra_join}"
-        f"WHERE d.user_id = {p} AND fc.path LIKE {p} AND s.id IN ({p}, {p}) "
+        f"WHERE fc.path LIKE {p} AND s.id IN ({p}, {p}) "
     )
 
 
-def _owned_params(uid: str) -> tuple:
+def _file_params(uid: str) -> tuple:
     # Same storage-id forms as InternalController::ownerFromStorageId.
-    return (uid, "files/%", f"home::{uid}", f"object::user:{uid}")
+    return ("files/%", f"home::{uid}", f"object::user:{uid}")
+
+
+def _owned(db: DB, extra_join: str = "") -> str:
+    """Join + filter: the detection is uid's and its file is in uid's home storage under files/."""
+    return (f"JOIN {db._table('filecache')} fc ON fc.fileid = d.file_id "
+            f"{_owned_file(db, extra_join)}AND d.user_id = {db._ph()} ")
+
+
+def _owned_params(uid: str) -> tuple:
+    return _file_params(uid) + (uid,)
 
 
 def escape_like(q: str) -> str:
@@ -126,6 +152,20 @@ def _crop_or_none(uid, did, secret, crop_root):
         except OSError:
             return None
     return crop_url(uid, did, secret)
+
+
+def owned_mtimes(db: DB, uid: str, ids: list[int]) -> list[tuple[int, int]]:
+    """[(fileid, filecache mtime)] of the ids that are uid's files (under files/, home storage)."""
+    cur = db._execute(
+        f"SELECT fc.fileid, fc.mtime FROM {db._table('filecache')} fc {_owned_file(db)}"
+        f"AND fc.fileid IN ({db._ph(len(ids))})", _file_params(uid) + tuple(ids))
+    return [(int(f), int(m)) for f, m in cur.fetchall()]
+
+
+def fill_thumbs(rows: list[tuple[int, int]], secret: str, thumb_root: str) -> dict:
+    """{fileid: {size: url}} for the files whose thumbs are all on disk and current. Stats: no DB slot held."""
+    return {str(f): {str(s): thumb_url(f, s, m, secret) for s in thumbs.SIZES}
+            for f, m in rows if thumbs.is_fresh(thumb_root, f, m)}
 
 
 def list_clusters(db: DB, uid: str, crop_secret: str, min_count: int = 1, title: str | None = None,
@@ -238,6 +278,7 @@ class Api:
         self.token_secret = config.get("api_token_secret", "")
         self.crop_secret = config.get("crop_link_secret", "")
         self.crop_root = config.get("face_crop_root") or DEFAULT_CROP_ROOT
+        self.thumb_root = config.get("thumb_root") or thumbs.DEFAULT_THUMB_ROOT
         self._idle = queue.SimpleQueue()
         self._db_slots = threading.BoundedSemaphore(DB_SLOTS)
         self._users = {}  # uid -> (ok, monotonic expiry); only validly signed uids get here
@@ -321,6 +362,13 @@ class Api:
                     raise ValueError("q")
                 cl = self._with_db(lambda db: cluster_candidates(db, uid, 1, q))
                 return 200, fill_covers(cl, uid, self.crop_secret, self.crop_root)
+            if path == "/v1/thumbs":
+                raw = qs.get("ids", [""])[-1]
+                if not _IDS.fullmatch(raw) or raw.count(",") >= MAX_THUMB_IDS:
+                    raise ValueError("ids")
+                ids = sorted({int(i) for i in raw.split(",")})
+                rows = self._with_db(lambda db: owned_mtimes(db, uid, ids))
+                return 200, fill_thumbs(rows, self.crop_secret, self.thumb_root)
         except ValueError:
             return 400, {"error": "bad parameter"}
         except Busy:
