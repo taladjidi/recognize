@@ -229,26 +229,34 @@ def restore(db, path):
     Returns (restored ids, skipped ids, ids made unassigned because their cluster is gone)."""
     t, tc, ph = db._table("recognize_face_detections"), db._table("recognize_face_clusters"), db._ph()
     restored, skipped, unassigned = [], [], []
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
+    # The last line of an id wins: a retried set backs up the row it then deleted, and that
+    # may differ from an earlier attempt's copy. A line cut off by a crash or a full disk is
+    # skipped: a DELETE only ever follows a complete, fsynced line.
+    rows = {}
+    with open(path, encoding="utf-8") as f:
+        for n, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
                 row = json.loads(line)["row"]
-                if row["id"] in restored or row["id"] in skipped:
-                    continue  # a retried set backed it up twice
-                if not all(re.fullmatch(r"[a-z_]+", c) for c in row):
-                    raise ValueError(f"bad column name in {path}: {sorted(row)}")
-                if db._execute(f"SELECT 1 FROM {t} WHERE id = {ph}", (row["id"],)).fetchone():
-                    skipped.append(row["id"])
-                    continue
-                if (row.get("cluster_id") or 0) > 0 and not db._execute(
-                        f"SELECT 1 FROM {tc} WHERE id = {ph}", (row["cluster_id"],)).fetchone():
-                    row["cluster_id"] = -1  # as a cluster deletion does to its detections
-                    unassigned.append(row["id"])
-                db._execute(f"INSERT INTO {t} ({', '.join(row)}) VALUES ({db._ph(len(row))})",
-                            tuple(row.values()))
-                restored.append(row["id"])
+            except (ValueError, KeyError, TypeError):
+                print(f"warning: {path}:{n}: unreadable line skipped", file=sys.stderr)
+                continue
+            rows[row["id"]] = row
+    try:
+        for row in rows.values():
+            if not all(re.fullmatch(r"[a-z_]+", c) for c in row):
+                raise ValueError(f"bad column name in {path}: {sorted(row)}")
+            if db._execute(f"SELECT 1 FROM {t} WHERE id = {ph}", (row["id"],)).fetchone():
+                skipped.append(row["id"])
+                continue
+            if (row.get("cluster_id") or 0) > 0 and not db._execute(
+                    f"SELECT 1 FROM {tc} WHERE id = {ph}", (row["cluster_id"],)).fetchone():
+                row["cluster_id"] = -1  # as a cluster deletion does to its detections
+                unassigned.append(row["id"])
+            db._execute(f"INSERT INTO {t} ({', '.join(row)}) VALUES ({db._ph(len(row))})",
+                        tuple(row.values()))
+            restored.append(row["id"])
         db.commit()
     except BaseException:
         db.rollback()
@@ -300,6 +308,10 @@ def report(db, out, apply):
 
 def _open_backup(path):
     f = open(path, "a", encoding="utf-8")
+    if f.tell() and open(path, "rb").read()[-1:] != b"\n":
+        f.write("\n")  # end a line cut off by a crash, so the next one stays parseable
+        f.flush()
+        os.fsync(f.fileno())
     d = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
     try:
         os.fsync(d)  # a new file's directory entry survives a power cut

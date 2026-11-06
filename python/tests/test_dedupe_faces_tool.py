@@ -456,3 +456,33 @@ def test_apply_refused_in_maintenance_mode(cfg, db, tmp_path, monkeypatch, capsy
     assert dd.main() == 0
     assert a in _ids(db) and len(_ids(db)) == 1
     assert "applied: deleted 1 duplicate detections in 1 files of 1 users" in capsys.readouterr().out
+
+
+def test_restore_takes_the_last_backup_of_an_id(db, bk, tmp_path):
+    # A retry re-backs up the row it then deletes; an earlier attempt's copy may be stale.
+    _det(db, 1)
+    _det(db, 1, x=0.101)
+    before = _dump(db)
+    dd.run(db, bk)
+    bk.flush()
+    (line,) = _backup(tmp_path)
+    stale = json.loads(json.dumps(line))
+    stale["row"]["face_vector"] = "[9.9]"
+    stale["row"]["cluster_id"] = -1
+    path = tmp_path / "backup.jsonl"
+    path.write_text(json.dumps(stale) + "\n" + json.dumps(line) + "\n", encoding="utf-8")
+    assert dd.restore(db, str(path))[:2] == ([2], [])
+    assert _dump(db) == before
+
+
+def test_a_cut_off_backup_line_is_skipped_and_ended(db, tmp_path, capsys):
+    _det(db, 1)
+    _det(db, 1, x=0.101)
+    before = _dump(db)
+    path = tmp_path / "backup.jsonl"
+    path.write_text('{"row": {"id": 99, "file_', encoding="utf-8")  # a crash mid-write
+    with dd._open_backup(str(path)) as f:  # must end the cut-off line before appending
+        dd.run(db, f)
+    assert dd.restore(db, str(path))[:2] == ([2], [])
+    assert _dump(db) == before
+    assert "unreadable line skipped" in capsys.readouterr().err
