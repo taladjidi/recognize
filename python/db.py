@@ -503,24 +503,39 @@ class DB:
             r["path"] = self._resolve_storage_path(r.pop("storage_id_str"), r["path"], self._config["datadirectory"])
         return rows
 
-    def thumb_candidates(self, after_id: int, limit: int) -> list[dict]:
-        """Owners' non-empty image/* and video/* files (files/, home:: or object::user:, as api_server
-        _owned) with fileid > after_id, by fileid: {fileid, path, mimetype, mtime, size}, path absolute
-        or None when not on local disk. Roll back after each page: a held MySQL snapshot hides new files."""
-        fc, s, m = self._table("filecache"), self._table("storages"), self._table("mimetypes")
-        cur = self._execute(
-            f"SELECT fc.fileid, fc.path, m.mimetype, fc.mtime, fc.size, s.id AS storage_id_str FROM {fc} fc "
-            f"JOIN {s} s ON fc.storage = s.numeric_id JOIN {m} m ON fc.mimetype = m.id "
-            f"WHERE fc.fileid > {self._ph()} AND fc.path LIKE 'files/%' AND fc.size > 0 "
-            f"AND (s.id LIKE 'home::%' OR s.id LIKE 'object::user:%') "
-            f"AND (m.mimetype LIKE 'image/%' OR m.mimetype LIKE 'video/%') "
-            f"ORDER BY fc.fileid LIMIT {int(limit)}",
-            (after_id,),
-        )
-        rows = self._fetchall_dicts(cur)
-        for r in rows:
-            r["path"] = self._resolve_storage_path(r.pop("storage_id_str"), r["path"], self._config["datadirectory"])
-        return rows
+    def thumb_candidates(self, chunk: int = 5000):
+        """Yield the owners' non-empty image/* and video/* files (files/, home:: or object::user:, as
+        api_server _owned) by fileid: {fileid, path, mimetype, mtime, size}, path absolute or None when
+        not on local disk. One query on Nextcloud's fs_storage_mimepart index, read in chunks: read it
+        to the end promptly (the server waits on an unread result), then roll back."""
+        s, m, fc = self._table("storages"), self._table("mimetypes"), self._table("filecache")
+        storages = dict(self._execute(
+            f"SELECT numeric_id, id FROM {s} WHERE id LIKE 'home::%' OR id LIKE 'object::user:%'").fetchall())
+        mimes = dict(self._execute(f"SELECT id, mimetype FROM {m}").fetchall())
+        parts = [i for i, t in mimes.items() if t in ("image", "video")]
+        if not storages or not parts:
+            return
+        # shortcut: psycopg2 buffers the whole result client-side; a named cursor if pgsql ever hosts a big library.
+        cur = self._execute(  # ids are the ints just read: inlined, no placeholder limit
+            f"SELECT fileid, storage, path, mimetype, mtime, size FROM {fc} "
+            f"WHERE storage IN ({', '.join(str(int(i)) for i in storages)}) "
+            f"AND mimepart IN ({', '.join(str(int(i)) for i in parts)}) "
+            f"AND path LIKE 'files/%' AND size > 0 ORDER BY fileid")
+        done = False
+        try:
+            while rows := cur.fetchmany(chunk):
+                for fileid, storage, path, mimetype, mtime, size in rows:
+                    mime = mimes.get(mimetype, "")
+                    if mime.startswith(("image/", "video/")):  # not the bare 'image' / 'video' rows
+                        yield {"fileid": fileid, "mimetype": mime, "mtime": mtime, "size": size,
+                               "path": self._resolve_storage_path(storages[storage], path,
+                                                                  self._config["datadirectory"])}
+            done = True
+        finally:
+            if not done:  # closed early: mysql-connector refuses the next query over an unread result
+                while cur.fetchmany(chunk):
+                    pass
+            cur.close()
 
     def get_app_value(self, key: str) -> str | None:
         t = self._table("appconfig")
@@ -736,10 +751,10 @@ class DB:
 
     # ── Settings & maintenance ──────────────────────────────────────────
 
-    def check_maintenance_mode(self) -> bool:
-        """True when Nextcloud's config.php has 'maintenance' => true (cached ~30 s)."""
+    def check_maintenance_mode(self, max_age: float = 30) -> bool:
+        """True when Nextcloud's config.php has 'maintenance' => true (cached max_age s)."""
         now = time.monotonic()
-        if now - getattr(self, "_maint_checked", -1e9) < 30:
+        if now - getattr(self, "_maint_checked", -1e9) < max_age:
             return self._maint
         path = self._config.get("config_php", "/usr/share/nextcloud/config/config.php")
         try:

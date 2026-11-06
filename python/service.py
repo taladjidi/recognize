@@ -12,6 +12,8 @@ Features:
 """
 
 import argparse
+import contextlib
+import itertools
 import logging
 import multiprocessing as mp
 import os
@@ -19,6 +21,8 @@ import signal
 import sys
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 
 log = logging.getLogger("recognize")
 
@@ -40,7 +44,6 @@ CROP_RESCAN_INTERVAL = 3600  # after a full backfill pass and cleanup round, res
 CROP_LOG_EVERY = 500         # INFO line every N crops created by the backfill
 
 # Photos grid thumbnails (thumbs.py): full pass over every image/video, then rest
-THUMB_PAGE = 1000            # candidates per DB page
 THUMB_INTERVAL = 120         # seconds between passes
 THUMB_WORKERS = 3            # decode processes (nice 19), config key thumb_workers
 
@@ -103,6 +106,8 @@ class Service:
         self.thumb_root = self.config.get("thumb_root") or DEFAULT_THUMB_ROOT
         self.thumb_workers = int(self.config.get("thumb_workers") or THUMB_WORKERS)
         self._thumb_root_warned = False
+        self._thumb_enospc_logged = False
+        self._thumb_suspects = set()   # fileids in flight when a decoder process died: retried alone
         self._thumb_thread = None
         self._signalled = False        # set by the signal handler; a watcher thread turns it into the Event
         self._watcher = None
@@ -132,7 +137,7 @@ class Service:
         self.pipeline.stopping.set()
         for t in (self._crop_thread, self._thumb_thread):
             if t:
-                t.join(timeout=5)  # the thumb pool's daemonic workers die with the process
+                t.join(timeout=5)  # a stopped thumb pass terminates its workers
         self.pipeline.close()
         log.info("Service stopped")
 
@@ -576,7 +581,8 @@ class Service:
     def _thumb_pass(self, db):
         """Make missing or stale thumbs for every candidate, then delete orphans; True when complete.
 
-        Orphans are only deleted after a full walk: a pass cut short (SIGTERM, error) knows too little."""
+        Orphans are only deleted after a full walk: a pass cut short (SIGTERM, a decoder crash, a full
+        disk, maintenance mode) knows too little."""
         import thumbs
         if not os.path.isdir(self.thumb_root):
             if not self._thumb_root_warned:
@@ -587,22 +593,17 @@ class Service:
             return False
         stop = self.pipeline.stopping
         t0 = time.monotonic()
-        counts = dict.fromkeys(("fresh", "marked", "made", "failed", "missing", "error", "remote"), 0)
-        errors = []
-        seen = set()
-        pool = None
+        counts = dict.fromkeys(("fresh", "marked", "made", "failed", "missing", "retry", "nospace", "error",
+                                "remote"), 0)
+        errors, seen, jobs = [], set(), []
+        # Read every candidate first, then roll back: no snapshot is held while decoding (MariaDB
+        # REPEATABLE READ) and the server never waits on an unread result (net_write_timeout).
+        # shortcut: the pass's todo jobs sit in memory (~250 B each); page the read if a first pass ever has millions.
         try:
-            after = 0
-            while True:
-                try:
-                    rows = db.thumb_candidates(after, THUMB_PAGE)
-                finally:
-                    db.rollback()  # never hold a snapshot while decoding (MariaDB REPEATABLE READ)
-                if not rows:
-                    break
-                after = rows[-1]["fileid"]
-                jobs = []
+            with contextlib.closing(db.thumb_candidates()) as rows:
                 for r in rows:
+                    if stop.is_set():
+                        return False
                     fid = r["fileid"]
                     seen.add(fid)
                     if r["path"] is None:
@@ -613,29 +614,83 @@ class Service:
                         jobs.append((self.thumb_root, fid, r["path"], r["mimetype"], r["mtime"]))
                     else:
                         counts["fresh" if st == "fresh" else "marked"] += 1
-                if jobs:
-                    if pool is None:  # spawn: never fork the CUDA-holding parent; nice 19 yields to classification
-                        pool = mp.get_context("spawn").Pool(self.thumb_workers, initializer=os.nice, initargs=(19,))
-                    for status, detail in pool.imap_unordered(thumbs.make, jobs):
-                        counts[status] += 1
-                        if status in ("failed", "error") and len(errors) < 3:
-                            errors.append(detail)
-                        if stop.is_set():
-                            return False
-                if stop.is_set():
-                    return False
         finally:
-            if pool is not None:
-                pool.terminate()
-                pool.join()
+            db.rollback()
+        # A file in flight when a decoder died runs alone first: if it kills that one too, it is the cause.
+        suspects, self._thumb_suspects = self._thumb_suspects, set()
+        for job in [j for j in jobs if j[1] in suspects]:
+            try:
+                if not self._thumb_run([job], 1, counts, errors):
+                    return False
+            except BrokenProcessPool:
+                self._thumb_suspects.discard(job[1])
+                thumbs.mark_failed(job[0], job[1], job[4])
+                counts["failed"] += 1
+                if len(errors) < 3:
+                    errors.append(f"{job[1]}: the decoder process died on it")
+        try:
+            if not self._thumb_run([j for j in jobs if j[1] not in suspects], self.thumb_workers, counts, errors):
+                return False
+        except BrokenProcessPool:
+            log.error("Thumbnails: a decoder process died (out of memory, a crash) with %d files in flight; "
+                      "pass aborted, they run alone next pass", len(self._thumb_suspects))
+            return False
+        if db.check_maintenance_mode(max_age=0):  # turned on during the pass
+            return False
         removed = thumbs.remove_orphans(self.thumb_root, seen)
         changed = counts["made"] or counts["failed"] or counts["error"] or removed
         log.log(logging.INFO if changed else logging.DEBUG,  # an idle pass every 2 min stays out of the journal
-                "Thumbnails: %d files, %d fresh, %d made, %d failed (+%d known), %d missing, %d not local, "
-                "%d write errors, %d orphans removed in %.1f s%s", len(seen), counts["fresh"], counts["made"],
-                counts["failed"], counts["marked"], counts["missing"], counts["remote"], counts["error"],
-                removed, time.monotonic() - t0, f"; first: {'; '.join(errors)}" if errors else "")
+                "Thumbnails: %d files, %d fresh, %d made, %d failed (+%d known), %d missing, %d retried later, "
+                "%d not local, %d write errors, %d orphans removed in %.1f s%s", len(seen), counts["fresh"],
+                counts["made"], counts["failed"], counts["marked"], counts["missing"], counts["retry"],
+                counts["remote"], counts["error"], removed, time.monotonic() - t0,
+                f"; first: {'; '.join(errors)}" if errors else "")
         return True
+
+    def _thumb_run(self, jobs, workers, counts, errors):
+        """thumbs.make over jobs in a fresh pool of `workers` processes; False when stopped or the disk is full.
+
+        Raises BrokenProcessPool when a worker dies; the files then in flight go to self._thumb_suspects."""
+        import thumbs
+        if not jobs:
+            return True
+        stop = self.pipeline.stopping
+        # spawn: never fork the CUDA-holding parent; worker_init: nice 19, idle I/O
+        pool = ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), initializer=thumbs.worker_init)
+        pending, todo = {}, iter(jobs)
+        try:
+            while True:
+                for job in itertools.islice(todo, 2 * workers - len(pending)):
+                    pending[pool.submit(thumbs.make, job)] = job
+                if not pending:
+                    return True
+                done, _ = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                if stop.is_set():
+                    return False
+                for f in done:
+                    status, detail = f.result()
+                    del pending[f]
+                    counts[status] += 1
+                    if status == "made":
+                        self._thumb_enospc_logged = False
+                    elif status == "nospace":
+                        if not self._thumb_enospc_logged:
+                            log.error("No space left for thumbnails in %s (%s); passes stop at the first full "
+                                      "write until one succeeds", self.thumb_root, detail)
+                            self._thumb_enospc_logged = True
+                        return False
+                    elif status in ("failed", "error") and len(errors) < 3:
+                        errors.append(detail)
+        except BrokenProcessPool:  # from f.result() or from submit(), whichever sees it first
+            self._thumb_suspects.update(j[1] for j in pending.values())
+            raise
+        finally:
+            procs = list((pool._processes or {}).values())  # shortcut: private; Python 3.14 has terminate_workers()
+            pool.shutdown(wait=False, cancel_futures=True)
+            for p in procs:  # a stopped pass must not wait for a 20 s ffmpeg
+                p.terminate()
+            for p in procs:
+                p.join()
 
     def _sleep(self, seconds):
         """Wait, but wake at once on SIGTERM: POLL_MAX_INTERVAL equals systemd's stop timeout."""
